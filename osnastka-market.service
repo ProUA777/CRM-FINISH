@@ -1,0 +1,28 @@
+# Приклад systemd-сервісу для Оснастка-Маркет (Linux).
+#
+# Встановлення:
+#   sudo cp deploy/osnastka-market.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now osnastka-market
+#   sudo systemctl status osnastka-market
+#
+# Перед цим постав власні значення нижче:
+#   - User/WorkingDirectory — під яким користувачем і з якої теки запускати
+#   - Environment=CRM_SECRET_KEY=... — обов'язково згенерований секрет,
+#     не типовий з коду:  python3 -c "import secrets; print(secrets.token_hex(32))"
+
+[Unit]
+Description=Оснастка-Маркет (Flask + gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=crmapp
+WorkingDirectory=/opt/osnastka-market
+Environment=CRM_SECRET_KEY=ЗАМІНИ_НА_ЗГЕНЕРОВАНИЙ_СЕКРЕТ
+ExecStart=/opt/osnastka-market/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:5000 --access-logfile /opt/osnastka-market/logs/access.log wsgi:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

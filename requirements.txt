@@ -1,0 +1,29 @@
+# Обов'язкові для роботи CRM
+Flask>=3.0
+Werkzeug>=3.0
+reportlab>=4.0
+openpyxl>=3.1
+
+# Продакшн WSGI-сервер замість вбудованого dev-сервера Flask.
+# gunicorn працює лише на Linux/macOS (залежить від модуля fcntl,
+# якого немає на Windows) — тому явно вимкнено для Windows нижче.
+# waitress — його заміна на Windows, потрібен launcher.py для .exe.
+gunicorn>=21.0; sys_platform != 'win32'
+waitress>=2.1
+
+# Для інтеграції з верстатами Haas (integrations/*.py)
+requests>=2.31
+
+# Для розбору DXF-креслень у калькуляторі вартості (периметр різу, габарити)
+ezdxf>=1.3
+
+# Для запуску автоматизованих тестів (test_app.py) — потрібен лише розробнику,
+# не потрібен для роботи самої CRM в бою
+pytest>=7.4
+
+# Потрібні ЛИШЕ для збірки .exe-інсталятора (launcher.py, build_exe.bat,
+# .github/workflows/build-windows-exe.yml) — не потрібні для звичайного
+# запуску CRM через `python app.py`
+pyinstaller>=6.0; sys_platform == 'win32'
+pystray>=0.19
+pillow>=10.0

@@ -1,0 +1,24 @@
+# Приклад конфігурації nginx як реверс-проксі перед gunicorn.
+# Ставить Оснастка-Маркет за HTTPS, приховує внутрішній порт 5000 від інтернету.
+#
+# Встановлення сертифіката (безкоштовно, Let's Encrypt):
+#   sudo apt install certbot python3-certbot-nginx
+#   sudo certbot --nginx -d crm.вашдомен.com
+# (certbot сам допише сюди SSL-директиви та налаштує автопродовження)
+
+server {
+    listen 80;
+    server_name crm.вашдомен.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Excel/PDF-файли можуть генеруватись кілька секунд — не обривати.
+        proxy_read_timeout 60s;
+        client_max_body_size 20M;
+    }
+}
