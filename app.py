@@ -1704,9 +1704,18 @@ def render_dxf_to_png_bytes(raw_bytes):
 
     Використовує офіційний addon ezdxf.addons.drawing з matplotlib-бекендом -
     той самий рушій, що й у CAD-переглядачах для швидкого прев'ю креслень.
-    Кидає ValueError із зрозумілим поясненням, якщо файл не є коректним DXF."""
+    Кидає ValueError із зрозумілим поясненням, якщо файл не є коректним DXF.
+
+    ВАЖЛИВО: DXF буває двох форматів - текстовий (ASCII) і бінарний. Спроба
+    примусово декодувати бінарний DXF як UTF-8-текст ламає його вміст і дає
+    незрозумілу помилку на кшталт "Invalid binary data near line: ...". Тому,
+    так само як analyze_dxf() вище, читаємо через ezdxf.readfile() з реального
+    файлу на диску - лише вона вміє сама розпізнати текстовий/бінарний DXF і
+    правильне кодування, замість того щоб вгадувати наперед."""
     import io
     import ezdxf
+    import os
+    import tempfile
     from ezdxf.addons.drawing import RenderContext, Frontend
     from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
     from ezdxf.addons.drawing.config import Configuration, ColorPolicy, BackgroundPolicy
@@ -1714,10 +1723,17 @@ def render_dxf_to_png_bytes(raw_bytes):
     matplotlib.use("Agg")  # без графічного дисплея (сервер / .exe без консолі)
     import matplotlib.pyplot as plt
 
+    tmp_path = None
     try:
-        doc = ezdxf.read(io.StringIO(raw_bytes.decode("utf-8", errors="replace")))
+        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = tmp.name
+        doc = ezdxf.readfile(tmp_path)
     except Exception as e:
         raise ValueError(f"файл не схожий на коректний DXF: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
     msp = doc.modelspace()
     fig = plt.figure(figsize=(8, 8), dpi=150)
