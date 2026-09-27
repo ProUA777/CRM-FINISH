@@ -1399,9 +1399,10 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
         raw = f.read()
         if not raw:
             continue
+        filename = getattr(f, "filename", "") or "файл"
         if len(raw) > AI_IMAGE_MAX_BYTES:
             raise AICalcError(
-                f"Зображення «{f.filename}» завелике ({len(raw)//1024//1024} МБ) — стисни його або зроби скріншот, максимум 5 МБ"
+                f"Файл «{filename}» завеликий ({len(raw)//1024//1024} МБ) — стисни його, максимум 5 МБ"
             )
         # Перевіряємо РЕАЛЬНИЙ вміст файлу за магічними байтами, а не заявлений
         # браузером mimetype - його легко підмінити (файл .txt, перейменований
@@ -1409,9 +1410,19 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
         # по собі нічого не доводить і навмисно тут ігнорується).
         media_type = detect_image_media_type(raw)
         if not media_type:
-            raise AICalcError(
-                f"Файл «{f.filename}» не схожий на зображення (PNG/JPEG/GIF/WEBP) — завантаж фото або скан креслення"
-            )
+            # Це не растрове зображення - можливо, це векторне DXF-креслення.
+            # Anthropic Vision API вміє дивитись лише на растр, тож рендеримо
+            # DXF у PNG "на льоту" (в пам'яті) і показуємо ШІ вже картинку.
+            try:
+                raw = render_dxf_to_png_bytes(raw)
+            except Exception as e:
+                raise AICalcError(
+                    f"Файл «{filename}» — не зображення (PNG/JPEG/GIF/WEBP) і не вдалось розібрати як DXF-креслення ({e}). "
+                    f"Завантаж фото, скан або справжній DXF-файл."
+                )
+            media_type = "image/png"
+            if len(raw) > AI_IMAGE_MAX_BYTES:
+                raise AICalcError(f"Рендер DXF-креслення «{filename}» вийшов завеликим — спрости креслення")
         content_blocks.append({
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": _base64.b64encode(raw).decode("ascii")},
@@ -1683,6 +1694,52 @@ def analyze_dxf(path):
         "area_m2": round(float(width_mm * height_mm) / 1_000_000, 4),
         "entity_count": entity_count,
     }
+
+
+def render_dxf_to_png_bytes(raw_bytes):
+    """Рендерить DXF-креслення у растрове зображення PNG (в пам'яті, без
+    тимчасових файлів на диску), щоб його можна було показати ШІ-калькулятору
+    через Vision API - Anthropic вміє дивитись лише на растрові картинки,
+    а не на векторні DXF-координати напряму.
+
+    Використовує офіційний addon ezdxf.addons.drawing з matplotlib-бекендом -
+    той самий рушій, що й у CAD-переглядачах для швидкого прев'ю креслень.
+    Кидає ValueError із зрозумілим поясненням, якщо файл не є коректним DXF."""
+    import io
+    import ezdxf
+    from ezdxf.addons.drawing import RenderContext, Frontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import Configuration, ColorPolicy, BackgroundPolicy
+    import matplotlib
+    matplotlib.use("Agg")  # без графічного дисплея (сервер / .exe без консолі)
+    import matplotlib.pyplot as plt
+
+    try:
+        doc = ezdxf.read(io.StringIO(raw_bytes.decode("utf-8", errors="replace")))
+    except Exception as e:
+        raise ValueError(f"файл не схожий на коректний DXF: {e}")
+
+    msp = doc.modelspace()
+    fig = plt.figure(figsize=(8, 8), dpi=150)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_facecolor("white")
+    fig.patch.set_facecolor("white")
+    ctx = RenderContext(doc)
+    backend = MatplotlibBackend(ax)
+    # Примусово малюємо чорними лініями на білому тлі незалежно від кольорів
+    # шарів у самому кресленні - інакше типовий DXF-колір "7" (білий у
+    # палітрі AutoCAD для темного фону САПР) стає невидимим на білому
+    # аркуші, і ШІ отримав би порожню картинку замість креслення.
+    render_config = Configuration(color_policy=ColorPolicy.BLACK, background_policy=BackgroundPolicy.WHITE)
+    Frontend(ctx, backend, config=render_config).draw_layout(msp, finalize=True)
+    ax.set_axis_off()
+
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", facecolor="white", bbox_inches="tight", pad_inches=0.2)
+    finally:
+        plt.close(fig)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -2763,14 +2820,15 @@ CALCULATOR_HTML = """
     <textarea name="ai_description" placeholder="напр.: Кронштейн зі сталі 3мм, розмір приблизно 200х150мм, вирізати лазером, 2 гиби під 90°, партія 100 шт" style="min-height:70px;">{{ ai_description or '' }}</textarea>
   </div>
   <div class="field" style="margin-bottom:10px;">
-    <label>Фото деталі або скан/фото креслення (до 3 файлів, PNG/JPEG/WEBP, до 5 МБ кожне)</label>
-    <input type="file" name="ai_images" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
+    <label>Фото деталі, скан/фото креслення або DXF-файл (до 3 файлів, PNG/JPEG/WEBP/DXF, до 5 МБ кожне)</label>
+    <input type="file" name="ai_images" accept="image/png,image/jpeg,image/webp,image/gif,.dxf" multiple>
   </div>
   <button class="btn btn-primary" type="submit">Розрахувати через ШІ</button>
   <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
     Потрібен API-ключ Anthropic (див. «Налаштування» → «ШІ-розрахунок вартості»). Якщо додати фото/скан
-    креслення, ШІ сам розгляне розміри, товщину, гиби й отвори на зображенні та опише весь технологічний
-    процес виготовлення разом із розрахунком. Це орієнтовна оцінка — обов'язково перевір цифри перед тим,
+    креслення або DXF-файл, ШІ сам розгляне розміри, товщину, гиби й отвори на зображенні та опише весь
+    технологічний процес виготовлення разом із розрахунком. DXF автоматично рендериться в картинку перед
+    відправкою. Це орієнтовна оцінка — обов'язково перевір цифри перед тим,
     як ставити їх у КП клієнту.
   </p>
 </form>
