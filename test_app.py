@@ -1018,6 +1018,147 @@ def test_settings_page_shows_ai_calculator_status(client):
     assert "Підключено" in r2.get_data(as_text=True)
 
 
+# ---------------------------------------------------------------------------
+# ШІ-калькулятор: аналіз зображення/креслення
+# ---------------------------------------------------------------------------
+
+def test_ai_calc_without_api_key_and_no_text_but_with_image_shows_key_error(client):
+    """Навіть якщо зображення додано, без API-ключа далі йти нікуди -
+    має показати саме помилку про відсутній ключ, а не про порожній опис."""
+    import io
+    login(client)
+    token = get_csrf_token(client, "/calculator")
+    png_bytes = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+        "de0000000c4944415478da6360000002000100ffff03000006000557bfabd400000000"
+        "49454e44ae426082"
+    )
+    r = client.post(
+        "/calculator/ai-estimate",
+        data={"_csrf_token": token, "ai_description": "",
+              "ai_images": (io.BytesIO(png_bytes), "креслення.png")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert r.status_code == 200
+    assert "API-ключ" in r.get_data(as_text=True)
+
+
+def test_ai_calc_no_text_and_no_image_shows_clear_error(client):
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-something"})
+    r = post(client, "/calculator/ai-estimate", {"ai_description": ""}, follow_redirects=True)
+    assert "Опиши деталь" in r.get_data(as_text=True) or "фото" in r.get_data(as_text=True)
+
+
+def test_detect_image_media_type_recognizes_real_formats_and_rejects_fake():
+    from app import detect_image_media_type
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+        "de0000000c4944415478da6360000002000100ffff03000006000557bfabd400000000"
+        "49454e44ae426082"
+    )
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 20
+    gif = b"GIF89a" + b"\x00" * 20
+    webp = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 10
+    assert detect_image_media_type(png) == "image/png"
+    assert detect_image_media_type(jpeg) == "image/jpeg"
+    assert detect_image_media_type(gif) == "image/gif"
+    assert detect_image_media_type(webp) == "image/webp"
+    assert detect_image_media_type(b"this is plain text, not an image at all") is None
+    # Файл .png з підміненим вмістом (лише розширення обманює, байти - ні)
+    assert detect_image_media_type(b"<html>not an image</html>") is None
+
+
+def test_ai_calc_rejects_non_image_file_as_image():
+    """Функція ai_estimate_cost_params має відхиляти файл, що не є
+    справжнім зображенням (наприклад текстовий файл з розширенням .png),
+    з чіткою помилкою, а не падати чи мовчки відправляти сміття в API."""
+    import io
+    from app import ai_estimate_cost_params, AICalcError
+
+    class FakeFile:
+        def __init__(self, data, filename, mimetype):
+            self._data = data
+            self.filename = filename
+            self.mimetype = mimetype
+
+        def read(self):
+            return self._data
+
+    fake = FakeFile(b"this is definitely not a png file", "fake.png", "image/png")
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params("", "sk-ant-fake-key", images=[fake])
+    assert "не схож" in str(exc_info.value)
+
+
+def test_ai_calc_rejects_oversized_image():
+    from app import ai_estimate_cost_params, AICalcError, AI_IMAGE_MAX_BYTES
+
+    class FakeFile:
+        def __init__(self, data, filename, mimetype):
+            self._data = data
+            self.filename = filename
+            self.mimetype = mimetype
+
+        def read(self):
+            return self._data
+
+    huge = FakeFile(b"\x89PNG" + b"0" * (AI_IMAGE_MAX_BYTES + 1), "величезне.png", "image/png")
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params("", "sk-ant-fake-key", images=[huge])
+    assert "завелике" in str(exc_info.value)
+
+
+def test_ai_calc_real_api_call_with_image_and_invalid_key_handled_gracefully(client):
+    """Реальний виклик Anthropic API з навмисно невалідним ключем, АЛЕ з
+    реальним валідним зображенням у content blocks - перевіряє, що сам
+    запит із image-блоком коректно формується й надсилається (інакше
+    помилка була б про побудову запиту, а не 401 від сервера), і що 401
+    так само коректно перехоплюється при наявності зображення."""
+    import io
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake-invalid-key-12345"})
+    token = get_csrf_token(client, "/calculator")
+    png_bytes = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+        "de0000000c4944415478da6360000002000100ffff03000006000557bfabd400000000"
+        "49454e44ae426082"
+    )
+    r = client.post(
+        "/calculator/ai-estimate",
+        data={"_csrf_token": token, "ai_description": "деталь на кресленні",
+              "ai_images": (io.BytesIO(png_bytes), "креслення.png")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert r.status_code == 200
+    assert "Невірний API-ключ" in r.get_data(as_text=True)
+
+
+def test_ai_calc_too_many_images_rejected():
+    from app import ai_estimate_cost_params, AICalcError
+
+    class FakeFile:
+        def __init__(self, data, filename, mimetype):
+            self._data = data
+            self.filename = filename
+            self.mimetype = mimetype
+
+        def read(self):
+            return self._data
+
+    png_bytes = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+        "de0000000c4944415478da6360000002000100ffff03000006000557bfabd400000000"
+        "49454e44ae426082"
+    )
+    images = [FakeFile(png_bytes, f"img{i}.png", "image/png") for i in range(4)]
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params("опис", "sk-ant-fake-key", images=images)
+    assert "3 зображення" in str(exc_info.value)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
