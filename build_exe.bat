@@ -26,8 +26,12 @@ pyinstaller --onefile --noconsole --name OsnastkaMarket --icon=icon.ico ^
     --hidden-import=openpyxl.cell._writer ^
     --hidden-import=waitress ^
     --hidden-import=ezdxf ^
+    --hidden-import=ezdxf.addons.drawing ^
+    --hidden-import=ezdxf.addons.drawing.matplotlib ^
+    --hidden-import=matplotlib.backends.backend_agg ^
     --collect-all reportlab ^
     --collect-all ezdxf ^
+    --collect-all matplotlib ^
     launcher.py
 
 echo.
