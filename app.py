@@ -1324,9 +1324,13 @@ def notify_all(text):
 # Розрахунок вартості через ШІ (опис деталі текстом -> параметри калькулятора)
 # ---------------------------------------------------------------------------
 
-AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог металообробного цеху (лазерне різання, гин, зварювання листового металу). Тобі дають опис деталі й операцій природною мовою (українською або російською). Виділи з нього параметри для калькулятора собівартості.
+AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог металообробного цеху (лазерне різання, гин, зварювання листового металу). Тобі дають опис деталі й операцій природною мовою (українською або російською), і/або зображення (фото деталі, скан або фото креслення). Твоя задача - і розрахувати параметри собівартості, і описати весь технологічний процес виготовлення.
 
-Якщо якийсь параметр прямо не вказано в описі - постав розумне типове значення для листового металу в Україні (орієнтовно: сталь конструкційна ~55-65 грн/кг, алюміній ~150-200 грн/кг, різ лазером ~15-30 грн/м залежно від товщини, один гиб на листогині ~50-120 грн, машино-година додаткової обробки ~500-900 грн, націнка 15-25%) і обов'язково згадай це припущення у полі operations_description, щоб людина знала, що це орієнтовна оцінка, а не дані з документів.
+Якщо додано зображення креслення чи деталі - уважно розглянь його: розміри, товщину металу (з написів на кресленні, штампу товщини, таблиці допусків), форму контуру (для оцінки периметру різу), кількість і кути згинів, отвори, різьблення, зварні шви, позначення шорсткості й термообробки, якщо вони є. Використай усе, що видно на зображенні, для розрахунку - це важливіше за здогадки. Якщо текстовий опис і зображення суперечать одне одному, довірся зображенню й зауваж розбіжність у operations_description.
+
+Якщо якийсь параметр не можна визначити ні з тексту, ні із зображення - постав розумне типове значення для листового металу в Україні (орієнтовно: сталь конструкційна ~55-65 грн/кг, алюміній ~150-200 грн/кг, різ лазером ~15-30 грн/м залежно від товщини, один гиб на листогині ~50-120 грн, машино-година додаткової обробки ~500-900 грн, націнка 15-25%) і обов'язково згадай це припущення у полі operations_description, щоб людина знала, що це орієнтовна оцінка, а не дані з документів.
+
+У полі operations_description дай ПОВНИЙ опис технологічного процесу: з чого і як вирізається заготовка, у якій послідовності йдуть операції (розкрій/різ → зняття задирок → гибка → зварювання → механообробка → покриття/фарбування тощо, якщо застосовно), скільки і яких гибів/зварних швів/отворів, і які значення були оцінені приблизно. Пиши це як технолог, що пояснює маршрут виготовлення колезі, 4-7 речень.
 
 Відповідай ВИКЛЮЧНО у форматі JSON, без жодного тексту до чи після, без markdown-обгортки ```:
 {
@@ -1340,7 +1344,7 @@ AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог мет
   "machine_rate_per_hour": <число, ставка за машино-годину у грн>,
   "quantity": <ціле число, кількість деталей у партії - за замовчуванням 1, якщо не вказано>,
   "margin_pct": <число, рекомендована націнка у відсотках>,
-  "operations_description": "<2-4 речення українською: послідовність операцій обробки та які значення були оцінені приблизно (якщо були)>"
+  "operations_description": "<4-7 речень українською: повний технологічний процес виготовлення та які значення були оцінені приблизно (якщо були)>"
 }"""
 
 
@@ -1348,20 +1352,79 @@ class AICalcError(Exception):
     pass
 
 
-def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5"):
-    """Викликає Anthropic Messages API, щоб перетворити довільний текстовий
-    опис деталі й операцій на структуровані параметри калькулятора вартості.
+AI_IMAGE_MAX_BYTES = 5 * 1024 * 1024  # ліміт Anthropic API на одне зображення в base64
+
+
+def detect_image_media_type(raw_bytes):
+    """Визначає реальний тип зображення за магічними байтами файлу (не за
+    заявленим mimetype, якому не можна довіряти). Навмисно не використовує
+    стандартний модуль imghdr - його прибирають з Python 3.13, а нам
+    потрібна лише невелика підмножина форматів (PNG/JPEG/GIF/WEBP),
+    достатніх для Anthropic API. Повертає media_type-рядок або None,
+    якщо це не один з підтримуваних форматів зображень."""
+    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if raw_bytes.startswith(b"RIFF") and raw_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", images=None):
+    """Викликає Anthropic Messages API, щоб перетворити текстовий опис і/або
+    зображення (фото деталі, скан креслення) на структуровані параметри
+    калькулятора вартості разом з описом усього техпроцесу.
+
+    images: список werkzeug FileStorage (0..3 файли) - фото/скани креслення.
     Кидає AICalcError із зрозумілим для користувача поясненням при будь-якій
-    проблемі (немає ключа, мережа, невалідна відповідь) - виклик коду має
-    ловити цей виняток і показувати flash-повідомлення, а не падати з 500."""
+    проблемі (немає ключа, мережа, невалідна відповідь, погане зображення) -
+    виклик коду має ловити цей виняток і показувати flash-повідомлення,
+    а не падати з 500."""
+    images = images or []
     if not api_key:
         raise AICalcError("Спочатку введи API-ключ Anthropic на сторінці «Налаштування»")
-    if not description or not description.strip():
-        raise AICalcError("Опиши деталь та операції текстом")
+    if (not description or not description.strip()) and not images:
+        raise AICalcError("Опиши деталь текстом або завантаж фото/скан креслення")
 
     import requests as _requests
     import json as _json
     import re as _re_local
+    import base64 as _base64
+
+    content_blocks = []
+    for f in images:
+        raw = f.read()
+        if not raw:
+            continue
+        if len(raw) > AI_IMAGE_MAX_BYTES:
+            raise AICalcError(
+                f"Зображення «{f.filename}» завелике ({len(raw)//1024//1024} МБ) — стисни його або зроби скріншот, максимум 5 МБ"
+            )
+        # Перевіряємо РЕАЛЬНИЙ вміст файлу за магічними байтами, а не заявлений
+        # браузером mimetype - його легко підмінити (файл .txt, перейменований
+        # на .png, прийшов би сюди з mimetype="image/png", тож mimetype сам
+        # по собі нічого не доводить і навмисно тут ігнорується).
+        media_type = detect_image_media_type(raw)
+        if not media_type:
+            raise AICalcError(
+                f"Файл «{f.filename}» не схожий на зображення (PNG/JPEG/GIF/WEBP) — завантаж фото або скан креслення"
+            )
+        content_blocks.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": _base64.b64encode(raw).decode("ascii")},
+        })
+
+    if len(content_blocks) > 3:
+        raise AICalcError("Максимум 3 зображення за один розрахунок")
+
+    text = description.strip() if description and description.strip() else (
+        "Проаналізуй зображення (креслення/фото деталі) і розрахуй параметри собівартості "
+        "та опиши повний технологічний процес виготовлення."
+    )
+    content_blocks.append({"type": "text", "text": text})
 
     try:
         resp = _requests.post(
@@ -1373,14 +1436,14 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5"):
             },
             json={
                 "model": model,
-                "max_tokens": 1024,
+                "max_tokens": 1536,
                 "system": AI_CALC_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": description.strip()}],
+                "messages": [{"role": "user", "content": content_blocks}],
             },
-            timeout=30,
+            timeout=45,
         )
     except _requests.exceptions.Timeout:
-        raise AICalcError("Anthropic API не відповів за 30 секунд — спробуй ще раз")
+        raise AICalcError("Anthropic API не відповів за 45 секунд — спробуй ще раз")
     except _requests.exceptions.RequestException as e:
         raise AICalcError(f"Не вдалось з'єднатися з Anthropic API: {e}")
 
@@ -2693,16 +2756,22 @@ CALCULATOR_HTML = """
 {% block subheading %}Заповни вручну або завантаж DXF-креслення — периметр різу й габарити підставляться автоматично{% endblock %}
 {% block content %}
 
-<div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> 🤖 Розрахунок через ШІ (опис деталі текстом)</div>
-<form method="post" action="{{ url_for('calculator_ai_estimate') }}" class="card card-pad" style="margin-bottom:20px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> 🤖 Розрахунок через ШІ (опис і/або фото креслення)</div>
+<form method="post" action="{{ url_for('calculator_ai_estimate') }}" enctype="multipart/form-data" class="card card-pad" style="margin-bottom:20px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
   <div class="field" style="margin-bottom:10px;">
-    <label>Опиши деталь та операції звичайною мовою</label>
+    <label>Опиши деталь та операції звичайною мовою (необов'язково, якщо є фото)</label>
     <textarea name="ai_description" placeholder="напр.: Кронштейн зі сталі 3мм, розмір приблизно 200х150мм, вирізати лазером, 2 гиби під 90°, партія 100 шт" style="min-height:70px;">{{ ai_description or '' }}</textarea>
+  </div>
+  <div class="field" style="margin-bottom:10px;">
+    <label>Фото деталі або скан/фото креслення (до 3 файлів, PNG/JPEG/WEBP, до 5 МБ кожне)</label>
+    <input type="file" name="ai_images" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
   </div>
   <button class="btn btn-primary" type="submit">Розрахувати через ШІ</button>
   <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
-    Потрібен API-ключ Anthropic (див. «Налаштування» → «ШІ-розрахунок вартості»). ШІ дає орієнтовну
-    оцінку параметрів — обов'язково перевір цифри перед тим, як ставити їх у КП клієнту.
+    Потрібен API-ключ Anthropic (див. «Налаштування» → «ШІ-розрахунок вартості»). Якщо додати фото/скан
+    креслення, ШІ сам розгляне розміри, товщину, гиби й отвори на зображенні та опише весь технологічний
+    процес виготовлення разом із розрахунком. Це орієнтовна оцінка — обов'язково перевір цифри перед тим,
+    як ставити їх у КП клієнту.
   </p>
 </form>
 
@@ -4699,19 +4768,21 @@ def cost_calculator():
 @login_required
 @role_required("sales")
 def calculator_ai_estimate():
-    """Приймає довільний текстовий опис деталі й операцій, викликає ШІ для
-    оцінки параметрів калькулятора, одразу рахує собівартість тими ж
+    """Приймає довільний текстовий опис деталі й операцій та/або фото/скан
+    креслення, викликає ШІ для оцінки параметрів калькулятора (з візуальним
+    аналізом зображення, якщо воно є), одразу рахує собівартість тими ж
     формулами, що й ручний розрахунок (жодної окремої "ШІ-математики" -
     цифри для розрахунку однакові, різниться лише спосіб їх отримання)."""
     db = get_db()
     api_key = get_setting(db, "anthropic_api_key", "")
     description = request.form.get("ai_description", "")
+    images = [f for f in request.files.getlist("ai_images") if f and f.filename]
     warehouse_items = db.execute(
         "SELECT * FROM warehouse_items WHERE category LIKE '%атеріал%' ORDER BY name"
     ).fetchall()
 
     try:
-        params = ai_estimate_cost_params(description, api_key)
+        params = ai_estimate_cost_params(description, api_key, images=images)
     except AICalcError as e:
         flash(str(e), "error")
         return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
