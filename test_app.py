@@ -1184,6 +1184,83 @@ def test_render_dxf_to_png_rejects_garbage_input():
         render_dxf_to_png_bytes(b"this is not a dxf file at all, just plain text")
 
 
+def test_render_dxf_to_png_handles_binary_dxf_format():
+    """РЕГРЕСІЙНИЙ ТЕСТ на реальний баг: DXF буває не лише текстовим (ASCII),
+    а й бінарним - користувач надіслав саме такий файл, і функція падала з
+    "Invalid binary data near line: ..." через примусове UTF-8-декодування
+    байтів бінарного DXF перед розбором. Фікс - читати через ezdxf.readfile()
+    з тимчасового файлу на диску (як analyze_dxf() вище), а не декодувати
+    вручну наперед. Створюємо СПРАВЖНІЙ бінарний DXF через ezdxf і рендеримо."""
+    import ezdxf
+    import tempfile
+    import os
+    from app import render_dxf_to_png_bytes, detect_image_media_type
+    from PIL import Image
+    import io
+
+    doc = ezdxf.new()
+    msp = doc.modelspace()
+    msp.add_line((0, 0), (100, 0))
+    msp.add_lwpolyline([(0, 0), (100, 0), (100, 50), (0, 50)], close=True)
+    msp.add_circle((50, 25), radius=10)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    tmp.close()
+    try:
+        doc.saveas(tmp.name, fmt="bin")
+        with open(tmp.name, "rb") as f:
+            binary_dxf_bytes = f.read()
+    finally:
+        os.remove(tmp.name)
+
+    assert binary_dxf_bytes.startswith(b"AutoCAD Binary DXF"), "тестовий фікстур не є справжнім бінарним DXF"
+
+    png_bytes = render_dxf_to_png_bytes(binary_dxf_bytes)
+    assert detect_image_media_type(png_bytes) == "image/png"
+    img = Image.open(io.BytesIO(png_bytes)).convert("L")
+    non_white = sum(1 for p in img.tobytes() if p < 250)
+    assert non_white > 50, "рендер бінарного DXF вийшов порожнім - лінії не намальовані"
+
+
+def test_ai_calc_accepts_real_binary_dxf_end_to_end(client):
+    """Наскрізна перевірка того самого бага через HTTP-роут калькулятора:
+    бінарний DXF-файл завантажується у форму ШІ-калькулятора і не має
+    впасти з помилкою парсингу до того, як дійде до Anthropic API."""
+    import ezdxf
+    import tempfile
+    import os
+    import io
+
+    doc = ezdxf.new()
+    msp = doc.modelspace()
+    msp.add_circle((10, 10), radius=5)
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    tmp.close()
+    try:
+        doc.saveas(tmp.name, fmt="bin")
+        with open(tmp.name, "rb") as f:
+            binary_dxf_bytes = f.read()
+    finally:
+        os.remove(tmp.name)
+
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake-invalid-key-12345"})
+    token = get_csrf_token(client, "/calculator")
+    r = client.post(
+        "/calculator/ai-estimate",
+        data={"_csrf_token": token, "ai_description": "",
+              "ai_images": (io.BytesIO(binary_dxf_bytes), "деталь_binary.dxf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    # Головне: НЕ помилка парсингу DXF, а дійшло до реального виклику API
+    # (з фейковим ключем - тому саме "Невірний API-ключ", а не "не вдалось розібрати")
+    assert "не вдалось розібрати" not in html
+    assert "Невірний API-ключ" in html
+
+
 def test_ai_calc_accepts_real_dxf_file_and_renders_it_before_api_call(client):
     """Наскрізна перевірка: DXF-файл (не зображення) завантажується в
     ШІ-калькулятор, автоматично рендериться в PNG всередині
