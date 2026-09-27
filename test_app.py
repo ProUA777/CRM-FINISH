@@ -1107,7 +1107,7 @@ def test_ai_calc_rejects_oversized_image():
     huge = FakeFile(b"\x89PNG" + b"0" * (AI_IMAGE_MAX_BYTES + 1), "величезне.png", "image/png")
     with pytest.raises(AICalcError) as exc_info:
         ai_estimate_cost_params("", "sk-ant-fake-key", images=[huge])
-    assert "завелике" in str(exc_info.value)
+    assert "завелик" in str(exc_info.value)
 
 
 def test_ai_calc_real_api_call_with_image_and_invalid_key_handled_gracefully(client):
@@ -1157,6 +1157,75 @@ def test_ai_calc_too_many_images_rejected():
     with pytest.raises(AICalcError) as exc_info:
         ai_estimate_cost_params("опис", "sk-ant-fake-key", images=images)
     assert "3 зображення" in str(exc_info.value)
+
+
+def test_render_dxf_to_png_produces_valid_visible_drawing():
+    """Перевіряє не лише що функція повертає валідний PNG, а що на ньому
+    справді щось намальовано (не порожній білий аркуш) - рендер DXF без
+    примусового кольору ліній дає невидимі білі лінії на білому тлі,
+    що саме тут і перевіряється через підрахунок непорожніх пікселів."""
+    from app import render_dxf_to_png_bytes, detect_image_media_type
+    dxf_bytes = _make_sample_dxf_bytes()
+
+    png_bytes = render_dxf_to_png_bytes(dxf_bytes)
+    assert detect_image_media_type(png_bytes) == "image/png"
+    assert len(png_bytes) > 500
+
+    from PIL import Image
+    import io
+    img = Image.open(io.BytesIO(png_bytes)).convert("L")
+    non_white = sum(1 for p in img.tobytes() if p < 250)
+    assert non_white > 50, "рендер DXF вийшов практично порожнім - лінії не намальовані"
+
+
+def test_render_dxf_to_png_rejects_garbage_input():
+    from app import render_dxf_to_png_bytes
+    with pytest.raises(ValueError):
+        render_dxf_to_png_bytes(b"this is not a dxf file at all, just plain text")
+
+
+def test_ai_calc_accepts_real_dxf_file_and_renders_it_before_api_call(client):
+    """Наскрізна перевірка: DXF-файл (не зображення) завантажується в
+    ШІ-калькулятор, автоматично рендериться в PNG всередині
+    ai_estimate_cost_params, і запит іде до Anthropic API з картинкою -
+    навіть з фейковим ключем це підтверджує, що ланцюжок
+    DXF -> рендер -> валідний image-блок -> реальний HTTP-запит
+    не ламається на жодному кроці."""
+    import io
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake-invalid-key-12345"})
+    dxf_bytes = _make_sample_dxf_bytes()
+    token = get_csrf_token(client, "/calculator")
+    r = client.post(
+        "/calculator/ai-estimate",
+        data={"_csrf_token": token, "ai_description": "",
+              "ai_images": (io.BytesIO(dxf_bytes), "деталь.dxf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert r.status_code == 200
+    assert "Невірний API-ключ" in r.get_data(as_text=True)
+
+
+def test_ai_calc_rejects_garbage_file_with_dxf_extension():
+    """Файл з розширенням .dxf, але сміттєвим вмістом всередині, має
+    отримати зрозумілу помилку про DXF, а не про PNG/JPEG (бо система вже
+    намагалась спершу як зображення, потім як DXF - обидва не підійшли)."""
+    from app import ai_estimate_cost_params, AICalcError
+
+    class FakeFile:
+        def __init__(self, data, filename, mimetype):
+            self._data = data
+            self.filename = filename
+            self.mimetype = mimetype
+
+        def read(self):
+            return self._data
+
+    fake = FakeFile(b"not a dxf and not an image either", "fake.dxf", "application/octet-stream")
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params("", "sk-ant-fake-key", images=[fake])
+    assert "DXF" in str(exc_info.value)
 
 
 if __name__ == "__main__":
