@@ -884,6 +884,54 @@ def test_reminders_appear_for_relevant_role_only(client):
     assert "Критично низький залишок" in r3.get_data(as_text=True)
 
 
+def test_reminders_include_overdue_production_orders(client):
+    """Дзвоник має попереджати і про прострочені виробничі замовлення (не
+    лише про задачі, склад, аварії, рекламації, платежі) - це доступний,
+    вже готовий сигнал (production_orders.due_date + status), якого раніше
+    не було серед нагадувань. Перевіряємо реальним запитом через ролі:
+    видно адміну й виробництву, не видно бухгалтерії (нерелевантно)."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+
+    yesterday = (a.datetime.datetime.now() - a.datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+    future = (a.datetime.datetime.now() + a.datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+    now = a.datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute(
+        "INSERT INTO production_orders (deal_id, machine_id, quantity, status, due_date, created_at) "
+        "VALUES (NULL, NULL, 5, 'in_progress', ?, ?)",
+        (yesterday, now),
+    )
+    # Прострочене, але вже виконане замовлення - НЕ має рахуватись.
+    db.execute(
+        "INSERT INTO production_orders (deal_id, machine_id, quantity, status, due_date, created_at) "
+        "VALUES (NULL, NULL, 3, 'done', ?, ?)",
+        (yesterday, now),
+    )
+    # Замовлення з дедлайном у майбутньому - теж НЕ має рахуватись.
+    db.execute(
+        "INSERT INTO production_orders (deal_id, machine_id, quantity, status, due_date, created_at) "
+        "VALUES (NULL, NULL, 2, 'planned', ?, ?)",
+        (future, now),
+    )
+    db.commit()
+
+    r = client.get("/")
+    html = r.get_data(as_text=True)
+    assert "Прострочених виробничих замовлень: 1" in html
+
+    client.get("/logout")
+    login(client, "maister", "prod123")
+    r2 = client.get("/")
+    assert "Прострочених виробничих замовлень: 1" in r2.get_data(as_text=True)
+
+    client.get("/logout")
+    login(client, "buh", "buh12345")
+    r3 = client.get("/")
+    assert "Прострочених виробничих замовлень" not in r3.get_data(as_text=True)
+
+
 # ---------------------------------------------------------------------------
 # Майстер, прив'язаний до конкретної дільниці
 # ---------------------------------------------------------------------------
@@ -1057,6 +1105,81 @@ def test_extract_json_object_returns_none_for_text_without_json():
     from app import _extract_json_object
     assert _extract_json_object("Вибач, я не можу порахувати без додаткової інформації.") is None
     assert _extract_json_object("") is None
+
+
+def test_ai_calc_prompt_names_real_shop_machines_and_asks_for_detailed_process():
+    """Користувач хоче, щоб ШІ описував технологічний процес прив'язаним до
+    РЕАЛЬНОГО парку обладнання цеху (Haas UMC-750, VF-2, VF-4, токарні ЧПУ
+    Haas), а не абстрактно "фрезерний верстат" - і щоб опис був розгорнутим,
+    а не 3-4 реченнями. Перевіряємо, що системний промпт справді називає
+    кожен верстат явно (щоб майбутнє редагування промпту випадково не
+    загубило назву) і вимагає розгорнутого, а не короткого опису."""
+    from app import AI_CALC_SYSTEM_PROMPT
+    for machine in ("Haas UMC-750", "Haas VF-2", "Haas VF-4", "Haas"):
+        assert machine in AI_CALC_SYSTEM_PROMPT
+    assert "10-15 речень" in AI_CALC_SYSTEM_PROMPT
+    assert "НЕДОСТАТНІМ" in AI_CALC_SYSTEM_PROMPT
+
+
+def test_ai_calc_sends_assistant_prefill_to_force_json_output():
+    """РЕГРЕСІЙНИЙ ТЕСТ на реальний баг: короткий опис без деталей про операції
+    ("Партія 200 шт. сталь 40Х, пруток 30 діаметром" - є матеріал і заготовка,
+    але жодного слова про самі операції) інколи змушував модель, попри пряму
+    заборону в системному промпті, відповісти поясненням/уточненням замість
+    JSON - і користувач бачив "ШІ повернув відповідь у неочікуваному форматі"
+    навіть з фолбек-парсером _extract_json_object на місці (бо в тексті моделі
+    просто не було жодного JSON-об'єкта). Правильний фікс - не намагатись
+    розпарсити довільний текст моделі постфактум, а зробити так, щоб вона
+    фізично не могла відповісти інакше, ніж JSON: префілимо початок відповіді
+    асистента символом "{" (стандартний прийом Anthropic API) - тоді її
+    відповідь це ПРОДОВЖЕННЯ вже відкритої JSON-структури, а не вільний текст
+    з чистого аркуша. Перевіряємо і що запит дійсно містить цей префіл-меседж,
+    і що відповідь без початкової "{" (так реально повертає API після
+    префілу) коректно парситься завдяки її поверненню назад."""
+    import app as app_module
+    from unittest import mock
+
+    captured_payload = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            # Так насправді виглядає відповідь Anthropic API після префілу
+            # "{" - сам відкриваючий символ у тексті відсутній, бо ми його
+            # самі дописали в messages, а модель лише ПРОДОВЖУЄ від нього.
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        '"weight_kg": 0.52, "material_price_per_kg": 62, '
+                        '"turning_hours": 0.4, "turning_rate_per_hour": 800, '
+                        '"milling_hours": 0, "milling_rate_per_hour": 900, '
+                        '"machine_hours": 0, "machine_rate_per_hour": 0, '
+                        '"setup_cost_total": 400, "quantity": 200, "margin_pct": 20, '
+                        '"operations_description": "Токарна обробка прутка 40Х Ø30 мм."}'
+                    ),
+                }]
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured_payload.update(json or {})
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        params = app_module.ai_estimate_cost_params(
+            "Партія 200 шт. сталь 40Х, пруток 30 діаметром", "sk-ant-fake-key"
+        )
+
+    # Запит справді містить префіл-меседж асистента з "{"
+    messages = captured_payload.get("messages", [])
+    assert len(messages) == 2
+    assert messages[1] == {"role": "assistant", "content": "{"}
+
+    # Відповідь без початкової "{" все одно коректно розпарсилась
+    assert params["quantity"] == 200
+    assert params["weight_kg"] == 0.52
+    assert "Токарна" in params["operations_description"]
 
 
 def test_settings_page_shows_ai_calculator_status(client):
