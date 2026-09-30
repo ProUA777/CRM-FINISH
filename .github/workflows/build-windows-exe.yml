@@ -53,8 +53,14 @@ jobs:
           --hidden-import=openpyxl.cell._writer
           --hidden-import=waitress
           --hidden-import=ezdxf
+          --hidden-import=ezdxf.addons.drawing
+          --hidden-import=ezdxf.addons.drawing.matplotlib
+          --hidden-import=matplotlib.backends.backend_agg
+          --hidden-import=fitz
           --collect-all reportlab
           --collect-all ezdxf
+          --collect-all matplotlib
+          --collect-all pymupdf
           launcher.py
 
       - name: Перевірка, що exe справді запускається
