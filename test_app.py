@@ -1121,21 +1121,18 @@ def test_ai_calc_prompt_names_real_shop_machines_and_asks_for_detailed_process()
     assert "НЕДОСТАТНІМ" in AI_CALC_SYSTEM_PROMPT
 
 
-def test_ai_calc_sends_assistant_prefill_to_force_json_output():
-    """РЕГРЕСІЙНИЙ ТЕСТ на реальний баг: короткий опис без деталей про операції
-    ("Партія 200 шт. сталь 40Х, пруток 30 діаметром" - є матеріал і заготовка,
-    але жодного слова про самі операції) інколи змушував модель, попри пряму
-    заборону в системному промпті, відповісти поясненням/уточненням замість
-    JSON - і користувач бачив "ШІ повернув відповідь у неочікуваному форматі"
-    навіть з фолбек-парсером _extract_json_object на місці (бо в тексті моделі
-    просто не було жодного JSON-об'єкта). Правильний фікс - не намагатись
-    розпарсити довільний текст моделі постфактум, а зробити так, щоб вона
-    фізично не могла відповісти інакше, ніж JSON: префілимо початок відповіді
-    асистента символом "{" (стандартний прийом Anthropic API) - тоді її
-    відповідь це ПРОДОВЖЕННЯ вже відкритої JSON-структури, а не вільний текст
-    з чистого аркуша. Перевіряємо і що запит дійсно містить цей префіл-меседж,
-    і що відповідь без початкової "{" (так реально повертає API після
-    префілу) коректно парситься завдяки її поверненню назад."""
+def test_ai_calc_forces_tool_use_to_guarantee_structured_json_output():
+    """РЕГРЕСІЙНИЙ ТЕСТ на реальний баг (двічі): (1) короткий опис без деталей
+    про операції інколи змушував модель відповісти поясненням замість JSON
+    ("ШІ повернув відповідь у неочікуваному форматі"); (2) спроба зафіксувати
+    це префілом асистента ({"role": "assistant", "content": "{"}) сама зламала
+    продакшн - реальний Anthropic API почав повертати 400 "This model does
+    not support assistant message prefill. The conversation must end with a
+    user message." Правильний і стійкий фікс - примусовий виклик інструмента
+    (tool_choice: {"type": "tool", ...}): Anthropic API гарантовано повертає
+    УЖЕ РОЗІБРАНИЙ JSON-об'єкт у tool_use.input, без жодного текстового
+    парсингу і без додаткового "assistant"-повідомлення в messages (розмова
+    завершується саме user-повідомленням, як і вимагає API)."""
     import app as app_module
     from unittest import mock
 
@@ -1145,20 +1142,18 @@ def test_ai_calc_sends_assistant_prefill_to_force_json_output():
         status_code = 200
 
         def json(self):
-            # Так насправді виглядає відповідь Anthropic API після префілу
-            # "{" - сам відкриваючий символ у тексті відсутній, бо ми його
-            # самі дописали в messages, а модель лише ПРОДОВЖУЄ від нього.
             return {
                 "content": [{
-                    "type": "text",
-                    "text": (
-                        '"weight_kg": 0.52, "material_price_per_kg": 62, '
-                        '"turning_hours": 0.4, "turning_rate_per_hour": 800, '
-                        '"milling_hours": 0, "milling_rate_per_hour": 900, '
-                        '"machine_hours": 0, "machine_rate_per_hour": 0, '
-                        '"setup_cost_total": 400, "quantity": 200, "margin_pct": 20, '
-                        '"operations_description": "Токарна обробка прутка 40Х Ø30 мм."}'
-                    ),
+                    "type": "tool_use",
+                    "name": "cost_estimate",
+                    "input": {
+                        "weight_kg": 0.52, "material_price_per_kg": 62,
+                        "turning_hours": 0.4, "turning_rate_per_hour": 800,
+                        "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0,
+                        "quantity": 200, "margin_pct": 20,
+                        "operations_description": "Токарна обробка прутка 40Х Ø30 мм.",
+                    },
                 }]
             }
 
@@ -1171,15 +1166,52 @@ def test_ai_calc_sends_assistant_prefill_to_force_json_output():
             "Партія 200 шт. сталь 40Х, пруток 30 діаметром", "sk-ant-fake-key"
         )
 
-    # Запит справді містить префіл-меседж асистента з "{"
+    # Розмова завершується user-повідомленням - жодного "assistant"-префілу
     messages = captured_payload.get("messages", [])
-    assert len(messages) == 2
-    assert messages[1] == {"role": "assistant", "content": "{"}
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
 
-    # Відповідь без початкової "{" все одно коректно розпарсилась
+    # Запит примусово вимагає саме виклик інструмента cost_estimate
+    assert captured_payload.get("tool_choice") == {"type": "tool", "name": "cost_estimate"}
+    assert captured_payload.get("tools", [{}])[0].get("name") == "cost_estimate"
+
     assert params["quantity"] == 200
     assert params["weight_kg"] == 0.52
     assert "Токарна" in params["operations_description"]
+
+
+def test_ai_calc_falls_back_to_text_json_extraction_if_model_ignores_tool_choice():
+    """Захисний фолбек: якщо модель (усупереч tool_choice) все ж повернула
+    звичайний текстовий блок замість tool_use, код має спробувати витягти
+    з нього JSON, а не одразу падати - той самий фолбек-парсер
+    _extract_json_object, що й раніше."""
+    import app as app_module
+    from unittest import mock
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        'Ось параметри: {"weight_kg": 1.1, "material_price_per_kg": 60, '
+                        '"turning_hours": 0.5, "turning_rate_per_hour": 800, '
+                        '"milling_hours": 0.2, "milling_rate_per_hour": 900, '
+                        '"machine_hours": 0, "machine_rate_per_hour": 0, '
+                        '"quantity": 10, "margin_pct": 15, '
+                        '"operations_description": "Токарно-фрезерна обробка."}'
+                    ),
+                }]
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        params = app_module.ai_estimate_cost_params("опис", "sk-ant-fake-key")
+    assert params["quantity"] == 10
 
 
 def test_settings_page_shows_ai_calculator_status(client):
@@ -1479,6 +1511,184 @@ def test_ai_calc_rejects_garbage_file_with_dxf_extension():
 
 
 # ---------------------------------------------------------------------------
+# Завантаження PDF у ШІ-калькулятор (скан/PDF-експорт креслення)
+# ---------------------------------------------------------------------------
+
+def _make_sample_pdf_bytes(num_pages=1):
+    """Генерує невеличкий тестовий PDF (прямокутник + текст на кожній
+    сторінці) прямо в пам'яті через reportlab - без залежності від
+    зовнішніх файлів. Малює реальну графіку (не порожню сторінку), щоб
+    тест на рендеринг міг перевірити, що на картинці справді щось є."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas as pdf_canvas
+
+    buf = BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+    for i in range(num_pages):
+        c.setLineWidth(2)
+        c.rect(50, 500, 200, 150, fill=0, stroke=1)
+        c.circle(300, 400, 40, fill=0, stroke=1)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(50, 700, f"Креслення деталі, сторінка {i + 1}")
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def test_render_pdf_to_png_produces_valid_visible_pages():
+    """Перевіряє, що рендер PDF дає справжню картинку (не порожній аркуш) -
+    той самий клас перевірки, що й для DXF (test_render_dxf_to_png_produces_
+    valid_visible_drawing): підрахунок непорожніх пікселів."""
+    from app import render_pdf_to_png_bytes, detect_image_media_type
+    from PIL import Image
+    import io
+
+    pdf_bytes = _make_sample_pdf_bytes(num_pages=1)
+    pages = render_pdf_to_png_bytes(pdf_bytes)
+    assert len(pages) == 1
+    png_bytes = pages[0]
+    assert detect_image_media_type(png_bytes) == "image/png"
+    assert len(png_bytes) > 500
+
+    img = Image.open(io.BytesIO(png_bytes)).convert("L")
+    non_white = sum(1 for p in img.tobytes() if p < 250)
+    assert non_white > 50, "рендер PDF вийшов практично порожнім - вміст не намальований"
+
+
+def test_render_pdf_to_png_respects_max_pages_limit():
+    """PDF на 5 сторінок має дати рівно 3 рендери (max_pages за замовчуванням
+    у виклику з ai_estimate_cost_params), а не всі 5 - інакше один
+    багатосторінковий PDF міг би обійти ліміт у 3 зображення на запит."""
+    from app import render_pdf_to_png_bytes
+    pdf_bytes = _make_sample_pdf_bytes(num_pages=5)
+    pages = render_pdf_to_png_bytes(pdf_bytes, max_pages=3)
+    assert len(pages) == 3
+
+
+def test_render_pdf_to_png_rejects_garbage_input():
+    from app import render_pdf_to_png_bytes
+    with pytest.raises(ValueError):
+        render_pdf_to_png_bytes(b"this is not a pdf file at all, just plain text")
+
+
+def test_ai_calc_accepts_real_pdf_file_and_renders_it_before_api_call(client):
+    """Наскрізна перевірка: PDF-файл (не зображення, не DXF) завантажується
+    в ШІ-калькулятор, автоматично рендериться в PNG всередині
+    ai_estimate_cost_params, і запит іде до Anthropic API з картинкою -
+    навіть з фейковим ключем це підтверджує, що ланцюжок
+    PDF -> рендер сторінок -> валідні image-блоки -> реальний HTTP-запит
+    не ламається на жодному кроці."""
+    import io
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake-invalid-key-12345"})
+    pdf_bytes = _make_sample_pdf_bytes(num_pages=1)
+    token = get_csrf_token(client, "/calculator")
+    r = client.post(
+        "/calculator/ai-estimate",
+        data={"_csrf_token": token, "ai_description": "",
+              "ai_images": (io.BytesIO(pdf_bytes), "креслення.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "не вдалось розібрати" not in html
+    assert "Невірний API-ключ" in html
+
+
+def test_ai_calc_single_pdf_is_capped_at_three_rendered_pages():
+    """Один PDF на 4 сторінки сам по собі НЕ має впасти з помилкою ліміту -
+    render_pdf_to_png_bytes(max_pages=3) вже обрізає його до перших 3 сторінок
+    ще на етапі рендерингу, тож у content_blocks потрапляє рівно 3 картинки,
+    а не 4 (інакше один багатосторінковий PDF міг би непомітно роздути запит
+    до Anthropic далеко за розумну межу)."""
+    from app import ai_estimate_cost_params, AICalcError
+    from unittest import mock
+
+    class FakeFile:
+        def __init__(self, data, filename):
+            self._data = data
+            self.filename = filename
+            self.mimetype = "application/pdf"
+
+        def read(self):
+            return self._data
+
+    pdf_bytes = _make_sample_pdf_bytes(num_pages=4)
+    fake = FakeFile(pdf_bytes, "креслення.pdf")
+
+    captured_payload = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"content": [{"type": "tool_use", "name": "cost_estimate", "input": {
+                "weight_kg": 1, "material_price_per_kg": 60, "turning_hours": 0.1,
+                "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 15,
+                "operations_description": "Опис.",
+            }}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured_payload.update(json or {})
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        ai_estimate_cost_params("опис", "sk-ant-fake-key", images=[fake])
+
+    sent_images = [b for b in captured_payload["messages"][0]["content"] if b.get("type") == "image"]
+    assert len(sent_images) == 3
+
+
+def test_ai_calc_two_multi_page_pdfs_together_exceed_three_image_limit():
+    """Два окремі PDF-файли по 2 сторінки (усього 4 картинки) РАЗОМ мають
+    впасти з поясненням ліміту - ліміт у 3 зображення застосовується до
+    сумарної кількості сторінок з усіх завантажених файлів, а не лише в
+    межах одного файлу."""
+    from app import ai_estimate_cost_params, AICalcError
+
+    class FakeFile:
+        def __init__(self, data, filename):
+            self._data = data
+            self.filename = filename
+            self.mimetype = "application/pdf"
+
+        def read(self):
+            return self._data
+
+    pdf_a = FakeFile(_make_sample_pdf_bytes(num_pages=2), "перша.pdf")
+    pdf_b = FakeFile(_make_sample_pdf_bytes(num_pages=2), "друга.pdf")
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params("опис", "sk-ant-fake-key", images=[pdf_a, pdf_b])
+    assert "3 зображення" in str(exc_info.value)
+
+
+def test_ai_calc_rejects_garbage_file_with_pdf_extension():
+    """Файл з розширенням .pdf, але сміттєвим вмістом усередині, має дати
+    зрозумілу помилку, що згадує і PDF, і DXF (бо система намагається
+    послідовно: зображення → PDF → DXF, і жодне не підійшло)."""
+    from app import ai_estimate_cost_params, AICalcError
+
+    class FakeFile:
+        def __init__(self, data, filename):
+            self._data = data
+            self.filename = filename
+            self.mimetype = "application/pdf"
+
+        def read(self):
+            return self._data
+
+    fake = FakeFile(b"not a pdf and not an image either, just garbage bytes", "fake.pdf")
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params("", "sk-ant-fake-key", images=[fake])
+    msg = str(exc_info.value)
+    assert "PDF" in msg
+    assert "DXF" in msg
+
+
+# ---------------------------------------------------------------------------
 # Бізнес-модель: токарно-фрезерна механообробка (НЕ лазерне різання/гин/
 # зварювання листового металу) — регресійні тести на коректність правки
 # ---------------------------------------------------------------------------
@@ -1544,6 +1754,94 @@ def test_cost_calculator_uses_turning_and_milling_fields_not_cut_and_bend(client
     assert "Токарна обробка" in html
     assert "Фрезерна обробка" in html
     assert "Наладка" in html
+
+
+# ---------------------------------------------------------------------------
+# PDF з результату калькулятора
+# ---------------------------------------------------------------------------
+
+def test_calculator_result_page_has_pdf_download_button(client):
+    """Кнопка «Завантажити як PDF» має з'являтись разом з результатом
+    розрахунку (і посилатись саме на новий ендпоінт), інакше користувач
+    її просто не побачить."""
+    login(client)
+    r = post(client, "/calculator", {
+        "weight_kg": "10", "material_price_per_kg": "50",
+        "turning_hours": "5", "turning_rate_per_hour": "20",
+        "milling_hours": "4", "milling_rate_per_hour": "15",
+        "machine_hours": "0.5", "machine_rate_per_hour": "200",
+        "quantity": "2", "margin_pct": "20",
+    })
+    html = r.get_data(as_text=True)
+    assert "Завантажити як PDF" in html
+    assert "/calculator/quote.pdf" in html
+
+
+def test_calculator_quote_pdf_produces_real_pdf_with_correct_totals(client):
+    """РЕАЛЬНИЙ функціональний тест: POST на /calculator/quote.pdf з тими ж
+    параметрами, що й ручний розрахунок (760 грн/од., 1824 грн разом - як у
+    test_cost_calculator_math_and_deal_prefill), і перевірка, що це дійсно
+    валідний PDF (сигнатура %PDF, реальний розмір), а не порожня заглушка.
+    Суми в PDF рахуються заново на сервері, тож тест заразом підтверджує,
+    що сервер не просто "довіряє" числам з прихованих полів форми."""
+    login(client)
+    token = get_csrf_token(client, "/calculator")
+    r = client.post("/calculator/quote.pdf", data={
+        "_csrf_token": token,
+        "weight_kg": "10", "material_price_per_kg": "50",
+        "turning_hours": "5", "turning_rate_per_hour": "20",
+        "milling_hours": "4", "milling_rate_per_hour": "15",
+        "machine_hours": "0.5", "machine_rate_per_hour": "200",
+        "quantity": "2", "margin_pct": "20",
+        "part_description": "Вал зі сталі 40Х, Ø30х250мм",
+        "operations_description": "Токарна обробка прутка на верстаті Haas.",
+    })
+    assert r.status_code == 200
+    assert r.mimetype == "application/pdf"
+    assert r.data[:4] == b"%PDF"
+    assert len(r.data) > 1500
+
+
+def test_calculator_quote_pdf_handles_long_ai_operations_description_without_error(client):
+    """РЕГРЕСІЙНИЙ ТЕСТ: після зміни промпту ШІ тепер за замовчуванням дає
+    10-15 речень опису техпроцесу (замість 4-7) - перевіряємо, що довгий
+    текст, який не влазить на одну сторінку разом з таблицею вартості, не
+    ламає генерацію PDF (код має самостійно перейти на нову сторінку), а
+    не впасти з помилкою чи обрізати вміст."""
+    login(client)
+    token = get_csrf_token(client, "/calculator")
+    long_description = (
+        "Заготовка - пруток сталі 40Х діаметром 30 мм, довжина під партію 260 мм на деталь. "
+        "Базування виконується в цанговому патроні на токарному верстаті з ЧПУ Haas. "
+        "Чорнове точіння знімає основний припуск по зовнішньому діаметру та торцю, залишаючи 0.5 мм на чистову обробку. "
+        "Чистове точіння формує фінальні розміри Ø28h7 та довжину з допуском ±0.05 мм, шорсткість Ra 1.6. "
+        "Деталь переустановлюється на Haas VF-2 для фрезерування шпонкового паза шириною 8 мм і глибиною 4 мм. "
+        "Свердління двох отворів Ø6 мм під кріплення виконується на тому ж верстаті за один установ. "
+        "Нарізання різьби M8 виконується мітчиком у свердлених отворах. "
+        "Термообробка (гартування до HRC 45-50) виконується за необхідності після механообробки. "
+        "Контроль ВТК перевіряє діаметр мікрометром, довжину штангенциркулем, биття - на призмах. "
+        "Пакування партії виконується в картонні короби з прокладками між деталями. "
+        "Орієнтовний час токарної обробки - 12 хвилин на деталь, фрезерної - 8 хвилин на деталь. "
+    ) * 3  # свідомо втричі довше типової відповіді, щоб гарантовано не влізло на одну сторінку
+    r = client.post("/calculator/quote.pdf", data={
+        "_csrf_token": token,
+        "weight_kg": "1.2", "material_price_per_kg": "62",
+        "turning_hours": "0.4", "turning_rate_per_hour": "800",
+        "milling_hours": "0.3", "milling_rate_per_hour": "900",
+        "machine_hours": "0", "machine_rate_per_hour": "0",
+        "setup_cost_total": "400",
+        "quantity": "200", "margin_pct": "20",
+        "part_description": "Партія 200 шт, сталь 40Х, пруток Ø30мм",
+        "operations_description": long_description,
+    })
+    assert r.status_code == 200
+    assert r.data[:4] == b"%PDF"
+    assert len(r.data) > 1500
+
+
+def test_calculator_quote_pdf_requires_login(client):
+    r = client.post("/calculator/quote.pdf", data={"weight_kg": "1"}, follow_redirects=True)
+    assert "логін" in r.get_data(as_text=True).lower() or "пароль" in r.get_data(as_text=True).lower()
 
 
 if __name__ == "__main__":
