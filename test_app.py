@@ -659,8 +659,8 @@ def test_cost_calculator_math_and_deal_prefill(client):
     login(client)
     r = post(client, "/calculator", {
         "weight_kg": "10", "material_price_per_kg": "50",
-        "cut_length_m": "5", "cut_price_per_m": "20",
-        "bend_count": "4", "bend_price_each": "15",
+        "turning_hours": "5", "turning_rate_per_hour": "20",
+        "milling_hours": "4", "milling_rate_per_hour": "15",
         "machine_hours": "0.5", "machine_rate_per_hour": "200",
         "quantity": "2", "margin_pct": "20",
     })
@@ -988,7 +988,7 @@ def test_ai_calc_real_api_call_with_invalid_key_handled_gracefully(client):
     login(client)
     post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake-invalid-key-12345"})
     r = post(client, "/calculator/ai-estimate",
-             {"ai_description": "Кронштейн зі сталі 3мм, лазер, 2 гиби, партія 50 шт"},
+             {"ai_description": "Вал зі сталі 40Х, Ø30х250мм, точіння + фрезерування паза, партія 50 шт"},
              follow_redirects=True)
     assert r.status_code == 200
     assert "Невірний API-ключ" in r.get_data(as_text=True)
@@ -1007,6 +1007,56 @@ def test_ai_calc_json_parsing_handles_markdown_wrapper():
         parsed = json.loads(cleaned)
         assert parsed["weight_kg"] == 1.2
         assert parsed["quantity"] == 50
+
+
+def test_extract_json_object_handles_prose_around_json():
+    """РЕГРЕСІЙНИЙ ТЕСТ на реальний баг: користувач отримав "ШІ повернув
+    відповідь у неочікуваному форматі" на короткому неоднозначному описі
+    ("торець 200 шт") - модель, стикнувшись з браком деталей, додала текст
+    до/після JSON-об'єкта (попри пряму заборону в промпті), а стара логіка
+    вміла знімати лише markdown-код-фенси, тому падала на будь-якому іншому
+    обрамленні. _extract_json_object() має вирізати сам об'єкт у кожному
+    з цих випадків."""
+    from app import _extract_json_object
+    import json
+
+    cases = [
+        'Оскільки опис дуже короткий, ось орієнтовний розрахунок:\n\n'
+        '{"weight_kg": 1.2, "quantity": 200}',
+
+        '{"weight_kg": 1.2, "quantity": 200}\n\n'
+        'Зверни увагу, це дуже груба оцінка через брак деталей в описі.',
+
+        'Ось розрахунок:\n'
+        '{"weight_kg": 1.2, "operations_description": "Токарна і фрезерна", "quantity": 200}\n'
+        'Сподіваюсь, допомогло!',
+    ]
+    for text in cases:
+        extracted = _extract_json_object(text)
+        assert extracted is not None, f"не знайшов JSON у: {text!r}"
+        parsed = json.loads(extracted)
+        assert parsed["weight_kg"] == 1.2
+        assert parsed["quantity"] == 200
+
+
+def test_extract_json_object_ignores_braces_inside_string_values():
+    """Фігурні дужки всередині текстового значення (напр. у
+    operations_description) не мають передчасно завершити пошук об'єкта -
+    рахунок глибини має ігнорувати вміст рядків у лапках."""
+    from app import _extract_json_object
+    import json
+
+    text = '{"weight_kg": 1.2, "operations_description": "Розмір {200x150}, партія {A}", "quantity": 5}'
+    extracted = _extract_json_object(text)
+    parsed = json.loads(extracted)
+    assert parsed["operations_description"] == "Розмір {200x150}, партія {A}"
+    assert parsed["quantity"] == 5
+
+
+def test_extract_json_object_returns_none_for_text_without_json():
+    from app import _extract_json_object
+    assert _extract_json_object("Вибач, я не можу порахувати без додаткової інформації.") is None
+    assert _extract_json_object("") is None
 
 
 def test_settings_page_shows_ai_calculator_status(client):
@@ -1303,6 +1353,74 @@ def test_ai_calc_rejects_garbage_file_with_dxf_extension():
     with pytest.raises(AICalcError) as exc_info:
         ai_estimate_cost_params("", "sk-ant-fake-key", images=[fake])
     assert "DXF" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Бізнес-модель: токарно-фрезерна механообробка (НЕ лазерне різання/гин/
+# зварювання листового металу) — регресійні тести на коректність правки
+# ---------------------------------------------------------------------------
+
+def test_no_laser_bending_welding_wording_anywhere_in_calculator_page(client):
+    """РЕГРЕСІЙНИЙ ТЕСТ: користувач явно повідомив, що в них немає лазера,
+    гину чи зварювання - вони точать і фрезерують на ЧПУ. Уся система була
+    переписана під цю модель. Цей тест ловить, якщо хтось (людина чи ШІ)
+    надалі випадково поверне старе формулювання назад у калькулятор."""
+    login(client)
+    html = client.get("/calculator").get_data(as_text=True)
+    for bad_word in ["лазер", "Лазер", "Гин ", "Гин(", "листогин", "Різ (лазер"]:
+        assert bad_word not in html, f"застаріле формулювання '{bad_word}' повернулось на сторінку калькулятора"
+
+
+def test_seed_data_has_no_orphaned_machine_or_routing_references(client):
+    """РЕГРЕСІЙНИЙ ТЕСТ: після видалення лазерного верстата з каталогу
+    обладнання деталі/угоди/маршрутні карти, що на нього посилались, мали
+    бути або видалені, або перепризначені на реальний верстат. Перевіряємо
+    БД напряму, що жодна угода не посилається на неіснуючий machine_id, і
+    що серед дільниць/техпроцесів немає лазерного різання."""
+    import sqlite3
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+
+    machine_ids = {r["id"] for r in db.execute("SELECT id FROM machines").fetchall()}
+    assert machine_ids, "у демо-даних мають бути верстати"
+
+    orphaned = db.execute(
+        "SELECT id, title, machine_id FROM deals WHERE machine_id IS NOT NULL AND machine_id NOT IN "
+        f"({','.join('?' * len(machine_ids))})",
+        tuple(machine_ids),
+    ).fetchall()
+    assert not orphaned, f"угоди посилаються на неіснуючий верстат: {[dict(o) for o in orphaned]}"
+
+    categories = [r["category"] for r in db.execute("SELECT category FROM machines").fetchall()]
+    for cat in categories:
+        assert "лазер" not in cat.lower(), f"у каталозі обладнання лишився лазерний верстат: {cat}"
+
+    routing_categories = [r["category"] for r in db.execute("SELECT category FROM routing_templates").fetchall()]
+    for cat in routing_categories:
+        assert "лазер" not in cat.lower(), f"лишився маршрутний техпроцес для лазера: {cat}"
+
+
+def test_cost_calculator_uses_turning_and_milling_fields_not_cut_and_bend(client):
+    """РЕГРЕСІЙНИЙ ТЕСТ: формули калькулятора мають рахувати вартість через
+    turning_hours/milling_hours (токарна/фрезерна обробка), а не через
+    застарілі cut_length_m/bend_count (периметр різу/кількість гибів)."""
+    login(client)
+    r = post(client, "/calculator", {
+        "weight_kg": "5", "material_price_per_kg": "60",
+        "turning_hours": "2", "turning_rate_per_hour": "800",
+        "milling_hours": "1", "milling_rate_per_hour": "900",
+        "machine_hours": "0", "machine_rate_per_hour": "0",
+        "setup_cost_total": "500",
+        "quantity": "5", "margin_pct": "20",
+    })
+    html = r.get_data(as_text=True)
+    # 5*60 + 2*800 + 1*900 + 500/5 = 300+1600+900+100 = 2900; ціна = 2900*1.2 = 3480
+    assert "2900" in html
+    assert "3480" in html
+    assert "Токарна обробка" in html
+    assert "Фрезерна обробка" in html
+    assert "Наладка" in html
 
 
 if __name__ == "__main__":
