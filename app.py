@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CRM для металообробного підприємства (різання, гин, зварювання) на власному парку верстатів з ЧПУ.
+CRM для металообробного підприємства (токарна, фрезерна та універсальна обробка) на власному парку верстатів з ЧПУ.
 Монолітний застосунок на Flask + SQLite. Один файл, без зовнішньої БД.
 
 Запуск:
@@ -145,7 +145,7 @@ def register_failed_login(key):
     db.commit()
 
 # ---------------------------------------------------------------------------
-# Довідники предметної області (специфіка металообробного виробництва: різання, гин, зварювання)
+# Довідники предметної області (специфіка металообробного виробництва: токарна, фрезерна, універсальна обробка)
 # ---------------------------------------------------------------------------
 
 STAGES = [
@@ -671,7 +671,6 @@ def seed_data(db):
         ("Універсальний токарно-фрезерний верстат", "UniTech U-500", "Універсал для малих серій та ремонту", "7.5 кВт", "500x300 мм", "0.02 мм", 28000, "USD", 30, 1),
         ("Свердлильно-фрезерний верстат", "DrillFix DF-210", "Компактний верстат для цехів", "3 кВт", "210x210 мм", "0.03 мм", 9500, "USD", 20, 1),
         ("Шліфувальний верстат з ЧПУ", "GrindLine GL-400", "Кругло-шліфувальний верстат", "5.5 кВт", "Ø400x800 мм", "0.002 мм", 51000, "USD", 50, 0),
-        ("Лазерний різальний комплекс", "LaserCut LC-3015", "Волоконний лазер для листового металу", "6 кВт", "3000x1500 мм", "0.05 мм", 98000, "USD", 75, 0),
     ]
     cur.executemany(
         "INSERT INTO machines (category, model, description, spindle_power, work_area, accuracy, price, currency, lead_time_days, in_stock) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -714,7 +713,7 @@ def seed_data(db):
         ("Ремонтна партія деталей за кресленням клієнта", 3, 4, 3, "proposal", 28000, "USD", 30, 50, oleh_id, d(15), "Сайт / заявка", "medium", None, "Малосерійне виробництво, обмежений бюджет", None),
         ("Шліфування партії валів — цех клієнта", 4, 5, 5, "contract", 51000, "USD", 50, 80, admin_id, d(10), "Рекомендація", "high", None, "Потрібне пакування та доставка на об'єкт клієнта", None),
         ("Свердлильні роботи для цеху №2", 1, 2, 4, "prepay", 9500, "USD", 50, 90, admin_id, d(7), "Постійний клієнт", "medium", None, None, None),
-        ("Лазерний розкрій листового металу", 2, 3, 6, "lead", 98000, "USD", 30, 15, oleh_id, d(60), "Виставка", "medium", "SteelCut Pro", "Товщина металу до 20мм, потрібна автоматизація подачі", None),
+        ("Переробка партії деталей за старим кресленням (універсал)", 2, 3, 3, "lead", 18000, "USD", 30, 15, oleh_id, d(60), "Виставка", "medium", "Konkurent CNC", "Мала серія, потрібна доробка під нове креслення замовника", None),
         ("Виготовлення партії кронштейнів (програно)", 5, 6, 1, "lost", 40000, "USD", 30, 0, oleh_id, d(-10), "Холодний дзвінок", "low", "Konkurent CNC", None, "Клієнт обрав дешевшого підрядника"),
         ("Виготовлення деталей для обробного центру клієнта", 4, 5, 2, "install", 65000, "USD", 40, 95, admin_id, d(3), "Рекомендація", "high", None, "Контроль якості заплановано на наступний тиждень", None),
     ]
@@ -824,13 +823,6 @@ def seed_data(db):
             ("Контроль точності (ВТК)", 6, 3),
             ("Упаковка та відвантаження", 7, 2),
         ],
-        "Лазерний різальний комплекс": [
-            ("Підготовка листового металу", 1, 3),
-            ("Налаштування ЧПУ-програми різу", 3, 4),
-            ("Лазерне різання", 3, 10),
-            ("Контроль якості кромки (ВТК)", 6, 2),
-            ("Упаковка та відвантаження", 7, 2),
-        ],
     }
     for category, steps in routing_defs.items():
         cur.execute("INSERT INTO routing_templates (category, name) VALUES (?,?)",
@@ -872,7 +864,6 @@ def seed_data(db):
         ("Чорнова фрезерна обробка", "MAT-AL-6061", 10),
         ("Складання та юстування", "CMP-BALLSCREW-25", 1),
         ("Попереднє шліфування", "MAT-STL-40X", 5),
-        ("Лазерне різання", "MAT-AL-6061", 20),
         ("Чистове точіння за програмою ЧПУ", "CMP-SPINDLE-BRG", 1),
     ]
     for op_name, sku, qty in bom_links:
@@ -1324,24 +1315,25 @@ def notify_all(text):
 # Розрахунок вартості через ШІ (опис деталі текстом -> параметри калькулятора)
 # ---------------------------------------------------------------------------
 
-AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог металообробного цеху (лазерне різання, гин, зварювання листового металу). Тобі дають опис деталі й операцій природною мовою (українською або російською), і/або зображення (фото деталі, скан або фото креслення). Твоя задача - і розрахувати параметри собівартості, і описати весь технологічний процес виготовлення.
+AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог токарно-фрезерного механообробного цеху (токарна обробка з ЧПУ, фрезерування, свердління, шліфування, універсальні верстати для дрібних серій та доробки). У цеху НЕМАЄ лазерного різання, гину листового металу чи зварювального виробництва - заготовки це прутки, болванки, поковки чи вже частково оброблені деталі, які точаться й фрезеруються на верстатах з ЧПУ. Тобі дають опис деталі й операцій природною мовою (українською або російською), і/або зображення (фото деталі, скан або фото креслення). Твоя задача - і розрахувати параметри собівартості, і описати весь технологічний процес виготовлення.
 
-Якщо додано зображення креслення чи деталі - уважно розглянь його: розміри, товщину металу (з написів на кресленні, штампу товщини, таблиці допусків), форму контуру (для оцінки периметру різу), кількість і кути згинів, отвори, різьблення, зварні шви, позначення шорсткості й термообробки, якщо вони є. Використай усе, що видно на зображенні, для розрахунку - це важливіше за здогадки. Якщо текстовий опис і зображення суперечать одне одному, довірся зображенню й зауваж розбіжність у operations_description.
+Якщо додано зображення креслення чи деталі - уважно розглянь його: розміри та форму (тіла обертання - для токарної обробки; призматичні/пази/отвори - для фрезерної), матеріал і його стан (пруток, поковка, лита заготовка), допуски й шорсткість поверхонь, різьблення, отвори під свердління, термообробку чи покриття, якщо позначені. Використай усе, що видно на зображенні, для розрахунку - це важливіше за здогадки. Якщо текстовий опис і зображення суперечать одне одному, довірся зображенню й зауваж розбіжність у operations_description.
 
-Якщо якийсь параметр не можна визначити ні з тексту, ні із зображення - постав розумне типове значення для листового металу в Україні (орієнтовно: сталь конструкційна ~55-65 грн/кг, алюміній ~150-200 грн/кг, різ лазером ~15-30 грн/м залежно від товщини, один гиб на листогині ~50-120 грн, машино-година додаткової обробки ~500-900 грн, націнка 15-25%) і обов'язково згадай це припущення у полі operations_description, щоб людина знала, що це орієнтовна оцінка, а не дані з документів.
+Якщо якийсь параметр не можна визначити ні з тексту, ні із зображення - постав розумне типове значення для механообробки в Україні (орієнтовно: сталь конструкційна ~55-65 грн/кг, алюміній ~150-200 грн/кг, нержавіюча сталь ~120-180 грн/кг; токарна обробка з ЧПУ ~600-1000 грн/машино-годину; фрезерна обробка з ЧПУ ~700-1200 грн/машино-годину; наладка верстата на партію ~300-1500 грн залежно від складності; націнка 15-25%) і обов'язково згадай це припущення у полі operations_description, щоб людина знала, що це орієнтовна оцінка, а не дані з документів.
 
-У полі operations_description дай ПОВНИЙ опис технологічного процесу: з чого і як вирізається заготовка, у якій послідовності йдуть операції (розкрій/різ → зняття задирок → гибка → зварювання → механообробка → покриття/фарбування тощо, якщо застосовно), скільки і яких гибів/зварних швів/отворів, і які значення були оцінені приблизно. Пиши це як технолог, що пояснює маршрут виготовлення колезі, 4-7 речень.
+У полі operations_description дай ПОВНИЙ опис технологічного процесу: з чого виготовляється заготовка (пруток певного діаметра, поковка тощо), у якій послідовності йдуть операції (підготовка заготовки → чорнове точіння → чистове точіння → фрезерування пазів/площин → свердління отворів → нарізання різьблення → термообробка/покриття, якщо застосовно → контроль ВТК), скільки приблизно часу займає кожен етап, і які значення були оцінені приблизно. Пиши це як технолог, що пояснює маршрут виготовлення колезі, 4-7 речень.
 
 Відповідай ВИКЛЮЧНО у форматі JSON, без жодного тексту до чи після, без markdown-обгортки ```:
 {
-  "weight_kg": <число, вага ОДНІЄЇ деталі в кг>,
+  "weight_kg": <число, вага заготовки (прутка/болванки) на ОДНУ деталь в кг>,
   "material_price_per_kg": <число, ціна металу за кг у грн>,
-  "cut_length_m": <число, периметр різу ОДНІЄЇ деталі в метрах>,
-  "cut_price_per_m": <число, ціна різу за метр у грн>,
-  "bend_count": <ціле число, кількість гибів на деталь>,
-  "bend_price_each": <число, ціна одного гибу у грн>,
-  "machine_hours": <число, машино-години на деталь для додаткової обробки, 0 якщо немає>,
-  "machine_rate_per_hour": <число, ставка за машино-годину у грн>,
+  "turning_hours": <число, час токарної обробки на ОДНУ деталь у годинах, 0 якщо токарних операцій немає>,
+  "turning_rate_per_hour": <число, ставка токарної обробки за машино-годину у грн>,
+  "milling_hours": <число, час фрезерної обробки (фрезерування/свердління/нарізання різьби) на ОДНУ деталь у годинах, 0 якщо немає>,
+  "milling_rate_per_hour": <число, ставка фрезерної обробки за машино-годину у грн>,
+  "machine_hours": <число, машино-години на деталь для додаткової обробки (шліфування, полірування, термообробка), 0 якщо немає>,
+  "machine_rate_per_hour": <число, ставка за машино-годину додаткової обробки у грн>,
+  "setup_cost_total": <число, вартість наладки верстата на всю партію у грн (одноразова, ділиться на кількість деталей), 0 якщо не оцінюється>,
   "quantity": <ціле число, кількість деталей у партії - за замовчуванням 1, якщо не вказано>,
   "margin_pct": <число, рекомендована націнка у відсотках>,
   "operations_description": "<4-7 речень українською: повний технологічний процес виготовлення та які значення були оцінені приблизно (якщо були)>"
@@ -1350,6 +1342,41 @@ AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог мет
 
 class AICalcError(Exception):
     pass
+
+
+def _extract_json_object(text):
+    """Вирізає перший повний JSON-об'єкт {...} з довільного тексту - для
+    випадків, коли модель відповідає не ЛИШЕ JSON-ом, а додає пояснювальний
+    текст до чи після нього (попри пряму заборону в системному промпті).
+    Рахує фігурні дужки вручну, а не regex-жадібністю, і коректно пропускає
+    дужки всередині рядкових значень (у т.ч. екранованих лапок), щоб не
+    зупинитись на "}" усередині, наприклад, operations_description. Повертає
+    підрядок з першою збалансованою парою {...} або None, якщо такої немає."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
 
 
 AI_IMAGE_MAX_BYTES = 5 * 1024 * 1024  # ліміт Anthropic API на одне зображення в base64
@@ -1480,10 +1507,23 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
     try:
         params = _json.loads(cleaned)
     except _json.JSONDecodeError:
-        raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
+        # Модель інколи додає пояснювальний текст ДО або ПІСЛЯ JSON-об'єкта
+        # (найчастіше коли опис деталі дуже короткий чи неоднозначний, і вона
+        # хоче попередити, що це груба оцінка) - код-фенс тут не допомагає,
+        # бо тексту навколо JSON немає обгортки ```. Тому як другу спробу
+        # вирізаємо підрядок від першої "{" до відповідної їй закриваючої "}"
+        # (з урахуванням фігурних дужок усередині текстових значень) і
+        # пробуємо розпарсити вже його - лише тоді здаємось і показуємо помилку.
+        extracted = _extract_json_object(text)
+        if extracted is None:
+            raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
+        try:
+            params = _json.loads(extracted)
+        except _json.JSONDecodeError:
+            raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
 
-    required = ["weight_kg", "material_price_per_kg", "cut_length_m", "cut_price_per_m",
-                "bend_count", "bend_price_each", "machine_hours", "machine_rate_per_hour",
+    required = ["weight_kg", "material_price_per_kg", "turning_hours", "turning_rate_per_hour",
+                "milling_hours", "milling_rate_per_hour", "machine_hours", "machine_rate_per_hour",
                 "quantity", "margin_pct", "operations_description"]
     missing = [k for k in required if k not in params]
     if missing:
@@ -1615,17 +1655,20 @@ def get_attachments(entity_type, entity_id):
 
 
 # ---------------------------------------------------------------------------
-# Розбір DXF-креслень (периметр різу, габарити заготовки)
+# Розбір DXF-креслень (довжина контуру, габарити заготовки для фрезерування)
 # ---------------------------------------------------------------------------
 
 def analyze_dxf(path):
-    """Рахує сумарну довжину різу (периметр усіх контурів) та габарити
-    заготовки з DXF-файлу — для підстановки в калькулятор вартості.
-    Підтримує найпоширеніші типи об'єктів у кресленнях для лазерного/
-    плазмового різу: LINE, CIRCLE, ARC, LWPOLYLINE, POLYLINE, SPLINE
-    (сплайн апроксимується ламаною). НЕ підтримує STEP-файли (потрібне
-    повноцінне 3D CAD-ядро, це окрема задача) та складні вкладені blocks/
-    xref-посилання всередині DXF."""
+    """Рахує сумарну довжину контуру (периметр усіх ліній) та габарити
+    заготовки з DXF-файлу — для підстановки в калькулятор вартості плоских
+    деталей під фрезерування (контур і час обробки по периметру, площа для
+    розрахунку матеріалу на партію). Для токарних деталей (тіла обертання)
+    ці значення зазвичай не потрібні — там визначальні параметри це діаметр
+    і довжина заготовки, які зручніше ввести вручну.
+    Підтримує найпоширеніші типи об'єктів у кресленнях: LINE, CIRCLE, ARC,
+    LWPOLYLINE, POLYLINE, SPLINE (сплайн апроксимується ламаною). НЕ підтримує
+    STEP-файли (потрібне повноцінне 3D CAD-ядро, це окрема задача) та складні
+    вкладені blocks/xref-посилання всередині DXF."""
     import ezdxf
     import math
 
@@ -2825,15 +2868,15 @@ document.querySelectorAll('.kanban-body').forEach(col => {
 CALCULATOR_HTML = """
 {% extends "base.html" %}
 {% block title %}Калькулятор вартості{% endblock %}
-{% block heading %}Калькулятор вартості різу/гину{% endblock %}
-{% block subheading %}Заповни вручну або завантаж DXF-креслення — периметр різу й габарити підставляться автоматично{% endblock %}
+{% block heading %}Калькулятор вартості механообробки{% endblock %}
+{% block subheading %}Заповни вручну або завантаж DXF-креслення — контур і габарити підставляться автоматично{% endblock %}
 {% block content %}
 
 <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> 🤖 Розрахунок через ШІ (опис і/або фото креслення)</div>
 <form method="post" action="{{ url_for('calculator_ai_estimate') }}" enctype="multipart/form-data" class="card card-pad" style="margin-bottom:20px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
   <div class="field" style="margin-bottom:10px;">
     <label>Опиши деталь та операції звичайною мовою (необов'язково, якщо є фото)</label>
-    <textarea name="ai_description" placeholder="напр.: Кронштейн зі сталі 3мм, розмір приблизно 200х150мм, вирізати лазером, 2 гиби під 90°, партія 100 шт" style="min-height:70px;">{{ ai_description or '' }}</textarea>
+    <textarea name="ai_description" placeholder="напр.: Вал зі сталі 40Х, пруток Ø30мм, довжина 250мм, точіння + фрезерування шпонкового паза, партія 50 шт" style="min-height:70px;">{{ ai_description or '' }}</textarea>
   </div>
   <div class="field" style="margin-bottom:10px;">
     <label>Фото деталі, скан/фото креслення або DXF-файл (до 3 файлів, PNG/JPEG/WEBP/DXF, до 5 МБ кожне)</label>
@@ -2842,7 +2885,7 @@ CALCULATOR_HTML = """
   <button class="btn btn-primary" type="submit">Розрахувати через ШІ</button>
   <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
     Потрібен API-ключ Anthropic (див. «Налаштування» → «ШІ-розрахунок вартості»). Якщо додати фото/скан
-    креслення або DXF-файл, ШІ сам розгляне розміри, товщину, гиби й отвори на зображенні та опише весь
+    креслення або DXF-файл, ШІ сам розгляне розміри, форму та отвори на зображенні і опише весь
     технологічний процес виготовлення разом із розрахунком. DXF автоматично рендериться в картинку перед
     відправкою. Це орієнтовна оцінка — обов'язково перевір цифри перед тим,
     як ставити їх у КП клієнту.
@@ -2863,47 +2906,49 @@ CALCULATOR_HTML = """
   </p>
   {% if dxf_result %}
   <div style="margin-top:14px; padding:12px; background:var(--bg-soft); border-radius:8px; font-size:12.5px;">
-    Розпізнано {{ dxf_result.entity_count }} об'єктів · периметр різу <b style="color:var(--accent-2);">{{ dxf_result.cut_length_m }} м</b>
+    Розпізнано {{ dxf_result.entity_count }} об'єктів · довжина контуру <b style="color:var(--accent-2);">{{ dxf_result.cut_length_m }} м</b>
     · габарити {{ dxf_result.width_mm }} × {{ dxf_result.height_mm }} мм · площа заготовки {{ dxf_result.area_m2 }} м²
     {% if dxf_result.estimated_weight_kg %} · орієнтовна вага <b style="color:var(--accent-2);">{{ dxf_result.estimated_weight_kg }} кг</b>{% endif %}
-    — значення нижче підставлено автоматично, можна скоригувати вручну.
+    — значення нижче підставлено автоматично, можна скоригувати вручну. Придатно для плоских/фрезерованих деталей;
+    для тіл обертання (токарна обробка) габарити зручніше ввести вручну.
   </div>
   {% endif %}
 </form>
 
 <div class="grid grid-2">
   <form method="post" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-    <div class="section-title" style="margin-top:0;">Матеріал</div>
+    <div class="section-title" style="margin-top:0;">Матеріал заготовки</div>
     <div class="form-grid" style="margin-bottom:14px;">
-      <div class="field"><label>Вага деталі, кг</label><input type="number" step="0.01" name="weight_kg" value="{{ request.form.get('weight_kg') or (dxf_result.estimated_weight_kg if dxf_result and dxf_result.estimated_weight_kg else '') }}" required></div>
+      <div class="field"><label>Вага заготовки, кг</label><input type="number" step="0.01" name="weight_kg" value="{{ request.form.get('weight_kg') or (dxf_result.estimated_weight_kg if dxf_result and dxf_result.estimated_weight_kg else '') }}" required></div>
       <div class="field"><label>Ціна металу, грн/кг</label><input type="number" step="0.01" name="material_price_per_kg" value="{{ request.form.get('material_price_per_kg','') }}" required></div>
     </div>
-    <div class="section-title">Різ (лазер/плазма)</div>
+    <div class="section-title">Токарна обробка</div>
     <div class="form-grid" style="margin-bottom:14px;">
-      <div class="field"><label>Периметр різу, м</label><input type="number" step="0.01" name="cut_length_m" value="{{ request.form.get('cut_length_m') or (dxf_result.cut_length_m if dxf_result else '') }}"></div>
-      <div class="field"><label>Ціна різу, грн/м</label><input type="number" step="0.01" name="cut_price_per_m" value="{{ request.form.get('cut_price_per_m','') }}"></div>
+      <div class="field"><label>Час токарної обробки, год</label><input type="number" step="0.01" name="turning_hours" value="{{ request.form.get('turning_hours','') }}"></div>
+      <div class="field"><label>Ставка, грн/год</label><input type="number" step="0.01" name="turning_rate_per_hour" value="{{ request.form.get('turning_rate_per_hour','') }}"></div>
     </div>
-    <div class="section-title">Гин (листогин)</div>
+    <div class="section-title">Фрезерна обробка (фрезерування / свердління / різьба)</div>
     <div class="form-grid" style="margin-bottom:14px;">
-      <div class="field"><label>Кількість гибів</label><input type="number" step="1" name="bend_count" value="{{ request.form.get('bend_count','') }}"></div>
-      <div class="field"><label>Ціна за один гиб, грн</label><input type="number" step="0.01" name="bend_price_each" value="{{ request.form.get('bend_price_each','') }}"></div>
+      <div class="field"><label>Час фрезерної обробки, год</label><input type="number" step="0.01" name="milling_hours" value="{{ request.form.get('milling_hours','') }}"></div>
+      <div class="field"><label>Ставка, грн/год</label><input type="number" step="0.01" name="milling_rate_per_hour" value="{{ request.form.get('milling_rate_per_hour','') }}"></div>
     </div>
-    <div class="section-title">Машино-години (додаткова обробка)</div>
+    <div class="section-title">Додаткова обробка (шліфування / термообробка / покриття)</div>
     <div class="form-grid" style="margin-bottom:14px;">
       <div class="field"><label>Машино-години</label><input type="number" step="0.01" name="machine_hours" value="{{ request.form.get('machine_hours','') }}"></div>
       <div class="field"><label>Ставка, грн/год</label><input type="number" step="0.01" name="machine_rate_per_hour" value="{{ request.form.get('machine_rate_per_hour','') }}"></div>
     </div>
-    <div class="section-title">Партія та націнка</div>
+    <div class="section-title">Наладка та партія</div>
     <div class="form-grid" style="margin-bottom:14px;">
+      <div class="field"><label>Наладка верстата на партію, грн</label><input type="number" step="0.01" name="setup_cost_total" value="{{ request.form.get('setup_cost_total','') }}"></div>
       <div class="field"><label>Кількість деталей</label><input type="number" step="1" name="quantity" value="{{ request.form.get('quantity','1') }}"></div>
       <div class="field"><label>Націнка, %</label><input type="number" step="1" name="margin_pct" value="{{ request.form.get('margin_pct','20') }}"></div>
     </div>
-    <div class="section-title">Матеріал на партію (розкрій листа)</div>
+    <div class="section-title">Матеріал на партію (для плоских деталей під фрезерування)</div>
     <div class="form-grid" style="margin-bottom:14px;">
       <div class="field"><label>Площа деталі, м²</label><input type="number" step="0.001" name="part_area_m2" value="{{ request.form.get('part_area_m2') or (dxf_result.area_m2 if dxf_result else '') }}"></div>
       <div class="field"><label>Коефіцієнт розкрою, %</label><input type="number" step="1" name="nesting_pct" value="{{ request.form.get('nesting_pct','75') }}"></div>
-      <div class="field"><label>Ширина листа, мм</label><input type="number" step="1" name="sheet_width_mm" value="{{ request.form.get('sheet_width_mm','1250') }}"></div>
-      <div class="field"><label>Довжина листа, мм</label><input type="number" step="1" name="sheet_length_mm" value="{{ request.form.get('sheet_length_mm','2500') }}"></div>
+      <div class="field"><label>Ширина заготовки, мм</label><input type="number" step="1" name="sheet_width_mm" value="{{ request.form.get('sheet_width_mm','1250') }}"></div>
+      <div class="field"><label>Довжина заготовки, мм</label><input type="number" step="1" name="sheet_length_mm" value="{{ request.form.get('sheet_length_mm','2500') }}"></div>
     </div>
     <div class="field" style="margin-bottom:14px;">
       <label>Звірити з позицією на складі (необов'язково)</label>
@@ -2923,8 +2968,8 @@ CALCULATOR_HTML = """
       <div style="font-size:11px; color:var(--accent-2); font-weight:700; margin-bottom:6px;">🤖 ОЦІНКА ШІ — ПЕРЕВІР ПЕРЕД ВИКОРИСТАННЯМ</div>
       <p style="font-size:12.5px; margin:0 0 10px;">{{ result.ai_operations_description }}</p>
       <div style="font-size:11px; color:var(--text-dim);">
-        Вага: {{ result.ai_inputs.weight_kg }} кг · Метал: {{ result.ai_inputs.material_price_per_kg }} грн/кг ·
-        Різ: {{ result.ai_inputs.cut_length_m }} м · Гибів: {{ result.ai_inputs.bend_count|int }} ·
+        Заготовка: {{ result.ai_inputs.weight_kg }} кг · Метал: {{ result.ai_inputs.material_price_per_kg }} грн/кг ·
+        Токарна: {{ result.ai_inputs.turning_hours }} год · Фрезерна: {{ result.ai_inputs.milling_hours }} год ·
         Партія: {{ result.ai_inputs.quantity|int }} шт · Націнка: {{ result.ai_inputs.margin_pct }}%
       </div>
     </div>
@@ -2932,9 +2977,10 @@ CALCULATOR_HTML = """
     <div class="card card-pad">
       <table style="width:100%; font-size:13px;">
         <tr><td>Матеріал</td><td style="text-align:right;">{{ result.material_cost }} грн</td></tr>
-        <tr><td>Різ</td><td style="text-align:right;">{{ result.cutting_cost }} грн</td></tr>
-        <tr><td>Гин</td><td style="text-align:right;">{{ result.bending_cost }} грн</td></tr>
-        <tr><td>Машино-години</td><td style="text-align:right;">{{ result.machine_cost }} грн</td></tr>
+        <tr><td>Токарна обробка</td><td style="text-align:right;">{{ result.turning_cost }} грн</td></tr>
+        <tr><td>Фрезерна обробка</td><td style="text-align:right;">{{ result.milling_cost }} грн</td></tr>
+        <tr><td>Додаткова обробка</td><td style="text-align:right;">{{ result.machine_cost }} грн</td></tr>
+        {% if result.setup_cost_total %}<tr><td>Наладка (за од., {{ result.setup_cost_total }} грн на партію)</td><td style="text-align:right;">{{ result.setup_cost_per_unit }} грн</td></tr>{% endif %}
         <tr style="border-top:1px solid var(--border);"><td><b>Собівартість за од.</b></td><td style="text-align:right;"><b>{{ result.cost_per_unit }} грн</b></td></tr>
         <tr><td>Ціна за од. (+{{ result.margin_pct }}%)</td><td style="text-align:right; color:var(--accent-2);"><b>{{ result.price_per_unit }} грн</b></td></tr>
         <tr style="border-top:1px solid var(--border);"><td><b>Разом за {{ result.quantity }} шт.</b></td><td style="text-align:right; font-size:18px; color:var(--accent);"><b>{{ result.total_price }} грн</b></td></tr>
@@ -4208,8 +4254,8 @@ SETTINGS_HTML = """
     <div class="section-title"><span class="accent-dot"></span> 🤖 ШІ-розрахунок вартості</div>
     <div class="card card-pad">
       <p style="font-size:12.5px; color:var(--text-dim); margin-top:0;">
-        Дозволяє в калькуляторі описати деталь звичайним текстом (напр. «лист сталі 3мм 500х300,
-        вирізати лазером, 2 гиби, партія 50 шт») — ШІ сам оцінить параметри й порахує вартість.
+        Дозволяє в калькуляторі описати деталь звичайним текстом (напр. «вал зі сталі 40Х, Ø30х250мм,
+        точіння + фрезерування паза, партія 50 шт») або додати фото/скан креслення — ШІ сам оцінить параметри й порахує вартість.
         Потрібен власний API-ключ Anthropic (<a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:var(--accent-2);">console.anthropic.com</a>).
       </p>
       <form method="post" action="{{ url_for('settings_save') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
@@ -4744,49 +4790,59 @@ def deals_board():
 @login_required
 @role_required("sales")
 def cost_calculator():
-    """Параметричний калькулятор вартості різу/гину листового металу.
-    Периметр різу та габарити можна ввести вручну АБО отримати автоматично,
-    завантаживши DXF-креслення (analyze_dxf). STEP свідомо не підтримується —
-    потрібне повноцінне 3D CAD-ядро, це окрема інженерна задача.
+    """Параметричний калькулятор вартості токарно-фрезерної механообробки:
+    матеріал заготовки, токарна обробка, фрезерна обробка (фрезерування/
+    свердління/нарізання різьби), додаткова обробка (шліфування, покриття),
+    наладка верстата на партію.
 
-    Додатково рахує, скільки листів матеріалу потрібно на партію деталей
-    (площа деталі + розмір стандартного листа + коефіцієнт розкрою) і
-    звіряє з залишком на складі."""
+    Контур деталі та габарити для фрезерування плоских деталей можна ввести
+    вручну АБО отримати автоматично, завантаживши DXF-креслення (analyze_dxf).
+    STEP свідомо не підтримується — потрібне повноцінне 3D CAD-ядро, це
+    окрема інженерна задача.
+
+    Додатково (для деталей з плоского/листового прокату, що йдуть під
+    фрезерування) рахує, скільки заготовок матеріалу потрібно на партію
+    деталей (площа деталі + розмір стандартної заготовки + коефіцієнт
+    розкрою) і звіряє з залишком на складі."""
     result = None
     if request.method == "POST":
         f = request.form
         try:
-            weight_kg = parse_number(f, "weight_kg", default=0, min_value=0, label="Вага деталі")
+            weight_kg = parse_number(f, "weight_kg", default=0, min_value=0, label="Вага заготовки")
             material_price = parse_number(f, "material_price_per_kg", default=0, min_value=0, label="Ціна металу за кг")
-            cut_length_m = parse_number(f, "cut_length_m", default=0, min_value=0, label="Периметр різу")
-            cut_speed_price = parse_number(f, "cut_price_per_m", default=0, min_value=0, label="Ціна різу за метр")
-            bend_count = parse_number(f, "bend_count", default=0, min_value=0, label="Кількість гибів")
-            bend_price = parse_number(f, "bend_price_each", default=0, min_value=0, label="Ціна одного гибу")
-            machine_hours = parse_number(f, "machine_hours", default=0, min_value=0, label="Машино-години")
-            machine_rate = parse_number(f, "machine_rate_per_hour", default=0, min_value=0, label="Ставка за машино-годину")
+            turning_hours = parse_number(f, "turning_hours", default=0, min_value=0, label="Час токарної обробки")
+            turning_rate = parse_number(f, "turning_rate_per_hour", default=0, min_value=0, label="Ставка токарної обробки за годину")
+            milling_hours = parse_number(f, "milling_hours", default=0, min_value=0, label="Час фрезерної обробки")
+            milling_rate = parse_number(f, "milling_rate_per_hour", default=0, min_value=0, label="Ставка фрезерної обробки за годину")
+            machine_hours = parse_number(f, "machine_hours", default=0, min_value=0, label="Машино-години додаткової обробки")
+            machine_rate = parse_number(f, "machine_rate_per_hour", default=0, min_value=0, label="Ставка за машино-годину додаткової обробки")
+            setup_cost_total = parse_number(f, "setup_cost_total", default=0, min_value=0, label="Вартість наладки на партію")
             quantity = parse_number(f, "quantity", default=1, min_value=1, label="Кількість деталей")
             margin_pct = parse_number(f, "margin_pct", default=20, min_value=0, label="Націнка, %")
             part_area_m2 = parse_number(f, "part_area_m2", default=0, min_value=0, label="Площа деталі")
-            sheet_width_mm = parse_number(f, "sheet_width_mm", default=0, min_value=0, label="Ширина листа")
-            sheet_length_mm = parse_number(f, "sheet_length_mm", default=0, min_value=0, label="Довжина листа")
+            sheet_width_mm = parse_number(f, "sheet_width_mm", default=0, min_value=0, label="Ширина заготовки")
+            sheet_length_mm = parse_number(f, "sheet_length_mm", default=0, min_value=0, label="Довжина заготовки")
             nesting_pct = parse_number(f, "nesting_pct", default=75, min_value=1, max_value=100, label="Коефіцієнт розкрою")
         except ValidationError as e:
             flash(str(e), "error")
             return render_template("calculator.html", active="calculator", result=None, dxf_result=None, warehouse_items=[])
 
         material_cost = weight_kg * material_price
-        cutting_cost = cut_length_m * cut_speed_price
-        bending_cost = bend_count * bend_price
+        turning_cost = turning_hours * turning_rate
+        milling_cost = milling_hours * milling_rate
         machine_cost = machine_hours * machine_rate
-        cost_per_unit = material_cost + cutting_cost + bending_cost + machine_cost
+        setup_cost_per_unit = (setup_cost_total / quantity) if quantity else 0
+        cost_per_unit = material_cost + turning_cost + milling_cost + machine_cost + setup_cost_per_unit
         price_per_unit = cost_per_unit * (1 + margin_pct / 100)
         total_price = price_per_unit * quantity
 
         result = {
             "material_cost": round(material_cost, 2),
-            "cutting_cost": round(cutting_cost, 2),
-            "bending_cost": round(bending_cost, 2),
+            "turning_cost": round(turning_cost, 2),
+            "milling_cost": round(milling_cost, 2),
             "machine_cost": round(machine_cost, 2),
+            "setup_cost_total": round(setup_cost_total, 2),
+            "setup_cost_per_unit": round(setup_cost_per_unit, 2),
             "cost_per_unit": round(cost_per_unit, 2),
             "price_per_unit": round(price_per_unit, 2),
             "quantity": quantity,
@@ -4794,7 +4850,7 @@ def cost_calculator():
             "margin_pct": margin_pct,
         }
 
-        # Розрахунок кількості листів матеріалу на партію (якщо вказано розмір листа й площу деталі)
+        # Розрахунок кількості заготовок матеріалу на партію (якщо вказано розмір заготовки й площу деталі)
         material_calc = None
         if part_area_m2 > 0 and sheet_width_mm > 0 and sheet_length_mm > 0:
             sheet_area_m2 = (sheet_width_mm * sheet_length_mm) / 1_000_000
@@ -4864,35 +4920,39 @@ def calculator_ai_estimate():
 
     weight_kg = float(params.get("weight_kg") or 0)
     material_price = float(params.get("material_price_per_kg") or 0)
-    cut_length_m = float(params.get("cut_length_m") or 0)
-    cut_speed_price = float(params.get("cut_price_per_m") or 0)
-    bend_count = float(params.get("bend_count") or 0)
-    bend_price = float(params.get("bend_price_each") or 0)
+    turning_hours = float(params.get("turning_hours") or 0)
+    turning_rate = float(params.get("turning_rate_per_hour") or 0)
+    milling_hours = float(params.get("milling_hours") or 0)
+    milling_rate = float(params.get("milling_rate_per_hour") or 0)
     machine_hours = float(params.get("machine_hours") or 0)
     machine_rate = float(params.get("machine_rate_per_hour") or 0)
+    setup_cost_total = float(params.get("setup_cost_total") or 0)
     quantity = max(int(params.get("quantity") or 1), 1)
     margin_pct = float(params.get("margin_pct") or 20)
 
     material_cost = weight_kg * material_price
-    cutting_cost = cut_length_m * cut_speed_price
-    bending_cost = bend_count * bend_price
+    turning_cost = turning_hours * turning_rate
+    milling_cost = milling_hours * milling_rate
     machine_cost = machine_hours * machine_rate
-    cost_per_unit = material_cost + cutting_cost + bending_cost + machine_cost
+    setup_cost_per_unit = (setup_cost_total / quantity) if quantity else 0
+    cost_per_unit = material_cost + turning_cost + milling_cost + machine_cost + setup_cost_per_unit
     price_per_unit = cost_per_unit * (1 + margin_pct / 100)
     total_price = price_per_unit * quantity
 
     result = {
-        "material_cost": round(material_cost, 2), "cutting_cost": round(cutting_cost, 2),
-        "bending_cost": round(bending_cost, 2), "machine_cost": round(machine_cost, 2),
+        "material_cost": round(material_cost, 2), "turning_cost": round(turning_cost, 2),
+        "milling_cost": round(milling_cost, 2), "machine_cost": round(machine_cost, 2),
+        "setup_cost_total": round(setup_cost_total, 2), "setup_cost_per_unit": round(setup_cost_per_unit, 2),
         "cost_per_unit": round(cost_per_unit, 2), "price_per_unit": round(price_per_unit, 2),
         "quantity": quantity, "total_price": round(total_price, 2), "margin_pct": margin_pct,
         "material_calc": None, "stock_check": None,
         "ai_operations_description": params.get("operations_description", ""),
         "ai_inputs": {
             "weight_kg": weight_kg, "material_price_per_kg": material_price,
-            "cut_length_m": cut_length_m, "cut_price_per_m": cut_speed_price,
-            "bend_count": bend_count, "bend_price_each": bend_price,
+            "turning_hours": turning_hours, "turning_rate_per_hour": turning_rate,
+            "milling_hours": milling_hours, "milling_rate_per_hour": milling_rate,
             "machine_hours": machine_hours, "machine_rate_per_hour": machine_rate,
+            "setup_cost_total": setup_cost_total,
             "quantity": quantity, "margin_pct": margin_pct,
         },
     }
