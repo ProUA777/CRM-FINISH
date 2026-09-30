@@ -1406,6 +1406,36 @@ def _extract_json_object(text):
     return None
 
 
+def render_pdf_to_png_bytes(raw_bytes, max_pages=3, dpi=150):
+    """Рендерить сторінки PDF-файлу (скан чи PDF-експорт креслення) у список
+    PNG-картинок - ШІ Vision API вміє дивитись лише на растр, а не на PDF
+    напряму. Через PyMuPDF (модуль fitz) - навмисно НЕ через pdf2image,
+    бо той залежить від зовнішнього системного бінарника poppler
+    (pdftoppm), якого нема на чистій Windows-машині користувача і який
+    PyInstaller не запакує автоматично в один .exe; PyMuPDF - самодостатнє
+    pip-колесо з вбудованим MuPDF, без зовнішніх системних залежностей.
+    Повертає список байтів PNG (по одному на сторінку, макс. max_pages
+    перших сторінок - креслення зазвичай на першій сторінці, але скан
+    техпаспорта чи КД може мати кілька)."""
+    import fitz  # PyMuPDF
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"файл не схожий на коректний PDF: {e}")
+    try:
+        if doc.page_count == 0:
+            raise ValueError("PDF не містить жодної сторінки")
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        pages = []
+        for i in range(min(doc.page_count, max_pages)):
+            pix = doc.load_page(i).get_pixmap(matrix=matrix)
+            pages.append(pix.tobytes("png"))
+        return pages
+    finally:
+        doc.close()
+
+
 AI_IMAGE_MAX_BYTES = 5 * 1024 * 1024  # ліміт Anthropic API на одне зображення в base64
 
 
@@ -1463,27 +1493,44 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
         # на .png, прийшов би сюди з mimetype="image/png", тож mimetype сам
         # по собі нічого не доводить і навмисно тут ігнорується).
         media_type = detect_image_media_type(raw)
-        if not media_type:
-            # Це не растрове зображення - можливо, це векторне DXF-креслення.
-            # Anthropic Vision API вміє дивитись лише на растр, тож рендеримо
-            # DXF у PNG "на льоту" (в пам'яті) і показуємо ШІ вже картинку.
+        if media_type:
+            page_pngs = [raw]
+        elif raw.lstrip(b"\x00\x20\t\r\n")[:5] == b"%PDF-":
+            # PDF (скан чи експорт креслення) - рендеримо сторінки в PNG,
+            # Vision API дивиться лише на растр, не на сам PDF.
             try:
-                raw = render_dxf_to_png_bytes(raw)
+                page_pngs = render_pdf_to_png_bytes(raw, max_pages=3)
             except Exception as e:
                 raise AICalcError(
-                    f"Файл «{filename}» — не зображення (PNG/JPEG/GIF/WEBP) і не вдалось розібрати як DXF-креслення ({e}). "
-                    f"Завантаж фото, скан або справжній DXF-файл."
+                    f"Файл «{filename}» — не вдалось розібрати як PDF ({e}). "
+                    f"Завантаж фото, скан, DXF- або PDF-файл."
                 )
             media_type = "image/png"
-            if len(raw) > AI_IMAGE_MAX_BYTES:
-                raise AICalcError(f"Рендер DXF-креслення «{filename}» вийшов завеликим — спрости креслення")
-        content_blocks.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": _base64.b64encode(raw).decode("ascii")},
-        })
+        else:
+            # Не растрове зображення і не PDF - можливо, це векторне
+            # DXF-креслення. Рендеримо DXF у PNG "на льоту" (в пам'яті).
+            try:
+                page_pngs = [render_dxf_to_png_bytes(raw)]
+            except Exception as e:
+                raise AICalcError(
+                    f"Файл «{filename}» — не зображення (PNG/JPEG/GIF/WEBP), не PDF і не вдалось розібрати як "
+                    f"DXF-креслення ({e}). Завантаж фото, скан, DXF- або PDF-файл."
+                )
+            media_type = "image/png"
 
-    if len(content_blocks) > 3:
-        raise AICalcError("Максимум 3 зображення за один розрахунок")
+        for page_bytes in page_pngs:
+            if len(page_bytes) > AI_IMAGE_MAX_BYTES:
+                raise AICalcError(
+                    f"Рендер файлу «{filename}» вийшов завеликим — спрости креслення чи зменши роздільність PDF"
+                )
+            if len(content_blocks) >= 3:
+                raise AICalcError(
+                    "Максимум 3 зображення за один розрахунок (кожна сторінка PDF рахується як окреме зображення)"
+                )
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": _base64.b64encode(page_bytes).decode("ascii")},
+            })
 
     text = description.strip() if description and description.strip() else (
         "Проаналізуй зображення (креслення/фото деталі) і розрахуй параметри собівартості "
@@ -1491,15 +1538,44 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
     )
     content_blocks.append({"type": "text", "text": text})
 
-    # Префіл відповіді асистента символом "{" - це стандартний прийом Anthropic
-    # API для гарантованого структурованого виводу: модель ФІЗИЧНО не може
-    # почати відповідь з вибачення чи уточнюючого питання (напр. коли опис
-    # дуже короткий і їй бракує деталей про операції), бо її відповідь - це
-    # ПРОДОВЖЕННЯ вже розпочатого "{", а не новий текст з чистого аркуша.
-    # Раніше, без префілу, модель на короткому/неоднозначному описі інколи
-    # ігнорувала пряму заборону в системному промпті і писала пояснювальний
-    # текст замість JSON - це і була причина помилки "неочікуваний формат"
-    # навіть коли json-парсинг з фолбеком уже був на місці.
+    required = ["weight_kg", "material_price_per_kg", "turning_hours", "turning_rate_per_hour",
+                "milling_hours", "milling_rate_per_hour", "machine_hours", "machine_rate_per_hour",
+                "quantity", "margin_pct", "operations_description"]
+
+    # ПРИМУСОВИЙ виклик інструмента (tool_choice) замість текстового префілу
+    # асистента - надійніший спосіб гарантувати структурований JSON-вивід:
+    # Anthropic API сам повертає вже РОЗІБРАНИЙ об'єкт у полі tool_use.input,
+    # тож не потрібен жоден текстовий парсинг/фолбек, і модель фізично не
+    # може відповісти поясненням чи уточненням замість даних.
+    # (Раніше тут був префіл {"role": "assistant", "content": "{"} - той
+    # прийом підтримують не всі моделі/режими, і на практиці API почав
+    # повертати помилку 400 "This model does not support assistant message
+    # prefill" - тому перейшли на tool_choice, який працює завжди.)
+    tool_schema = {
+        "name": "cost_estimate",
+        "description": "Структуровані параметри для розрахунку собівартості механообробної деталі та опис техпроцесу",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "weight_kg": {"type": "number", "description": "Маса однієї деталі, кг"},
+                "material_price_per_kg": {"type": "number", "description": "Ціна матеріалу за кг, грн"},
+                "turning_hours": {"type": "number", "description": "Час токарної обробки однієї деталі, год"},
+                "turning_rate_per_hour": {"type": "number", "description": "Ставка токарного верстата, грн/год"},
+                "milling_hours": {"type": "number", "description": "Час фрезерної обробки однієї деталі, год"},
+                "milling_rate_per_hour": {"type": "number", "description": "Ставка фрезерного верстата, грн/год"},
+                "machine_hours": {"type": "number", "description": "Час іншої мех. обробки (шліфування тощо), год"},
+                "machine_rate_per_hour": {"type": "number", "description": "Ставка іншого верстата, грн/год"},
+                "quantity": {"type": "number", "description": "Кількість деталей у партії"},
+                "margin_pct": {"type": "number", "description": "Рекомендована націнка, %"},
+                "operations_description": {
+                    "type": "string",
+                    "description": "РОЗГОРНУТИЙ технологічний маршрут українською, мінімум 10-15 речень, з назвою конкретного верстата на кожній операції",
+                },
+            },
+            "required": required,
+        },
+    }
+
     try:
         resp = _requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -1514,8 +1590,9 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
                 "system": AI_CALC_SYSTEM_PROMPT,
                 "messages": [
                     {"role": "user", "content": content_blocks},
-                    {"role": "assistant", "content": "{"},
                 ],
+                "tools": [tool_schema],
+                "tool_choice": {"type": "tool", "name": "cost_estimate"},
             },
             timeout=45,
         )
@@ -1537,28 +1614,20 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
 
     try:
         data = resp.json()
-        text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
     except Exception:
         raise AICalcError("Не вдалось розібрати відповідь Anthropic API")
 
-    # API повертає лише ПРОДОВЖЕННЯ після префілу - сам символ "{" у відповіді
-    # відсутній (ми його самі дописали в messages), тож повертаємо його назад,
-    # щоб отримати повний JSON-текст для розбору нижче.
-    if not text.lstrip().startswith("{"):
-        text = "{" + text
+    params = None
+    for block in data.get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == "cost_estimate":
+            params = block.get("input")
+            break
 
-    # Модель інколи все одно обгортає JSON у ```json ... ``` попри інструкцію - знімаємо обгортку.
-    cleaned = _re_local.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=_re_local.MULTILINE).strip()
-    try:
-        params = _json.loads(cleaned)
-    except _json.JSONDecodeError:
-        # Модель інколи додає пояснювальний текст ДО або ПІСЛЯ JSON-об'єкта
-        # (найчастіше коли опис деталі дуже короткий чи неоднозначний, і вона
-        # хоче попередити, що це груба оцінка) - код-фенс тут не допомагає,
-        # бо тексту навколо JSON немає обгортки ```. Тому як другу спробу
-        # вирізаємо підрядок від першої "{" до відповідної їй закриваючої "}"
-        # (з урахуванням фігурних дужок усередині текстових значень) і
-        # пробуємо розпарсити вже його - лише тоді здаємось і показуємо помилку.
+    if params is None:
+        # Захисний фолбек на випадок, якщо модель (всупереч tool_choice) все ж
+        # повернула звичайний текст - намагаємось витягти з нього JSON-об'єкт,
+        # перш ніж здатись.
+        text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
         extracted = _extract_json_object(text)
         if extracted is None:
             raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
@@ -1567,9 +1636,9 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
         except _json.JSONDecodeError:
             raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
 
-    required = ["weight_kg", "material_price_per_kg", "turning_hours", "turning_rate_per_hour",
-                "milling_hours", "milling_rate_per_hour", "machine_hours", "machine_rate_per_hour",
-                "quantity", "margin_pct", "operations_description"]
+    if not isinstance(params, dict):
+        raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
+
     missing = [k for k in required if k not in params]
     if missing:
         raise AICalcError(f"ШІ не заповнив усі потрібні поля ({', '.join(missing)}) — спробуй ще раз")
@@ -2924,16 +2993,16 @@ CALCULATOR_HTML = """
     <textarea name="ai_description" placeholder="напр.: Вал зі сталі 40Х, пруток Ø30мм, довжина 250мм, точіння + фрезерування шпонкового паза, партія 50 шт" style="min-height:70px;">{{ ai_description or '' }}</textarea>
   </div>
   <div class="field" style="margin-bottom:10px;">
-    <label>Фото деталі, скан/фото креслення або DXF-файл (до 3 файлів, PNG/JPEG/WEBP/DXF, до 5 МБ кожне)</label>
-    <input type="file" name="ai_images" accept="image/png,image/jpeg,image/webp,image/gif,.dxf" multiple>
+    <label>Фото деталі, скан/фото креслення, DXF- або PDF-файл (до 3 файлів або сторінок, PNG/JPEG/WEBP/DXF/PDF, до 5 МБ кожне)</label>
+    <input type="file" name="ai_images" accept="image/png,image/jpeg,image/webp,image/gif,.dxf,.pdf,application/pdf" multiple>
   </div>
   <button class="btn btn-primary" type="submit">Розрахувати через ШІ</button>
   <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
     Потрібен API-ключ Anthropic (див. «Налаштування» → «ШІ-розрахунок вартості»). Якщо додати фото/скан
-    креслення або DXF-файл, ШІ сам розгляне розміри, форму та отвори на зображенні і опише весь
-    технологічний процес виготовлення разом із розрахунком. DXF автоматично рендериться в картинку перед
-    відправкою. Це орієнтовна оцінка — обов'язково перевір цифри перед тим,
-    як ставити їх у КП клієнту.
+    креслення, DXF- або PDF-файл, ШІ сам розгляне розміри, форму та отвори на зображенні і опише весь
+    технологічний процес виготовлення разом із розрахунком. DXF і кожна сторінка PDF автоматично
+    рендеряться в картинку перед відправкою (PDF — до 3 перших сторінок). Це орієнтовна оцінка — обов'язково
+    перевір цифри перед тим, як ставити їх у КП клієнту.
   </p>
 </form>
 
@@ -3053,7 +3122,26 @@ CALCULATOR_HTML = """
       </div>
       {% endif %}
       <p style="font-size:11.5px; color:var(--text-dim); margin-bottom:8px; margin-top:14px;">Створити угоду з цим розрахунком — далі обереш клієнта на сторінці угоди.</p>
-      <a class="btn btn-primary btn-sm" href="{{ url_for('deal_new', prefill_title='Розрахунок з калькулятора', prefill_amount=result.total_price) }}">Створити угоду на основі розрахунку →</a>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <a class="btn btn-primary btn-sm" href="{{ url_for('deal_new', prefill_title='Розрахунок з калькулятора', prefill_amount=result.total_price) }}">Створити угоду на основі розрахунку →</a>
+        <form method="post" action="{{ url_for('calculator_quote_pdf') }}" target="_blank">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="weight_kg" value="{{ result.ai_inputs.weight_kg if result.ai_inputs else request.form.get('weight_kg', 0) }}">
+          <input type="hidden" name="material_price_per_kg" value="{{ result.ai_inputs.material_price_per_kg if result.ai_inputs else request.form.get('material_price_per_kg', 0) }}">
+          <input type="hidden" name="turning_hours" value="{{ result.ai_inputs.turning_hours if result.ai_inputs else request.form.get('turning_hours', 0) }}">
+          <input type="hidden" name="turning_rate_per_hour" value="{{ result.ai_inputs.turning_rate_per_hour if result.ai_inputs else request.form.get('turning_rate_per_hour', 0) }}">
+          <input type="hidden" name="milling_hours" value="{{ result.ai_inputs.milling_hours if result.ai_inputs else request.form.get('milling_hours', 0) }}">
+          <input type="hidden" name="milling_rate_per_hour" value="{{ result.ai_inputs.milling_rate_per_hour if result.ai_inputs else request.form.get('milling_rate_per_hour', 0) }}">
+          <input type="hidden" name="machine_hours" value="{{ result.ai_inputs.machine_hours if result.ai_inputs else request.form.get('machine_hours', 0) }}">
+          <input type="hidden" name="machine_rate_per_hour" value="{{ result.ai_inputs.machine_rate_per_hour if result.ai_inputs else request.form.get('machine_rate_per_hour', 0) }}">
+          <input type="hidden" name="setup_cost_total" value="{{ result.ai_inputs.setup_cost_total if result.ai_inputs else request.form.get('setup_cost_total', 0) }}">
+          <input type="hidden" name="quantity" value="{{ result.ai_inputs.quantity if result.ai_inputs else request.form.get('quantity', 1) }}">
+          <input type="hidden" name="margin_pct" value="{{ result.ai_inputs.margin_pct if result.ai_inputs else request.form.get('margin_pct', 20) }}">
+          <input type="hidden" name="part_description" value="{{ ai_description or 'Розрахунок вартості механообробки (ручний ввід параметрів)' }}">
+          <input type="hidden" name="operations_description" value="{{ result.ai_operations_description or '' }}">
+          <button class="btn btn-ghost btn-sm" type="submit">📄 Завантажити як PDF</button>
+        </form>
+      </div>
     </div>
     {% else %}
     <div class="empty" style="padding:60px 20px;">Заповни параметри зліва і натисни «Розрахувати»</div>
@@ -5004,6 +5092,173 @@ def calculator_ai_estimate():
     flash("Розрахунок від ШІ готовий — обов'язково перевір цифри перед використанням у КП", "success")
     return render_template("calculator.html", active="calculator", result=result, dxf_result=None,
                             warehouse_items=warehouse_items, ai_description=description)
+
+
+@app.route("/calculator/quote.pdf", methods=["POST"])
+@login_required
+@role_required("sales")
+def calculator_quote_pdf():
+    """Генерує PDF одразу з результату калькулятора (ручного чи ШІ-розрахунку),
+    без потреби спершу створювати угоду - зручно, щоб відразу відправити
+    клієнту розрахунок і повний технологічний процес. Суми НАВМИСНО рахуються
+    заново на сервері з переданих параметрів (а не беруться готовими з
+    прихованих полів форми), щоб підсумок у PDF не залежав від значень, які
+    можна підмінити в інструментах розробника браузера - той самий принцип
+    "довіряй, але перевіряй", що й у решті калькулятора."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas as pdf_canvas
+    from flask import Response
+
+    f = request.form
+    try:
+        weight_kg = parse_number(f, "weight_kg", default=0, min_value=0, label="Вага заготовки")
+        material_price = parse_number(f, "material_price_per_kg", default=0, min_value=0, label="Ціна металу за кг")
+        turning_hours = parse_number(f, "turning_hours", default=0, min_value=0, label="Час токарної обробки")
+        turning_rate = parse_number(f, "turning_rate_per_hour", default=0, min_value=0, label="Ставка токарної обробки за годину")
+        milling_hours = parse_number(f, "milling_hours", default=0, min_value=0, label="Час фрезерної обробки")
+        milling_rate = parse_number(f, "milling_rate_per_hour", default=0, min_value=0, label="Ставка фрезерної обробки за годину")
+        machine_hours = parse_number(f, "machine_hours", default=0, min_value=0, label="Машино-години додаткової обробки")
+        machine_rate = parse_number(f, "machine_rate_per_hour", default=0, min_value=0, label="Ставка за машино-годину додаткової обробки")
+        setup_cost_total = parse_number(f, "setup_cost_total", default=0, min_value=0, label="Вартість наладки на партію")
+        quantity = parse_number(f, "quantity", default=1, min_value=1, label="Кількість деталей")
+        margin_pct = parse_number(f, "margin_pct", default=20, min_value=0, label="Націнка, %")
+    except ValidationError as e:
+        flash(str(e), "error")
+        return redirect(url_for("cost_calculator"))
+
+    material_cost = weight_kg * material_price
+    turning_cost = turning_hours * turning_rate
+    milling_cost = milling_hours * milling_rate
+    machine_cost = machine_hours * machine_rate
+    setup_cost_per_unit = (setup_cost_total / quantity) if quantity else 0
+    cost_per_unit = material_cost + turning_cost + milling_cost + machine_cost + setup_cost_per_unit
+    price_per_unit = cost_per_unit * (1 + margin_pct / 100)
+    total_price = price_per_unit * quantity
+
+    part_description = (f.get("part_description") or "").strip() or "Розрахунок вартості механообробки"
+    operations_description = (f.get("operations_description") or "").strip()
+
+    def wrap_text(text_obj, text, max_chars):
+        for line in text.splitlines() or [""]:
+            words = line.split(" ")
+            cur_line = ""
+            for w in words:
+                if len(cur_line) + len(w) > max_chars:
+                    text_obj.textLine(cur_line)
+                    cur_line = w + " "
+                else:
+                    cur_line += w + " "
+            text_obj.textLine(cur_line)
+
+    buf = BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    steel = colors.HexColor("#2a2e35")
+    accent = colors.HexColor("#e2650a")
+    text_dim = colors.HexColor("#555555")
+
+    def draw_header():
+        c.setFillColor(steel)
+        c.rect(0, height - 28 * mm, width, 28 * mm, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(20 * mm, height - 15 * mm, "Оснастка-Маркет")
+        c.setFont("Helvetica", 10)
+        c.drawString(20 * mm, height - 22 * mm, "Розрахунок вартості токарно-фрезерної механообробки")
+        c.setFillColor(colors.black)
+
+    draw_header()
+    y = height - 40 * mm
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(20 * mm, y, f"Розрахунок від {datetime.date.today().strftime('%d.%m.%Y')}")
+    y -= 10 * mm
+
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(20 * mm, y, "Деталь / замовлення:")
+    y -= 6 * mm
+    c.setFont("Helvetica", 10)
+    text_obj = c.beginText(20 * mm, y)
+    text_obj.setLeading(4.5 * mm)
+    wrap_text(text_obj, part_description, 95)
+    c.drawText(text_obj)
+    y = text_obj.getY() - 8 * mm
+
+    if operations_description:
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(20 * mm, y, "Технологічний процес:")
+        y -= 6 * mm
+        c.setFont("Helvetica", 9)
+        text_obj = c.beginText(20 * mm, y)
+        text_obj.setLeading(4.2 * mm)
+        wrap_text(text_obj, operations_description, 100)
+        c.drawText(text_obj)
+        y = text_obj.getY() - 8 * mm
+
+    # Розгорнутий технологічний опис (тепер, за замовчуванням, це 10-15
+    # речень від ШІ) легко не влазить на одну сторінку разом з таблицею
+    # вартості - переходимо на нову, а не обрізаємо чи накладаємо текст.
+    if y < 85 * mm:
+        c.showPage()
+        draw_header()
+        y = height - 40 * mm
+
+    rows = [
+        ("Матеріал", material_cost),
+        ("Токарна обробка", turning_cost),
+        ("Фрезерна обробка", milling_cost),
+        ("Додаткова обробка", machine_cost),
+    ]
+    if setup_cost_total:
+        rows.append((f"Наладка (за од., {setup_cost_total:.0f} грн на партію)", setup_cost_per_unit))
+
+    table_height = (len(rows) + 5) * 6 * mm + 20 * mm
+    if y - table_height < 15 * mm:
+        c.showPage()
+        draw_header()
+        y = height - 40 * mm
+
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(20 * mm, y, "Розрахунок вартості:")
+    y -= 8 * mm
+    c.setFont("Helvetica", 10)
+    for label, value in rows:
+        c.drawString(24 * mm, y, label)
+        c.drawRightString(width - 20 * mm, y, "{:,.2f} грн".format(value).replace(",", " "))
+        y -= 6 * mm
+
+    c.setStrokeColor(colors.HexColor("#dddddd"))
+    c.line(20 * mm, y, width - 20 * mm, y)
+    y -= 7 * mm
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(24 * mm, y, "Собівартість за од.")
+    c.drawRightString(width - 20 * mm, y, "{:,.2f} грн".format(cost_per_unit).replace(",", " "))
+    y -= 6 * mm
+    c.setFillColor(accent)
+    c.drawString(24 * mm, y, "Ціна за од. (+{:.0f}%)".format(margin_pct))
+    c.drawRightString(width - 20 * mm, y, "{:,.2f} грн".format(price_per_unit).replace(",", " "))
+    c.setFillColor(colors.black)
+    y -= 10 * mm
+
+    c.setFillColor(steel)
+    c.rect(20 * mm, y - 12 * mm, width - 40 * mm, 12 * mm, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(24 * mm, y - 8.5 * mm, "Разом за {} шт.:".format(int(quantity)))
+    c.drawRightString(width - 24 * mm, y - 8.5 * mm, "{:,.2f} грн".format(total_price).replace(",", " "))
+
+    c.setFillColor(text_dim)
+    c.setFont("Helvetica", 8)
+    c.drawString(20 * mm, 15 * mm, "Документ згенеровано автоматично в Оснастка-Маркет. Ціни орієнтовні та можуть уточнюватись за результатами технічного огляду.")
+    c.showPage()
+    c.save()
+    buf.seek(0)
+
+    resp = Response(buf.read(), mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = "inline; filename=rozrahunok_vartosti.pdf"
+    return resp
 
 
 @app.route("/calculator/analyze-dxf", methods=["POST"])
