@@ -560,6 +560,33 @@ CREATE TABLE IF NOT EXISTS service_tickets (
     created_at TEXT NOT NULL,
     resolved_at TEXT
 );
+
+-- Історія всіх розрахунків вартості (ручних і через ШІ) - кожен завершений
+-- розрахунок у калькуляторі зберігається сюди автоматично, щоб потім можна
+-- було переглянути, хто і коли рахував яку деталь та за якою ціною.
+CREATE TABLE IF NOT EXISTS cost_calculations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    source TEXT NOT NULL DEFAULT 'manual',
+    part_description TEXT,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    weight_kg REAL,
+    material_price_per_kg REAL,
+    turning_hours REAL,
+    turning_rate_per_hour REAL,
+    milling_hours REAL,
+    milling_rate_per_hour REAL,
+    machine_hours REAL,
+    machine_rate_per_hour REAL,
+    setup_cost_total REAL,
+    margin_pct REAL,
+    cost_per_unit REAL,
+    price_per_unit REAL,
+    total_price REAL,
+    operations_description TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 """
 
 
@@ -591,6 +618,46 @@ def now_iso():
 
 def today_str():
     return datetime.date.today().strftime("%Y-%m-%d")
+
+
+def save_calculation_history(db, user, source, part_description, result, raw_inputs=None, operations_description=None):
+    """Зберігає завершений розрахунок вартості (ручний чи через ШІ) в
+    історію - викликається одразу після того, як калькулятор порахував
+    result (той самий dict, що йде в шаблон), щоб пізніше можна було
+    переглянути весь список розрахунків: хто, коли, яка деталь і за якою
+    ціною.
+
+    raw_inputs: словник із вхідними параметрами (weight_kg,
+    material_price_per_kg, turning_hours, ...) - result містить лише вже
+    ПОРАХОВАНІ суми (material_cost тощо), а не самі вхідні числа, тож їх
+    треба передати окремо (для ШІ-розрахунку це result["ai_inputs"], для
+    ручного - локальні змінні з форми).
+
+    Не кидає винятків назовні - збій запису історії не має ламати сам
+    розрахунок користувачу."""
+    raw_inputs = raw_inputs or {}
+    try:
+        db.execute(
+            "INSERT INTO cost_calculations (user_id, source, part_description, quantity, weight_kg, "
+            "material_price_per_kg, turning_hours, turning_rate_per_hour, milling_hours, milling_rate_per_hour, "
+            "machine_hours, machine_rate_per_hour, setup_cost_total, margin_pct, cost_per_unit, price_per_unit, "
+            "total_price, operations_description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                user["id"] if user else None, source, (part_description or "").strip()[:500],
+                result.get("quantity") or 1,
+                raw_inputs.get("weight_kg"), raw_inputs.get("material_price_per_kg"),
+                raw_inputs.get("turning_hours"), raw_inputs.get("turning_rate_per_hour"),
+                raw_inputs.get("milling_hours"), raw_inputs.get("milling_rate_per_hour"),
+                raw_inputs.get("machine_hours"), raw_inputs.get("machine_rate_per_hour"),
+                result.get("setup_cost_total"), result.get("margin_pct"),
+                result.get("cost_per_unit"), result.get("price_per_unit"), result.get("total_price"),
+                (operations_description or result.get("ai_operations_description") or "").strip()[:20000],
+                now_iso(),
+            ),
+        )
+        db.commit()
+    except Exception:
+        pass
 
 
 def migrate_schema(db):
@@ -1336,7 +1403,9 @@ AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог ток
 
 Якщо додано зображення креслення чи деталі - уважно розглянь його: розміри та форму (тіла обертання - для токарної обробки; призматичні/пази/отвори - для фрезерної), матеріал і його стан (пруток, поковка, лита заготовка), допуски й шорсткість поверхонь, різьблення, отвори під свердління, термообробку чи покриття, якщо позначені. Використай усе, що видно на зображенні, для розрахунку - це важливіше за здогадки. Якщо текстовий опис і зображення суперечать одне одному, довірся зображенню й зауваж розбіжність у operations_description.
 
-Якщо якийсь параметр не можна визначити ні з тексту, ні із зображення - постав розумне типове значення для механообробки в Україні (орієнтовно: сталь конструкційна ~55-65 грн/кг, алюміній ~150-200 грн/кг, нержавіюча сталь ~120-180 грн/кг; токарна обробка з ЧПУ ~600-1000 грн/машино-годину; фрезерна обробка з ЧПУ ~700-1200 грн/машино-годину; наладка верстата на партію ~300-1500 грн залежно від складності; націнка 15-25%) і обов'язково згадай це припущення у полі operations_description, щоб людина знала, що це орієнтовна оцінка, а не дані з документів.
+Якщо якийсь ДРУГОРЯДНИЙ параметр не можна визначити ні з тексту, ні із зображення (ціни, ставки за годину, вартість наладки, націнка) - постав розумне типове значення для механообробки в Україні (орієнтовно: сталь конструкційна ~55-65 грн/кг, алюміній ~150-200 грн/кг, нержавіюча сталь ~120-180 грн/кг; токарна обробка з ЧПУ ~600-1000 грн/машино-годину; фрезерна обробка з ЧПУ ~700-1200 грн/машино-годину; наладка верстата на партію ~300-1500 грн залежно від складності; націнка 15-25%) і обов'язково згадай це припущення у полі operations_description, щоб людина знала, що це орієнтовна оцінка, а не дані з документів. Про ДРУГОРЯДНІ параметри НІКОЛИ не питай - завжди оцінюй сам.
+
+Але якщо опису мінімально НЕ вистачає для самого розрахунку - тобто ти не можеш визначити ні матеріал (з чого деталь - сталь, алюміній, нержавійка тощо), ні розмір/вагу заготовки (немає ні розмірів у тексті, ні зображення, з якого їх видно), ні які операції взагалі потрібні (просто "деталь" без жодного опису форми чи процесу) - НЕ вигадуй ці критичні дані з нуля і НЕ вважай типове значення прийнятним заміною. Замість цього виклич інструмент ask_clarifying_question і постав ОДНЕ конкретне, вузьке питання українською, яке справді закриє прогалину (напр. "З якого металу деталь і які її приблизні габарити (діаметр/довжина або довжина×ширина×висота)?"). Питай лише тоді, коли без відповіді оцінка була б беззмістовною - якщо є хоч якісь орієнтири (навіть неповні), користуйся ними та розумними припущеннями замість питання.
 
 У полі operations_description дай РОЗГОРНУТИЙ, детальний опис технологічного процесу - це має читатись як справжня технологічна карта, а не коротка анотація. Структуруй його по етапах, кожен окремим реченням чи групою речень, і для КОЖНОЇ операції механообробки явно назви верстат з парку вище:
 1) заготовка - з чого і якого розміру (пруток Ø.. мм, поковка, лита заготовка) і чому саме така;
@@ -1457,27 +1526,159 @@ def detect_image_media_type(raw_bytes):
     return None
 
 
-def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", images=None):
+_AI_CALC_PENDING = {}
+_AI_CALC_PENDING_TTL_SECONDS = 30 * 60  # 30 хвилин - достатньо, щоб встигнути відповісти на питання
+
+
+def _ai_calc_pending_store(messages, description):
+    """Зберігає стан розмови з ШІ (messages, включно з попереднім
+    tool_use ask_clarifying_question) сервер-side під одноразовим
+    токеном, поки користувач відповідає на уточнююче питання - HTTP
+    без стану, тож між двома POST-запитами розмову треба десь тримати,
+    а передавати назад у прихованому полі форми (з base64-зображеннями
+    всередині) було б і негарно, і могло б перевищити розумний розмір
+    форми. Заразом прибирає протухлі записи старші за TTL."""
+    import uuid as _uuid
+    now = time.time()
+    for key in [k for k, v in _AI_CALC_PENDING.items() if now - v["created"] > _AI_CALC_PENDING_TTL_SECONDS]:
+        _AI_CALC_PENDING.pop(key, None)
+    token = _uuid.uuid4().hex
+    _AI_CALC_PENDING[token] = {"messages": messages, "description": description, "created": now}
+    return token
+
+
+def _ai_calc_pending_pop(token):
+    """Дістає й одразу видаляє збережений стан розмови за токеном -
+    одноразовий, щоб ту саму відповідь не можна було випадково
+    надіслати двічі й отримати два різні продовження однієї розмови.
+    Повертає None, якщо токен невідомий або протух (TTL вичерпано)."""
+    entry = _AI_CALC_PENDING.pop(token, None)
+    if entry is None:
+        return None
+    if time.time() - entry["created"] > _AI_CALC_PENDING_TTL_SECONDS:
+        return None
+    return entry
+
+
+AI_CALC_REQUIRED_PARAMS = ["weight_kg", "material_price_per_kg", "turning_hours", "turning_rate_per_hour",
+                           "milling_hours", "milling_rate_per_hour", "machine_hours", "machine_rate_per_hour",
+                           "quantity", "margin_pct", "operations_description"]
+
+AI_CALC_COST_ESTIMATE_TOOL = {
+    "name": "cost_estimate",
+    "description": "Структуровані параметри для розрахунку собівартості механообробної деталі та опис техпроцесу",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "weight_kg": {"type": "number", "description": "Маса однієї деталі, кг"},
+            "material_price_per_kg": {"type": "number", "description": "Ціна матеріалу за кг, грн"},
+            "turning_hours": {"type": "number", "description": "Час токарної обробки однієї деталі, год"},
+            "turning_rate_per_hour": {"type": "number", "description": "Ставка токарного верстата, грн/год"},
+            "milling_hours": {"type": "number", "description": "Час фрезерної обробки однієї деталі, год"},
+            "milling_rate_per_hour": {"type": "number", "description": "Ставка фрезерного верстата, грн/год"},
+            "machine_hours": {"type": "number", "description": "Час іншої мех. обробки (шліфування тощо), год"},
+            "machine_rate_per_hour": {"type": "number", "description": "Ставка іншого верстата, грн/год"},
+            "quantity": {"type": "number", "description": "Кількість деталей у партії"},
+            "margin_pct": {"type": "number", "description": "Рекомендована націнка, %"},
+            "operations_description": {
+                "type": "string",
+                "description": "РОЗГОРНУТИЙ технологічний маршрут українською, мінімум 10-15 речень, з назвою конкретного верстата на кожній операції",
+            },
+        },
+        "required": AI_CALC_REQUIRED_PARAMS,
+    },
+}
+
+AI_CALC_ASK_QUESTION_TOOL = {
+    "name": "ask_clarifying_question",
+    "description": (
+        "Постав ОДНЕ конкретне уточнююче питання користувачу, коли даних критично "
+        "не вистачає для розрахунку (невідомий матеріал, невідомі габарити/вага і "
+        "немає зображення, або незрозуміло, які операції взагалі потрібні) і їх "
+        "не можна розумно оцінити типовим значенням. НЕ використовуй для другорядних "
+        "параметрів (ціни, ставки, націнка, наладка) - їх завжди оцінюй сам."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "Одне конкретне, вузьке питання українською для користувача"},
+        },
+        "required": ["question"],
+    },
+}
+
+
+def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", images=None,
+                             continue_messages=None, answer=None):
     """Викликає Anthropic Messages API, щоб перетворити текстовий опис і/або
     зображення (фото деталі, скан креслення) на структуровані параметри
     калькулятора вартості разом з описом усього техпроцесу.
 
     images: список werkzeug FileStorage (0..3 файли) - фото/скани креслення.
+
+    Якщо опису критично не вистачає (немає матеріалу/габаритів/незрозумілі
+    операції), ШІ може замість результату попросити ОДНЕ уточнення - тоді
+    функція повертає {"status": "question", "question": "...", "messages": [...]}.
+    Покажи "question" користувачу, збережи "messages", і виклич функцію ЗНОВУ
+    з continue_messages=<збережені messages> та answer=<відповідь користувача>
+    (тоді description/images ігноруються - розмова продовжується). Коли ШІ
+    готовий дати результат, повертається {"status": "ok", "params": {...}}.
+
     Кидає AICalcError із зрозумілим для користувача поясненням при будь-якій
-    проблемі (немає ключа, мережа, невалідна відповідь, погане зображення) -
-    виклик коду має ловити цей виняток і показувати flash-повідомлення,
-    а не падати з 500."""
-    images = images or []
+    технічній проблемі (немає ключа, мережа, невалідна відповідь, погане
+    зображення) - виклик коду має ловити цей виняток і показувати
+    flash-повідомлення, а не падати з 500."""
     if not api_key:
         raise AICalcError("Спочатку введи API-ключ Anthropic на сторінці «Налаштування»")
-    if (not description or not description.strip()) and not images:
-        raise AICalcError("Опиши деталь текстом або завантаж фото/скан креслення")
 
     import requests as _requests
     import json as _json
     import re as _re_local
     import base64 as _base64
 
+    if continue_messages is not None:
+        # Продовження розмови після того, як ШІ попросив уточнення, а
+        # користувач на нього відповів. Шукаємо id останнього виклику
+        # ask_clarifying_question, щоб коректно прив'язати tool_result -
+        # без цього Anthropic API відхилить запит як невалідний.
+        if not answer or not answer.strip():
+            raise AICalcError("Введи відповідь на уточнююче питання ШІ")
+        tool_use_id = None
+        for msg in reversed(continue_messages):
+            if msg.get("role") != "assistant":
+                continue
+            for block in msg.get("content", []):
+                if block.get("type") == "tool_use" and block.get("name") == "ask_clarifying_question":
+                    tool_use_id = block.get("id")
+                    break
+            if tool_use_id:
+                break
+        if not tool_use_id:
+            raise AICalcError("Не вдалось продовжити розрахунок — почни його заново")
+
+        messages = continue_messages + [{
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": answer.strip()}],
+        }]
+        # На другому колі ШІ вже отримав усе, що просив - більше питань не
+        # приймаємо (щоб не зациклитись), примусово вимагаємо фінальний результат.
+        tools = [AI_CALC_COST_ESTIMATE_TOOL]
+        tool_choice = {"type": "tool", "name": "cost_estimate"}
+    else:
+        images = images or []
+        if (not description or not description.strip()) and not images:
+            raise AICalcError("Опиши деталь текстом або завантаж фото/скан креслення")
+        messages, tools, tool_choice = _ai_calc_build_first_turn(description, images, _base64)
+
+    return _ai_calc_call_api(messages, tools, tool_choice, api_key, model,
+                              _requests, _json, _re_local)
+
+
+def _ai_calc_build_first_turn(description, images, _base64):
+    """Будує messages/tools/tool_choice для першого звернення до ШІ (опис
+    і/або файли деталі, без попередньої розмови). Винесено окремо від
+    _ai_calc_call_api, щоб цикл обробки файлів (зображення/PDF/DXF) не
+    дублювався між першим і продовженим викликом."""
     content_blocks = []
     for f in images:
         raw = f.read()
@@ -1538,44 +1739,32 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
     )
     content_blocks.append({"type": "text", "text": text})
 
-    required = ["weight_kg", "material_price_per_kg", "turning_hours", "turning_rate_per_hour",
-                "milling_hours", "milling_rate_per_hour", "machine_hours", "machine_rate_per_hour",
-                "quantity", "margin_pct", "operations_description"]
+    messages = [{"role": "user", "content": content_blocks}]
+    # Дозволяємо ШІ обрати: одразу дати результат (cost_estimate), або,
+    # якщо даних критично не вистачає, поставити ОДНЕ уточнююче питання
+    # (ask_clarifying_question) - tool_choice "any" змушує викликати
+    # ЯКИЙСЬ з інструментів (а не вільний текст), але не диктує який саме.
+    tools = [AI_CALC_COST_ESTIMATE_TOOL, AI_CALC_ASK_QUESTION_TOOL]
+    tool_choice = {"type": "any"}
+    return messages, tools, tool_choice
 
-    # ПРИМУСОВИЙ виклик інструмента (tool_choice) замість текстового префілу
-    # асистента - надійніший спосіб гарантувати структурований JSON-вивід:
-    # Anthropic API сам повертає вже РОЗІБРАНИЙ об'єкт у полі tool_use.input,
-    # тож не потрібен жоден текстовий парсинг/фолбек, і модель фізично не
-    # може відповісти поясненням чи уточненням замість даних.
-    # (Раніше тут був префіл {"role": "assistant", "content": "{"} - той
-    # прийом підтримують не всі моделі/режими, і на практиці API почав
-    # повертати помилку 400 "This model does not support assistant message
-    # prefill" - тому перейшли на tool_choice, який працює завжди.)
-    tool_schema = {
-        "name": "cost_estimate",
-        "description": "Структуровані параметри для розрахунку собівартості механообробної деталі та опис техпроцесу",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "weight_kg": {"type": "number", "description": "Маса однієї деталі, кг"},
-                "material_price_per_kg": {"type": "number", "description": "Ціна матеріалу за кг, грн"},
-                "turning_hours": {"type": "number", "description": "Час токарної обробки однієї деталі, год"},
-                "turning_rate_per_hour": {"type": "number", "description": "Ставка токарного верстата, грн/год"},
-                "milling_hours": {"type": "number", "description": "Час фрезерної обробки однієї деталі, год"},
-                "milling_rate_per_hour": {"type": "number", "description": "Ставка фрезерного верстата, грн/год"},
-                "machine_hours": {"type": "number", "description": "Час іншої мех. обробки (шліфування тощо), год"},
-                "machine_rate_per_hour": {"type": "number", "description": "Ставка іншого верстата, грн/год"},
-                "quantity": {"type": "number", "description": "Кількість деталей у партії"},
-                "margin_pct": {"type": "number", "description": "Рекомендована націнка, %"},
-                "operations_description": {
-                    "type": "string",
-                    "description": "РОЗГОРНУТИЙ технологічний маршрут українською, мінімум 10-15 речень, з назвою конкретного верстата на кожній операції",
-                },
-            },
-            "required": required,
-        },
-    }
 
+def _ai_calc_call_api(messages, tools, tool_choice, api_key, model, _requests, _json, _re_local):
+    """Виконує сам HTTP-виклик Anthropic Messages API з готовими
+    messages/tools/tool_choice і розбирає відповідь. Спільна для першого
+    звернення і для продовження після уточнюючого питання - розбір
+    помилок (мережа, 401/429, невалідна відповідь) однаковий в обох
+    випадках.
+
+    ПРИМУСОВИЙ виклик інструмента (tool_choice) замість текстового префілу
+    асистента - надійніший спосіб гарантувати структурований JSON-вивід:
+    Anthropic API сам повертає вже РОЗІБРАНИЙ об'єкт у полі tool_use.input,
+    тож не потрібен жоден текстовий парсинг/фолбек, і модель фізично не
+    може відповісти вільним поясненням замість виклику інструмента.
+    (Раніше тут був префіл {"role": "assistant", "content": "{"} - той
+    прийом підтримують не всі моделі/режими, і на практиці API почав
+    повертати помилку 400 "This model does not support assistant message
+    prefill" - тому перейшли на tool_choice, який працює завжди.)"""
     try:
         resp = _requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -1588,11 +1777,9 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
                 "model": model,
                 "max_tokens": 3072,
                 "system": AI_CALC_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": content_blocks},
-                ],
-                "tools": [tool_schema],
-                "tool_choice": {"type": "tool", "name": "cost_estimate"},
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
             },
             timeout=45,
         )
@@ -1617,11 +1804,21 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
     except Exception:
         raise AICalcError("Не вдалось розібрати відповідь Anthropic API")
 
-    params = None
+    tool_block = None
     for block in data.get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == "cost_estimate":
-            params = block.get("input")
+        if block.get("type") == "tool_use":
+            tool_block = block
             break
+
+    if tool_block is not None and tool_block.get("name") == "ask_clarifying_question":
+        question = (tool_block.get("input") or {}).get("question") or "Уточни, будь ласка, деталі для розрахунку"
+        return {
+            "status": "question",
+            "question": question,
+            "messages": messages + [{"role": "assistant", "content": data.get("content", [])}],
+        }
+
+    params = tool_block.get("input") if (tool_block is not None and tool_block.get("name") == "cost_estimate") else None
 
     if params is None:
         # Захисний фолбек на випадок, якщо модель (всупереч tool_choice) все ж
@@ -1639,11 +1836,11 @@ def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", image
     if not isinstance(params, dict):
         raise AICalcError("ШІ повернув відповідь у неочікуваному форматі — спробуй переформулювати опис коротше й конкретніше")
 
-    missing = [k for k in required if k not in params]
+    missing = [k for k in AI_CALC_REQUIRED_PARAMS if k not in params]
     if missing:
         raise AICalcError(f"ШІ не заповнив усі потрібні поля ({', '.join(missing)}) — спробуй ще раз")
 
-    return params
+    return {"status": "ok", "params": params}
 
 
 def telegram_detect_chats(token):
@@ -2405,8 +2602,16 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       document.documentElement.style.zoom = (value / 100);
     }
     document.addEventListener('click', function(e){
+      // ВАЖЛИВО: перевіряємо належність до самої кнопки-дзвоника через
+      // .closest('#reminders-toggle-btn'), а НЕ порівнянням e.target.textContent
+      // з '🔔' - коли є непрочитані нагадування, всередині кнопки з'являється
+      // бейдж-лічильник (<span>3</span>), і клік по самому бейджу чи по кнопці
+      // з бейджем давав e.target.textContent на кшталт "🔔3", що НІКОЛИ не
+      // дорівнювало '🔔' - через це цей самий обробник миттєво закривав щойно
+      // відкритий дропдаун одразу після onclick-тогла, і дзвоник візуально
+      // "не реагував" на натискання.
       var dd = document.getElementById('reminders-dropdown');
-      if (dd && dd.classList.contains('open') && !e.target.closest('.reminders-dropdown') && e.target.textContent !== '🔔') {
+      if (dd && dd.classList.contains('open') && !e.target.closest('.reminders-dropdown') && !e.target.closest('#reminders-toggle-btn')) {
         dd.classList.remove('open');
       }
     });
@@ -2419,7 +2624,7 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       </div>
       <div style="display:flex; align-items:center; gap:14px;">
         <div style="position:relative;">
-          <button type="button" onclick="document.getElementById('reminders-dropdown').classList.toggle('open')"
+          <button type="button" id="reminders-toggle-btn" onclick="document.getElementById('reminders-dropdown').classList.toggle('open')"
                   style="background:none; border:none; cursor:pointer; font-size:20px; color:var(--text); position:relative; padding:4px;">
             🔔
             {% if reminders %}<span style="position:absolute; top:0; right:0; background:var(--red); color:white; border-radius:50%; width:16px; height:16px; font-size:10px; display:flex; align-items:center; justify-content:center;">{{ reminders|length }}</span>{% endif %}
@@ -2986,6 +3191,10 @@ CALCULATOR_HTML = """
 {% block subheading %}Заповни вручну або завантаж DXF-креслення — контур і габарити підставляться автоматично{% endblock %}
 {% block content %}
 
+<div style="text-align:right; margin-bottom:10px;">
+  <a class="btn btn-ghost btn-sm" href="{{ url_for('calculator_history') }}">📜 Історія розрахунків</a>
+</div>
+
 <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> 🤖 Розрахунок через ШІ (опис і/або фото креслення)</div>
 <form method="post" action="{{ url_for('calculator_ai_estimate') }}" enctype="multipart/form-data" class="card card-pad" style="margin-bottom:20px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
   <div class="field" style="margin-bottom:10px;">
@@ -3001,10 +3210,28 @@ CALCULATOR_HTML = """
     Потрібен API-ключ Anthropic (див. «Налаштування» → «ШІ-розрахунок вартості»). Якщо додати фото/скан
     креслення, DXF- або PDF-файл, ШІ сам розгляне розміри, форму та отвори на зображенні і опише весь
     технологічний процес виготовлення разом із розрахунком. DXF і кожна сторінка PDF автоматично
-    рендеряться в картинку перед відправкою (PDF — до 3 перших сторінок). Це орієнтовна оцінка — обов'язково
-    перевір цифри перед тим, як ставити їх у КП клієнту.
+    рендеряться в картинку перед відправкою (PDF — до 3 перших сторінок). Опис може бути мінімальним —
+    якщо ШІ не вистачить даних (матеріал, габарити), він поставить одне уточнююче питання замість того,
+    щоб вигадувати цифри з нуля. Це орієнтовна оцінка — обов'язково перевір цифри перед тим, як ставити
+    їх у КП клієнту.
   </p>
 </form>
+
+{% if ai_question %}
+<div class="card card-pad" style="margin-bottom:20px; border-color:var(--accent);">
+  <div style="font-weight:600; margin-bottom:8px;">🤖 ШІ просить уточнення:</div>
+  <div style="margin-bottom:12px;">{{ ai_question }}</div>
+  <form method="post" action="{{ url_for('calculator_ai_estimate') }}" style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="ai_clarify_token" value="{{ ai_clarify_token }}">
+    <div class="field" style="flex:1; min-width:240px;">
+      <label>Твоя відповідь</label>
+      <input type="text" name="ai_clarify_answer" placeholder="напр.: сталь 45, пруток Ø40, довжина 120 мм" required autofocus>
+    </div>
+    <button class="btn btn-primary" type="submit">Надіслати відповідь</button>
+  </form>
+</div>
+{% endif %}
 
 <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> Автозаповнення з DXF-креслення</div>
 <form method="post" action="{{ url_for('calculator_analyze_dxf') }}" enctype="multipart/form-data" class="card card-pad" style="margin-bottom:20px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
@@ -3148,6 +3375,57 @@ CALCULATOR_HTML = """
     {% endif %}
   </div>
 </div>
+{% endblock %}
+"""
+
+CALCULATOR_HISTORY_HTML = """
+{% extends "base.html" %}
+{% block title %}Історія розрахунків{% endblock %}
+{% block heading %}Історія розрахунків вартості{% endblock %}
+{% block subheading %}Всього: {{ total }}{% if total_pages > 1 %} · сторінка {{ page }} з {{ total_pages }}{% endif %}{% endblock %}
+{% block content %}
+<div class="toolbar">
+  <div class="filters">
+    <form method="get" style="display:flex; gap:8px;">
+      <input type="text" name="q" placeholder="Пошук за назвою деталі..." value="{{ search_q or '' }}" style="min-width:220px;">
+      <select name="source" onchange="this.form.submit()">
+        <option value="">Усі джерела</option>
+        <option value="manual" {{ 'selected' if request.args.get('source')=='manual' }}>Ручний</option>
+        <option value="ai" {{ 'selected' if request.args.get('source')=='ai' }}>ШІ</option>
+      </select>
+      <button class="btn btn-sm" type="submit">Знайти</button>
+    </form>
+  </div>
+  <a class="btn" href="{{ url_for('export_calculations_xlsx', source=request.args.get('source',''), q=search_q or '') }}">⬇ Excel</a>
+  <a class="btn btn-ghost" href="{{ url_for('cost_calculator') }}">← До калькулятора</a>
+</div>
+<div class="card table-wrap">
+<table>
+  <tr><th>Дата</th><th>Менеджер</th><th>Джерело</th><th>Деталь</th><th>К-сть</th><th>Собівартість/од</th><th>Ціна/од</th><th>Разом</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td style="white-space:nowrap;">{{ r['created_at'] }}</td>
+    <td>{{ r['manager_name'] or '—' }}</td>
+    <td>{% if r['source']=='ai' %}<span class="badge badge-low">🤖 ШІ</span>{% else %}<span class="badge">ручний</span>{% endif %}</td>
+    <td style="max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ r['part_description'] or '' }}">{{ r['part_description'] or '—' }}</td>
+    <td>{{ r['quantity'] }}</td>
+    <td>{{ '%.2f'|format(r['cost_per_unit'] or 0) }}</td>
+    <td>{{ '%.2f'|format(r['price_per_unit'] or 0) }}</td>
+    <td><b>{{ '%.2f'|format(r['total_price'] or 0) }}</b></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="8" class="empty">Розрахунків ще немає</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% if total_pages > 1 %}
+<div style="display:flex; gap:8px; justify-content:center; margin-top:16px;">
+  {% set qs = ('&source='+request.args.get('source') if request.args.get('source') else '') + ('&q='+search_q if search_q else '') %}
+  {% if page > 1 %}<a class="btn btn-sm" href="?page={{ page-1 }}{{ qs }}">← Попередня</a>{% endif %}
+  <span style="padding:6px 10px; color:var(--text-dim); font-size:12.5px;">Сторінка {{ page }} з {{ total_pages }}</span>
+  {% if page < total_pages %}<a class="btn btn-sm" href="?page={{ page+1 }}{{ qs }}">Наступна →</a>{% endif %}
+</div>
+{% endif %}
 {% endblock %}
 """
 
@@ -4501,6 +4779,7 @@ app.jinja_loader = DictLoader({
     "deals_board.html": DEALS_BOARD_HTML,
     "deal_form.html": DEAL_FORM_HTML,
     "calculator.html": CALCULATOR_HTML,
+    "calculator_history.html": CALCULATOR_HISTORY_HTML,
     "deal_detail.html": DEAL_DETAIL_HTML,
     "tasks.html": TASKS_HTML,
     "calendar.html": CALENDAR_HTML,
@@ -5018,6 +5297,16 @@ def cost_calculator():
                     "enough": item["qty_on_hand"] >= needed,
                 }
         result["stock_check"] = stock_check
+        save_calculation_history(
+            get_db(), get_current_user(), "manual",
+            f.get("part_description") or "Ручний розрахунок (без опису деталі)", result,
+            raw_inputs={
+                "weight_kg": weight_kg, "material_price_per_kg": material_price,
+                "turning_hours": turning_hours, "turning_rate_per_hour": turning_rate,
+                "milling_hours": milling_hours, "milling_rate_per_hour": milling_rate,
+                "machine_hours": machine_hours, "machine_rate_per_hour": machine_rate,
+            },
+        )
 
     db = get_db()
     warehouse_items = db.execute(
@@ -5025,6 +5314,104 @@ def cost_calculator():
     ).fetchall()
     return render_template("calculator.html", active="calculator", result=result, dxf_result=None,
                             warehouse_items=warehouse_items)
+
+
+def _calculator_history_filters():
+    """Будує WHERE-умову й параметри для списку історії розрахунків із
+    query-параметрів ?source=&q= - спільне для сторінки /calculator/history
+    і експорту /export/calculations.xlsx, щоб експорт завжди вивантажував
+    РІВНО те, що бачить користувач на екрані (з тим самим фільтром), а не
+    щось інше."""
+    source = request.args.get("source", "").strip()
+    q = request.args.get("q", "").strip()
+    clauses = []
+    params = []
+    if source in ("manual", "ai"):
+        clauses.append("cc.source = ?")
+        params.append(source)
+    if q:
+        clauses.append("cc.part_description LIKE ?")
+        params.append(f"%{q}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params, source, q
+
+
+@app.route("/calculator/history")
+@login_required
+@role_required("sales")
+def calculator_history():
+    """Список усіх раніше завершених розрахунків вартості (ручних і через
+    ШІ) - кожен розрахунок з cost_calculator/calculator_ai_estimate
+    автоматично потрапляє сюди через save_calculation_history. Видно всім
+    з роллю sales (не лише свої) - це спільний інструмент відділу продажів,
+    як і сам калькулятор."""
+    db = get_db()
+    where, params, source, q = _calculator_history_filters()
+    page = max(int(request.args.get("page", 1) or 1), 1)
+    per_page = 50
+
+    total = db.execute(f"SELECT COUNT(*) c FROM cost_calculations cc {where}", params).fetchone()["c"]
+    total_pages = max(1, -(-total // per_page))
+    page = min(page, total_pages)
+    offset = (page - 1) * per_page
+
+    rows = db.execute(
+        f"SELECT cc.*, u.full_name AS manager_name FROM cost_calculations cc "
+        f"LEFT JOIN users u ON u.id = cc.user_id {where} "
+        f"ORDER BY cc.created_at DESC, cc.id DESC LIMIT ? OFFSET ?",
+        params + [per_page, offset],
+    ).fetchall()
+
+    return render_template("calculator_history.html", active="calculator", rows=rows,
+                            total=total, page=page, total_pages=total_pages, search_q=q)
+
+
+@app.route("/export/calculations.xlsx")
+@login_required
+@role_required("sales")
+def export_calculations_xlsx():
+    """Вивантажує історію розрахунків у Excel - з тим самим фільтром
+    (джерело/пошук), що й на екрані /calculator/history, щоб можна було
+    передати бухгалтерії чи керівнику повний список розрахунків за період
+    без ручного переписування з екрана."""
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from flask import send_file
+
+    db = get_db()
+    where, params, source, q = _calculator_history_filters()
+    rows = db.execute(
+        f"SELECT cc.*, u.full_name AS manager_name FROM cost_calculations cc "
+        f"LEFT JOIN users u ON u.id = cc.user_id {where} "
+        f"ORDER BY cc.created_at DESC, cc.id DESC",
+        params,
+    ).fetchall()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Розрахунки"
+    headers = ["Дата", "Менеджер", "Джерело", "Деталь", "К-сть", "Вага, кг", "Матеріал, грн/кг",
+               "Токарна, год", "Фрезерна, год", "Собівартість/од", "Ціна/од", "Націнка, %", "Разом, грн"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2A2E35")
+    for r in rows:
+        ws.append([
+            r["created_at"], r["manager_name"], "ШІ" if r["source"] == "ai" else "ручний",
+            r["part_description"], r["quantity"], r["weight_kg"], r["material_price_per_kg"],
+            r["turning_hours"], r["milling_hours"], r["cost_per_unit"], r["price_per_unit"],
+            r["margin_pct"], r["total_price"],
+        ])
+    for i, w in enumerate([18, 18, 10, 40, 8, 10, 14, 12, 12, 14, 12, 10, 14], start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name="rozrahunky_vartosti.xlsx",
+                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/calculator/ai-estimate", methods=["POST"])
@@ -5035,22 +5422,54 @@ def calculator_ai_estimate():
     креслення, викликає ШІ для оцінки параметрів калькулятора (з візуальним
     аналізом зображення, якщо воно є), одразу рахує собівартість тими ж
     формулами, що й ручний розрахунок (жодної окремої "ШІ-математики" -
-    цифри для розрахунку однакові, різниться лише спосіб їх отримання)."""
+    цифри для розрахунку однакові, різниться лише спосіб їх отримання).
+
+    Опис може бути мінімальним: якщо ШІ не вистачає критичних даних
+    (матеріал, габарити/вага), він замість вигаданих цифр ставить ОДНЕ
+    уточнююче питання (див. ai_estimate_cost_params) - тоді ця функція
+    зберігає стан розмови сервер-side (_AI_CALC_PENDING) під одноразовим
+    токеном і показує форму з питанням; другий POST на цей же маршрут з
+    ai_clarify_token/ai_clarify_answer продовжує ту саму розмову."""
     db = get_db()
     api_key = get_setting(db, "anthropic_api_key", "")
-    description = request.form.get("ai_description", "")
-    images = [f for f in request.files.getlist("ai_images") if f and f.filename]
     warehouse_items = db.execute(
         "SELECT * FROM warehouse_items WHERE category LIKE '%атеріал%' ORDER BY name"
     ).fetchall()
 
-    try:
-        params = ai_estimate_cost_params(description, api_key, images=images)
-    except AICalcError as e:
-        flash(str(e), "error")
-        return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
-                                warehouse_items=warehouse_items, ai_description=description)
+    clarify_token = request.form.get("ai_clarify_token", "").strip()
+    if clarify_token:
+        pending = _ai_calc_pending_pop(clarify_token)
+        description = (pending or {}).get("description", "")
+        if pending is None:
+            flash("Уточнення застаріло або вже використане — почни розрахунок заново", "error")
+            return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
+                                    warehouse_items=warehouse_items, ai_description=description)
+        answer = request.form.get("ai_clarify_answer", "")
+        try:
+            calc_result = ai_estimate_cost_params(
+                None, api_key, continue_messages=pending["messages"], answer=answer
+            )
+        except AICalcError as e:
+            flash(str(e), "error")
+            return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
+                                    warehouse_items=warehouse_items, ai_description=description)
+    else:
+        description = request.form.get("ai_description", "")
+        images = [f for f in request.files.getlist("ai_images") if f and f.filename]
+        try:
+            calc_result = ai_estimate_cost_params(description, api_key, images=images)
+        except AICalcError as e:
+            flash(str(e), "error")
+            return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
+                                    warehouse_items=warehouse_items, ai_description=description)
 
+    if calc_result["status"] == "question":
+        token = _ai_calc_pending_store(calc_result["messages"], description)
+        return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
+                                warehouse_items=warehouse_items, ai_description=description,
+                                ai_question=calc_result["question"], ai_clarify_token=token)
+
+    params = calc_result["params"]
     weight_kg = float(params.get("weight_kg") or 0)
     material_price = float(params.get("material_price_per_kg") or 0)
     turning_hours = float(params.get("turning_hours") or 0)
@@ -5089,6 +5508,7 @@ def calculator_ai_estimate():
             "quantity": quantity, "margin_pct": margin_pct,
         },
     }
+    save_calculation_history(db, get_current_user(), "ai", description, result, raw_inputs=result["ai_inputs"])
     flash("Розрахунок від ШІ готовий — обов'язково перевір цифри перед використанням у КП", "success")
     return render_template("calculator.html", active="calculator", result=result, dxf_result=None,
                             warehouse_items=warehouse_items, ai_description=description)
