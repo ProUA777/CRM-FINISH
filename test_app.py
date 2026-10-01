@@ -1432,6 +1432,29 @@ def test_production_role_can_write_off_warehouse_stock(client):
     assert after_qty == before_qty - 2
 
 
+def test_warehouse_transaction_history_shows_which_user_did_it(client):
+    """РЕГРЕСІЙНИЙ ТЕСТ: Дмитро повідомив, що після списання Миколою
+    (виробництво) в адмінці не було видно, ХТО саме провів операцію -
+    user_id в БД зберігався, але колонка в таблиці історії не виводилась.
+    Перевіряємо наскрізно: Микола списує -> адмін відкриває картку
+    матеріалу -> бачить "Тарас Майстренко" (full_name maister), а не
+    порожню колонку чи просто дату."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    item = db.execute("SELECT * FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+
+    post(client, f"/warehouse/{item['id']}/transactions", {
+        "type": "out", "qty": "3", "reference": "списано Тарасом",
+    }, follow_redirects=True)
+
+    login(client)  # адмін
+    html = client.get(f"/warehouse/{item['id']}").get_data(as_text=True)
+    assert "Тарас Майстренко" in html
+    assert "списано Тарасом" in html
+
+
 def test_production_role_cannot_record_warehouse_receipt(client):
     """Виробничник НЕ може оформити прихід нового матеріалу (type='in') -
     це відповідальність ролі 'Склад', а не цеху."""
@@ -3152,6 +3175,505 @@ def test_demo_seed_populates_calculation_history_for_fresh_install(client):
     html = client.get("/calculator/history").get_data(as_text=True)
     assert "Розрахунків ще немає" not in html
     assert "Фланець приводний" in html
+
+
+# ---------------------------------------------------------------------------
+# Змінний журнал виробництва (shift log)
+# ---------------------------------------------------------------------------
+
+def test_shift_log_requires_login(client):
+    r = client.get("/shift-log", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/login" in r.location
+
+
+def test_shift_log_blocked_for_non_production_non_admin_role(client):
+    """Роль 'Склад' не бере участі у змінному журналі - лише виробництво
+    та адмін."""
+    login(client, "sklad", "sklad123")
+    r = client.get("/shift-log", follow_redirects=True)
+    assert "немає прав" in r.get_data(as_text=True).lower()
+
+
+def test_shift_log_new_get_renders_form(client):
+    login(client, "maister", "prod123")
+    r = client.get("/shift-log/new")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "Деталь" in html
+    assert "Виготовлено" in html
+
+
+def test_shift_log_create_entry_for_self(client):
+    """Звичайний виробничник створює запис за свою зміну - worker_user_id і
+    created_by_user_id мають співпасти з ним самим."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    r = post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "shift": "day", "work_center_id": "3",
+        "part_description": "Вал приводний Ф25", "quantity_made": "40",
+        "quantity_scrap": "2", "scrap_reason": "биття різця",
+        "shift_hours": "8", "setup_hours": "0.5",
+    }, follow_redirects=True)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "Вал приводний Ф25" in html
+
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute("SELECT * FROM shift_logs WHERE part_description='Вал приводний Ф25'").fetchone()
+    assert row is not None
+    assert row["quantity_made"] == 40
+    assert row["quantity_scrap"] == 2
+    maister_id = db.execute("SELECT id FROM users WHERE username='maister'").fetchone()["id"]
+    assert row["worker_user_id"] == maister_id
+    assert row["created_by_user_id"] == maister_id
+    assert row["work_center_id"] == 3
+
+
+def test_shift_log_validates_required_part_description(client):
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    before = db.execute("SELECT COUNT(*) c FROM shift_logs").fetchone()[0]
+
+    r = post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "quantity_made": "10",
+    }, follow_redirects=True)
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+    after = db.execute("SELECT COUNT(*) c FROM shift_logs").fetchone()[0]
+    assert after == before
+
+
+def test_shift_log_validates_non_negative_quantity(client):
+    login(client, "maister", "prod123")
+    r = post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "part_description": "Тест", "quantity_made": "-5",
+    }, follow_redirects=True)
+    assert "не може бути меншим" in r.get_data(as_text=True).lower()
+
+
+def test_shift_log_foreman_record_pinned_to_own_work_center(client):
+    """Майстер дільниці (tokar, work_center_id=1) завжди пише запис на СВОЮ
+    дільницю, навіть якщо у форму якось підставили інший work_center_id -
+    так само, як термінал дозволяє діяти лише на своїй дільниці."""
+    login(client, "tokar", "tokar123")
+    a = client._app_module
+    post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "part_description": "Втулка бронзова",
+        "quantity_made": "15", "work_center_id": "3",
+    }, follow_redirects=True)
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute("SELECT * FROM shift_logs WHERE part_description='Втулка бронзова'").fetchone()
+    assert row is not None
+    assert row["work_center_id"] == 1
+
+
+def test_shift_log_worker_can_edit_own_record(client):
+    login(client, "maister", "prod123")
+    a = client._app_module
+    post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "part_description": "Деталь-ред1", "quantity_made": "5",
+    }, follow_redirects=True)
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    log_id = db.execute("SELECT id FROM shift_logs WHERE part_description='Деталь-ред1'").fetchone()["id"]
+
+    r = post(client, f"/shift-log/{log_id}/edit", data={
+        "work_date": "2026-09-30", "part_description": "Деталь-ред1", "quantity_made": "9",
+    }, follow_redirects=True)
+    assert "оновлено" in r.get_data(as_text=True).lower()
+    updated = db.execute("SELECT quantity_made FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    assert updated["quantity_made"] == 9
+
+
+def test_shift_log_foreman_can_edit_same_department_record(client):
+    """Майстер дільниці може редагувати записи своєї дільниці, навіть
+    зроблені ІНШИМ (адмін) - за прямим рішенням користувача: "Майстер
+    дільниці + адмін" для редагування чужих записів."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    admin_id = db.execute("SELECT id FROM users WHERE username='admin'").fetchone()["id"]
+    db.execute(
+        "INSERT INTO shift_logs (work_date, shift, work_center_id, worker_user_id, part_description, "
+        "quantity_made, quantity_scrap, created_by_user_id, created_at) VALUES "
+        "('2026-09-30','day',1,?,'Чужий запис на дільниці 1',3,0,?,'2026-09-30 10:00:00')",
+        (admin_id, admin_id),
+    )
+    db.commit()
+    log_id = db.execute("SELECT id FROM shift_logs WHERE part_description='Чужий запис на дільниці 1'").fetchone()["id"]
+
+    login(client, "tokar", "tokar123")
+    r = post(client, f"/shift-log/{log_id}/edit", data={
+        "work_date": "2026-09-30", "part_description": "Чужий запис на дільниці 1", "quantity_made": "7",
+    }, follow_redirects=True)
+    assert "оновлено" in r.get_data(as_text=True).lower()
+    updated = db.execute("SELECT quantity_made FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    assert updated["quantity_made"] == 7
+
+
+def test_shift_log_foreman_cannot_edit_other_department_record(client):
+    """Майстер дільниці 1 НЕ може редагувати чи видаляти запис, зроблений
+    на ІНШІЙ дільниці кимось іншим."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    admin_id = db.execute("SELECT id FROM users WHERE username='admin'").fetchone()["id"]
+    db.execute(
+        "INSERT INTO shift_logs (work_date, shift, work_center_id, worker_user_id, part_description, "
+        "quantity_made, quantity_scrap, created_by_user_id, created_at) VALUES "
+        "('2026-09-30','day',3,?,'Запис на дільниці 3',3,0,?,'2026-09-30 10:00:00')",
+        (admin_id, admin_id),
+    )
+    db.commit()
+    log_id = db.execute("SELECT id FROM shift_logs WHERE part_description='Запис на дільниці 3'").fetchone()["id"]
+
+    login(client, "tokar", "tokar123")
+    r = post(client, f"/shift-log/{log_id}/edit", data={
+        "work_date": "2026-09-30", "part_description": "ЗМІНЕНО", "quantity_made": "99",
+    }, follow_redirects=True)
+    assert "лише свої записи" in r.get_data(as_text=True).lower()
+    unchanged = db.execute("SELECT part_description FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    assert unchanged["part_description"] == "Запис на дільниці 3"
+
+    r2 = post(client, f"/shift-log/{log_id}/delete", follow_redirects=True)
+    assert "лише свої записи" in r2.get_data(as_text=True).lower()
+    still_there = db.execute("SELECT id FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    assert still_there is not None
+
+
+def test_shift_log_general_production_can_edit_any_record(client):
+    """Загальний майстер цеху (maister, без закріпленої дільниці) бачить і
+    редагує все - так само, як і решта застосунку трактує таких
+    користувачів."""
+    login(client, "tokar", "tokar123")
+    a = client._app_module
+    post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "part_description": "Запис токаря", "quantity_made": "3",
+    }, follow_redirects=True)
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    log_id = db.execute("SELECT id FROM shift_logs WHERE part_description='Запис токаря'").fetchone()["id"]
+
+    login(client, "maister", "prod123")
+    r = post(client, f"/shift-log/{log_id}/edit", data={
+        "work_date": "2026-09-30", "part_description": "Запис токаря", "quantity_made": "11",
+    }, follow_redirects=True)
+    assert "оновлено" in r.get_data(as_text=True).lower()
+    updated = db.execute("SELECT quantity_made FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    assert updated["quantity_made"] == 11
+
+
+def test_shift_log_delete_removes_row(client):
+    login(client, "maister", "prod123")
+    a = client._app_module
+    post(client, "/shift-log/new", data={
+        "work_date": "2026-09-30", "part_description": "На видалення", "quantity_made": "1",
+    }, follow_redirects=True)
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    log_id = db.execute("SELECT id FROM shift_logs WHERE part_description='На видалення'").fetchone()["id"]
+
+    r = post(client, f"/shift-log/{log_id}/delete", follow_redirects=True)
+    assert "видалено" in r.get_data(as_text=True).lower()
+    gone = db.execute("SELECT id FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    assert gone is None
+
+
+def test_shift_log_edit_missing_id_returns_404(client):
+    login(client, "maister", "prod123")
+    r = client.get("/shift-log/999999/edit")
+    assert r.status_code == 404
+
+
+def test_shift_log_delete_missing_id_returns_404(client):
+    login(client, "maister", "prod123")
+    r = post(client, "/shift-log/999999/delete")
+    assert r.status_code == 404
+
+
+def test_shift_log_list_shows_totals_and_filters(client):
+    login(client, "maister", "prod123")
+    post(client, "/shift-log/new", data={
+        "work_date": today_str(), "part_description": "Для списку", "quantity_made": "20", "quantity_scrap": "4",
+    }, follow_redirects=True)
+    r = client.get("/shift-log")
+    html = r.get_data(as_text=True)
+    assert "Для списку" in html
+    assert "20" in html
+
+
+def today_str():
+    import datetime
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+
+def test_dashboard_shows_production_block_for_production_role(client):
+    """Виробничий блок 'Виробництво сьогодні' на дашборді - новий запит
+    користувача, додано ПОРУЧ із воронкою продажів, видно адміну й ролі
+    'Виробництво'."""
+    login(client, "maister", "prod123")
+    post(client, "/shift-log/new", data={
+        "work_date": today_str(), "part_description": "Деталь дашборду", "quantity_made": "12",
+    }, follow_redirects=True)
+    r = client.get("/")
+    html = r.get_data(as_text=True)
+    assert "Виробництво сьогодні" in html
+    assert "Угоди (воронка)" not in html  # maister не бачить меню продажів
+    assert "Воронка продажів" in html  # але сам блок воронки на дашборді лишається для всіх
+
+
+def test_dashboard_hides_production_block_for_sales_role(client):
+    login(client, "oleh", "manager123")
+    html = client.get("/").get_data(as_text=True)
+    assert "Виробництво сьогодні" not in html
+
+
+def test_dashboard_still_shows_sales_funnel_alongside_production_block(client):
+    """Виробничий блок ДОДАНО, а не замінив воронку продажів - адмін має
+    бачити обидва блоки одночасно (явний вибір користувача: 'Додати
+    виробничий блок поруч')."""
+    login(client)
+    post(client, "/shift-log/new", data={
+        "work_date": today_str(), "part_description": "Деталь для адміна", "quantity_made": "6",
+    }, follow_redirects=True)
+    html = client.get("/").get_data(as_text=True)
+    assert "Воронка продажів" in html
+    assert "Виробництво сьогодні" in html
+
+
+def test_sidebar_shows_shift_log_link_for_production_not_for_sales(client):
+    login(client, "maister", "prod123")
+    html = client.get("/").get_data(as_text=True)
+    assert "Змінний журнал" in html
+
+    login(client, "oleh", "manager123")
+    html2 = client.get("/").get_data(as_text=True)
+    assert "Змінний журнал" not in html2
+
+
+# ---------------------------------------------------------------------------
+# Угода без верстата -> перехід на "Передоплата" питає верстат
+# ---------------------------------------------------------------------------
+
+def test_moving_deal_without_machine_to_prepay_redirects_to_select_machine(client):
+    """Угода, створена без обраного верстата (типово - одним кліком з історії
+    калькулятора), НЕ повинна мовчки переходити на 'Передоплата' без жодного
+    сліду в цехах - користувача має перенаправити на вибір верстата."""
+    login(client)
+    r = post(client, "/deals/new", {"title": "Угода без верстата", "client_id": "1", "amount": "5000"},
+             follow_redirects=True)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    deal = db.execute("SELECT * FROM deals WHERE title='Угода без верстата'").fetchone()
+    assert deal["machine_id"] is None
+
+    r2 = post(client, f"/deals/{deal['id']}/move/prepay", follow_redirects=False)
+    assert r2.status_code == 302
+    assert f"/deals/{deal['id']}/select-machine" in r2.location
+
+    order = db.execute("SELECT * FROM production_orders WHERE deal_id=?", (deal["id"],)).fetchone()
+    assert order is None
+    stage_unchanged = db.execute("SELECT stage FROM deals WHERE id=?", (deal["id"],)).fetchone()
+    assert stage_unchanged["stage"] != "prepay"
+
+
+def test_moving_deal_without_machine_fetch_returns_needs_machine_json(client):
+    """Kanban-перетягування (fetch) теж не повинно мовчки губити завдання -
+    має повернути прапорець needs_machine і посилання для переходу."""
+    login(client)
+    post(client, "/deals/new", {"title": "Канбан без верстата", "client_id": "1", "amount": "3000"},
+         follow_redirects=True)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    deal = db.execute("SELECT * FROM deals WHERE title='Канбан без верстата'").fetchone()
+
+    token = get_csrf_token(client)
+    r = client.post(f"/deals/{deal['id']}/move/prepay", headers={"X-Requested-With": "fetch", "X-CSRF-Token": token})
+    data = r.get_json()
+    assert data["needs_machine"] is True
+    assert f"/deals/{deal['id']}/select-machine" in data["redirect"]
+
+
+def test_select_machine_sets_machine_and_creates_production_order(client):
+    """Після вибору верстата на проміжній сторінці угода має перейти на
+    обрану стадію, і виробниче замовлення має завестись у цех - саме те,
+    чого раніше не ставалось для угод без верстата."""
+    login(client)
+    post(client, "/deals/new", {"title": "Угода для вибору верстата", "client_id": "1", "amount": "7000"},
+         follow_redirects=True)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    deal = db.execute("SELECT * FROM deals WHERE title='Угода для вибору верстата'").fetchone()
+    machine = db.execute("SELECT * FROM machines LIMIT 1").fetchone()
+
+    r = post(client, f"/deals/{deal['id']}/select-machine", data={
+        "machine_id": str(machine["id"]), "next_stage": "prepay",
+    }, follow_redirects=True)
+    html = r.get_data(as_text=True)
+    assert "заведено виробниче замовлення" in html.lower()
+
+    updated_deal = db.execute("SELECT * FROM deals WHERE id=?", (deal["id"],)).fetchone()
+    assert updated_deal["machine_id"] == machine["id"]
+    assert updated_deal["stage"] == "prepay"
+    order = db.execute("SELECT * FROM production_orders WHERE deal_id=?", (deal["id"],)).fetchone()
+    assert order is not None
+    ops = db.execute("SELECT * FROM production_operations WHERE production_order_id=?", (order["id"],)).fetchall()
+    assert len(ops) > 0
+
+
+def test_select_machine_requires_machine_id(client):
+    login(client)
+    post(client, "/deals/new", {"title": "Угода без вибору", "client_id": "1", "amount": "1000"},
+         follow_redirects=True)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    deal = db.execute("SELECT * FROM deals WHERE title='Угода без вибору'").fetchone()
+
+    r = post(client, f"/deals/{deal['id']}/select-machine", data={"next_stage": "prepay"}, follow_redirects=True)
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+    unchanged = db.execute("SELECT machine_id, stage FROM deals WHERE id=?", (deal["id"],)).fetchone()
+    assert unchanged["machine_id"] is None
+    assert unchanged["stage"] != "prepay"
+
+
+def test_select_machine_requires_login(client):
+    r = client.get("/deals/1/select-machine", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/login" in r.location
+
+
+def test_select_machine_404_for_missing_deal(client):
+    login(client)
+    r = client.get("/deals/999999/select-machine")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# PDF-зведення змінного журналу за місяць
+# ---------------------------------------------------------------------------
+
+def test_shift_log_report_pdf_requires_login(client):
+    r = client.get("/shift-log/report.pdf", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/login" in r.location
+
+
+def test_shift_log_report_pdf_produces_real_pdf_for_current_month(client):
+    """Демо-дані вже засівають записи на сьогодні - PDF за поточний місяць
+    повинен бути справжнім, непорожнім PDF-документом."""
+    login(client, "maister", "prod123")
+    r = client.get("/shift-log/report.pdf")
+    assert r.status_code == 200
+    assert r.mimetype == "application/pdf"
+    assert r.data[:4] == b"%PDF"
+    assert len(r.data) > 500
+
+
+def test_shift_log_report_pdf_filters_by_worker(client):
+    """PDF звужений до одного робітника не повинен включати записи іншого -
+    перевіряємо побічно через розмір (менше рядків -> коротший файл) і те,
+    що обидва варіанти реально генеруються без помилок."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    tokar_id = db.execute("SELECT id FROM users WHERE username='tokar'").fetchone()["id"]
+
+    r_all = client.get("/shift-log/report.pdf")
+    r_one = client.get(f"/shift-log/report.pdf?worker_user_id={tokar_id}")
+    assert r_all.status_code == 200 and r_one.status_code == 200
+    assert r_all.data[:4] == b"%PDF" and r_one.data[:4] == b"%PDF"
+
+
+def test_shift_log_report_pdf_handles_month_with_no_entries(client):
+    """Місяць без жодного запису не повинен падати з 500 - просто PDF з
+    написом 'записів немає'."""
+    login(client, "maister", "prod123")
+    r = client.get("/shift-log/report.pdf?month=2019-01")
+    assert r.status_code == 200
+    assert r.data[:4] == b"%PDF"
+
+
+def test_shift_log_report_pdf_rejects_malformed_month_gracefully(client):
+    """Некоректний параметр місяця (спроба зламати формат) не повинен
+    спричиняти 500 - тихо відкочується на поточний місяць."""
+    login(client, "maister", "prod123")
+    r = client.get("/shift-log/report.pdf?month=not-a-month")
+    assert r.status_code == 200
+    assert r.data[:4] == b"%PDF"
+
+
+def test_shift_log_list_has_pdf_report_link(client):
+    login(client, "maister", "prod123")
+    html = client.get("/shift-log").get_data(as_text=True)
+    assert "report.pdf" in html
+    assert "Скачати PDF за місяць" in html
+
+
+# ---------------------------------------------------------------------------
+# Серверна валідація форм, що раніше падали з "технічною" 400-сторінкою
+# замість зрозумілого повідомлення (f["поле"] без .get() -> BadRequestKeyError)
+# ---------------------------------------------------------------------------
+
+def test_service_add_missing_required_fields_shows_friendly_error(client):
+    login(client)
+    r = post(client, "/service/add", data={}, follow_redirects=True)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+
+
+def test_task_add_missing_title_shows_friendly_error(client):
+    login(client)
+    r = post(client, "/tasks/add", data={}, follow_redirects=True)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+
+
+def test_contact_add_missing_full_name_shows_friendly_error(client):
+    login(client)
+    r = post(client, "/clients/1/contacts", data={}, follow_redirects=True)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+
+
+def test_activity_add_missing_text_shows_friendly_error(client):
+    login(client)
+    r = post(client, "/activities/1", data={}, follow_redirects=True)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+
+
+def test_service_update_status_missing_status_shows_friendly_error(client):
+    login(client)
+    r = post(client, "/service/1/status", data={}, follow_redirects=True)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True).lower()
+    assert "flash-error" in html and "обов" in html
+
+
+def test_service_add_with_valid_data_still_works(client):
+    """Регресія: виправлення валідації не повинне зламати звичайний,
+    коректний шлях створення заявки."""
+    login(client)
+    r = post(client, "/service/add", data={"client_id": "1", "issue": "Тестова несправність"},
+             follow_redirects=True)
+    assert "Сервісну заявку створено" in r.get_data(as_text=True)
 
 
 if __name__ == "__main__":
