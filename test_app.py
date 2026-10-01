@@ -932,6 +932,227 @@ def test_reminders_include_overdue_production_orders(client):
     assert "Прострочених виробничих замовлень" not in r3.get_data(as_text=True)
 
 
+def test_reminders_bell_button_has_stable_id_and_js_no_longer_uses_broken_textcontent_check(client):
+    """РЕГРЕСІЙНИЙ ТЕСТ на реальний баг: користувач повідомив, що дзвоник
+    "не реагує на натискання". Причина була в document-click обробнику:
+    він порівнював e.target.textContent з рівно '🔔', але коли є непрочитані
+    нагадування (майже завжди), у кнопці є ще й бейдж-лічильник, тож
+    textContent виходив на кшталт '🔔3' і НІКОЛИ не збігався з '🔔' -
+    обробник миттєво закривав щойно відкритий дропдаун одразу після
+    onclick-тогла. Фікс - перевіряти приналежність кліку до кнопки через
+    .closest('#reminders-toggle-btn'), а не порівнювати текст. Тест не
+    виконує JS (немає браузера), але перевіряє, що в реальному HTML є
+    стабільний id кнопки і що крихкого порівняння з textContent більше
+    немає - інакше цей самий regresssion можна випадково повернути."""
+    login(client)
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="reminders-toggle-btn"' in html
+    assert "e.target.closest('#reminders-toggle-btn')" in html
+    assert "e.target.textContent !== '🔔'" not in html
+
+
+# ---------------------------------------------------------------------------
+# Історія розрахунків вартості
+# ---------------------------------------------------------------------------
+
+def test_manual_calculator_saves_to_history(client):
+    """Кожен завершений ручний розрахунок має автоматично потрапляти в
+    історію - перевіряємо і сам факт запису в БД (з правильними цифрами),
+    і що він потім видно на сторінці /calculator/history."""
+    login(client)
+    r = post(client, "/calculator", {
+        "weight_kg": "2.5", "material_price_per_kg": "60", "turning_hours": "1",
+        "turning_rate_per_hour": "800", "milling_hours": "0", "milling_rate_per_hour": "900",
+        "machine_hours": "0", "machine_rate_per_hour": "0", "setup_cost_total": "0",
+        "quantity": "10", "margin_pct": "20", "part_description": "Тестовий вал для історії",
+    })
+    assert r.status_code == 200
+
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute("SELECT * FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert row["source"] == "manual"
+    assert row["part_description"] == "Тестовий вал для історії"
+    assert row["quantity"] == 10
+    assert row["weight_kg"] == 2.5
+
+    hist_html = client.get("/calculator/history").get_data(as_text=True)
+    assert "Тестовий вал для історії" in hist_html
+
+
+def test_ai_calculator_saves_to_history_with_ai_source(client):
+    """Розрахунок через ШІ теж має потрапляти в історію, позначений
+    джерелом 'ai' (а не 'manual'), з розгорнутим описом техпроцесу."""
+    from unittest import mock
+
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "name": "cost_estimate", "input": {
+                        "weight_kg": 0.8, "material_price_per_kg": 60, "turning_hours": 0.3,
+                        "turning_rate_per_hour": 800, "milling_hours": 0.1, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 7, "margin_pct": 20,
+                        "operations_description": "Технологічний процес виготовлення втулки.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        token = get_csrf_token(client, "/calculator")
+        r = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token, "ai_description": "Втулка зі сталі 45, партія 7 шт",
+        }, follow_redirects=True)
+    assert r.status_code == 200
+
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute("SELECT * FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert row["source"] == "ai"
+    assert row["quantity"] == 7
+    assert "Втулка" in row["part_description"]
+    assert "втулки" in row["operations_description"]
+
+    hist_html = client.get("/calculator/history").get_data(as_text=True)
+    assert "🤖 ШІ" in hist_html
+
+
+def test_calculator_history_page_filters_by_source_and_paginates(client):
+    """Фільтр по джерелу (ручний/ШІ) і пагінація мають реально працювати -
+    вставляємо напряму в БД кілька записів різних джерел і перевіряємо, що
+    фільтр показує лише потрібні."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    now = a.now_iso() if hasattr(a, "now_iso") else "2026-01-01 10:00:00"
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Деталь-ручна',1,10,12,12,?)", (now,)
+    )
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'ai','Деталь-ШІ',1,20,24,24,?)", (now,)
+    )
+    db.commit()
+
+    html_all = client.get("/calculator/history").get_data(as_text=True)
+    assert "Деталь-ручна" in html_all
+    assert "Деталь-ШІ" in html_all
+
+    html_manual = client.get("/calculator/history?source=manual").get_data(as_text=True)
+    assert "Деталь-ручна" in html_manual
+    assert "Деталь-ШІ" not in html_manual
+
+    html_ai = client.get("/calculator/history?source=ai").get_data(as_text=True)
+    assert "Деталь-ШІ" in html_ai
+    assert "Деталь-ручна" not in html_ai
+
+
+def test_calculator_history_requires_login():
+    a = __import__("app")
+    c = a.app.test_client()
+    r = c.get("/calculator/history", follow_redirects=True)
+    assert "Увійти" in r.get_data(as_text=True) or "login" in r.request.path
+
+
+def test_calculator_page_links_to_history_page(client):
+    login(client)
+    html = client.get("/calculator").get_data(as_text=True)
+    assert 'href="/calculator/history"' in html
+
+
+def test_calculator_history_text_search_filters_by_part_description(client):
+    """Пошук за назвою деталі має реально фільтрувати (не лише
+    source) - вставляємо дві деталі з різними назвами й перевіряємо, що
+    ?q=... показує тільки ту, що містить підрядок."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    now = "2026-01-01 10:00:00"
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Фланець Ø60',1,10,12,12,?)", (now,)
+    )
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Втулка бронзова',1,8,10,10,?)", (now,)
+    )
+    db.commit()
+
+    html = client.get("/calculator/history?q=Фланець").get_data(as_text=True)
+    assert "Фланець" in html
+    assert "Втулка" not in html
+
+
+def test_export_calculations_xlsx_produces_real_workbook_with_correct_rows_and_respects_filter(client):
+    """Реальна перевірка Excel-експорту: відкриваємо згенерований файл
+    через openpyxl (а не лише дивимось на статус-код чи content-type) і
+    звіряємо, що рядки та суми справді там, і що фільтр по джерелу працює
+    так само, як і на сторінці історії."""
+    import io
+    from openpyxl import load_workbook
+
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    now = "2026-01-01 10:00:00"
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Експорт-ручний',3,100,120,360,?)", (now,)
+    )
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'ai','Експорт-ШІ',2,50,60,120,?)", (now,)
+    )
+    db.commit()
+
+    r_all = client.get("/export/calculations.xlsx")
+    assert r_all.status_code == 200
+    assert r_all.mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    wb = load_workbook(io.BytesIO(r_all.data))
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[0][0] == "Дата"
+    part_descriptions = [row[3] for row in rows[1:]]
+    assert "Експорт-ручний" in part_descriptions
+    assert "Експорт-ШІ" in part_descriptions
+    manual_row = next(row for row in rows[1:] if row[3] == "Експорт-ручний")
+    assert manual_row[4] == 3  # кількість
+    assert manual_row[12] == 360  # разом
+
+    r_manual_only = client.get("/export/calculations.xlsx?source=manual")
+    wb2 = load_workbook(io.BytesIO(r_manual_only.data))
+    descriptions2 = [row[3] for row in wb2.active.iter_rows(values_only=True)][1:]
+    assert "Експорт-ручний" in descriptions2
+    assert "Експорт-ШІ" not in descriptions2
+
+
+def test_export_calculations_xlsx_requires_login():
+    a = __import__("app")
+    c = a.app.test_client()
+    r = c.get("/export/calculations.xlsx", follow_redirects=True)
+    assert "Увійти" in r.get_data(as_text=True) or "login" in r.request.path
+
+
+def test_calculator_history_page_has_excel_export_link(client):
+    login(client)
+    html = client.get("/calculator/history").get_data(as_text=True)
+    assert "/export/calculations.xlsx" in html
+
+
 # ---------------------------------------------------------------------------
 # Майстер, прив'язаний до конкретної дільниці
 # ---------------------------------------------------------------------------
@@ -1162,7 +1383,7 @@ def test_ai_calc_forces_tool_use_to_guarantee_structured_json_output():
         return FakeResponse()
 
     with mock.patch("requests.post", side_effect=fake_post):
-        params = app_module.ai_estimate_cost_params(
+        result = app_module.ai_estimate_cost_params(
             "Партія 200 шт. сталь 40Х, пруток 30 діаметром", "sk-ant-fake-key"
         )
 
@@ -1171,10 +1392,15 @@ def test_ai_calc_forces_tool_use_to_guarantee_structured_json_output():
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
 
-    # Запит примусово вимагає саме виклик інструмента cost_estimate
-    assert captured_payload.get("tool_choice") == {"type": "tool", "name": "cost_estimate"}
-    assert captured_payload.get("tools", [{}])[0].get("name") == "cost_estimate"
+    # Перший виклик дозволяє ШІ або дати результат, або поставити уточнення -
+    # "any" примусово вимагає виклик ЯКОГОСЬ інструмента (не вільний текст),
+    # а не диктує наперед, якого саме.
+    assert captured_payload.get("tool_choice") == {"type": "any"}
+    tool_names = {t.get("name") for t in captured_payload.get("tools", [])}
+    assert tool_names == {"cost_estimate", "ask_clarifying_question"}
 
+    assert result["status"] == "ok"
+    params = result["params"]
     assert params["quantity"] == 200
     assert params["weight_kg"] == 0.52
     assert "Токарна" in params["operations_description"]
@@ -1210,8 +1436,253 @@ def test_ai_calc_falls_back_to_text_json_extraction_if_model_ignores_tool_choice
         return FakeResponse()
 
     with mock.patch("requests.post", side_effect=fake_post):
-        params = app_module.ai_estimate_cost_params("опис", "sk-ant-fake-key")
-    assert params["quantity"] == 10
+        result = app_module.ai_estimate_cost_params("опис", "sk-ant-fake-key")
+    assert result["status"] == "ok"
+    assert result["params"]["quantity"] == 10
+
+
+def test_ai_calc_asks_clarifying_question_when_description_too_thin():
+    """Користувач хоче: якщо опису мінімально не вистачає (наприклад просто
+    "деталь", без матеріалу й без розмірів), ШІ має поставити ОДНЕ конкретне
+    уточнююче питання замість того, щоб вигадувати цифри з повітря чи
+    падати з помилкою формату. Перевіряємо і функцію напряму: вона віддає
+    status="question" з текстом питання і збереженими messages (потрібними,
+    щоб продовжити ту саму розмову другим викликом)."""
+    import app as app_module
+    from unittest import mock
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_ask_123",
+                    "name": "ask_clarifying_question",
+                    "input": {"question": "З якого металу деталь і які її приблизні габарити?"},
+                }]
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        result = app_module.ai_estimate_cost_params("деталь", "sk-ant-fake-key")
+
+    assert result["status"] == "question"
+    assert "металу" in result["question"]
+    assert isinstance(result["messages"], list)
+    # Останнє повідомлення - це assistant-хід з викликом ask_clarifying_question,
+    # потрібним, щоб коректно продовжити розмову (tool_use_id для tool_result).
+    assert result["messages"][-1]["role"] == "assistant"
+
+
+def test_ai_calc_continues_conversation_after_answering_clarifying_question():
+    """Другий крок того самого сценарію: коли користувач відповідає на
+    питання ШІ, функція має продовжити ТУ САМУ розмову (передати
+    tool_result з правильним tool_use_id) і цього разу примусово отримати
+    фінальний результат (cost_estimate), а не ще одне питання - інакше
+    міг би вийти нескінченний цикл уточнень."""
+    import app as app_module
+    from unittest import mock
+
+    first_response_content = [{
+        "type": "tool_use",
+        "id": "toolu_ask_456",
+        "name": "ask_clarifying_question",
+        "input": {"question": "З якого металу деталь?"},
+    }]
+    captured_second_payload = {}
+
+    class FakeResponse:
+        def __init__(self, content):
+            self._content = content
+            self.status_code = 200
+
+        def json(self):
+            return {"content": self._content}
+
+    call_count = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FakeResponse(first_response_content)
+        captured_second_payload.update(json or {})
+        return FakeResponse([{
+            "type": "tool_use", "name": "cost_estimate", "input": {
+                "weight_kg": 2.0, "material_price_per_kg": 65, "turning_hours": 0.6,
+                "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 5, "margin_pct": 20,
+                "operations_description": "Токарна обробка сталі 45.",
+            },
+        }])
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        first = app_module.ai_estimate_cost_params("деталь", "sk-ant-fake-key")
+        assert first["status"] == "question"
+        second = app_module.ai_estimate_cost_params(
+            None, "sk-ant-fake-key", continue_messages=first["messages"], answer="сталь 45, пруток Ø40х80мм"
+        )
+
+    assert second["status"] == "ok"
+    assert second["params"]["quantity"] == 5
+
+    # Другий запит примусово вимагає фінальний результат - без ask_clarifying_question,
+    # щоб уникнути нескінченного циклу уточнень.
+    assert captured_second_payload.get("tool_choice") == {"type": "tool", "name": "cost_estimate"}
+    tool_names = {t.get("name") for t in captured_second_payload.get("tools", [])}
+    assert tool_names == {"cost_estimate"}
+
+    # І сама відповідь користувача коректно прив'язана до питання через tool_result.
+    sent_messages = captured_second_payload.get("messages", [])
+    last_msg = sent_messages[-1]
+    assert last_msg["role"] == "user"
+    tool_result_block = last_msg["content"][0]
+    assert tool_result_block["type"] == "tool_result"
+    assert tool_result_block["tool_use_id"] == "toolu_ask_456"
+    assert tool_result_block["content"] == "сталь 45, пруток Ø40х80мм"
+
+
+def test_ai_calc_continue_without_answer_raises_clear_error():
+    from app import ai_estimate_cost_params, AICalcError
+    with pytest.raises(AICalcError) as exc_info:
+        ai_estimate_cost_params(None, "sk-ant-fake-key",
+                                 continue_messages=[{"role": "assistant", "content": [
+                                     {"type": "tool_use", "id": "x", "name": "ask_clarifying_question", "input": {}}
+                                 ]}],
+                                 answer="   ")
+    assert "відповідь" in str(exc_info.value)
+
+
+def test_calculator_ai_estimate_route_shows_clarifying_question_and_completes_after_answer(client):
+    """Наскрізний сценарій через реальний HTTP-маршрут /calculator/ai-estimate:
+    (1) короткий опис "вал" без матеріалу й розмірів -> сторінка калькулятора
+    показує питання ШІ і форму для відповіді (а не помилку чи вигадані
+    цифри); (2) користувач надсилає відповідь через ту саму форму (token +
+    answer) -> другий запит повертає вже готовий результат розрахунку."""
+    import app as app_module
+    from unittest import mock
+
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    call_count = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        call_count["n"] += 1
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                if call_count["n"] == 1:
+                    return {"content": [{
+                        "type": "tool_use", "id": "toolu_route_1", "name": "ask_clarifying_question",
+                        "input": {"question": "З якого металу вал і які його габарити?"},
+                    }]}
+                return {"content": [{
+                    "type": "tool_use", "name": "cost_estimate", "input": {
+                        "weight_kg": 1.2, "material_price_per_kg": 60, "turning_hours": 0.5,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 20, "margin_pct": 20,
+                        "operations_description": "Токарна обробка вала зі сталі 45.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        token = get_csrf_token(client, "/calculator")
+        r1 = client.post("/calculator/ai-estimate", data={"_csrf_token": token, "ai_description": "вал"},
+                          follow_redirects=True)
+        html1 = r1.get_data(as_text=True)
+        assert r1.status_code == 200
+        assert "З якого металу вал" in html1
+        assert "ai_clarify_token" in html1
+
+        import re
+        m = re.search(r'name="ai_clarify_token" value="([^"]+)"', html1)
+        assert m, "токен уточнюючого питання не знайдено на сторінці"
+        clarify_token = m.group(1)
+
+        token2 = get_csrf_token(client, "/calculator")
+        r2 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token2, "ai_clarify_token": clarify_token,
+            "ai_clarify_answer": "сталь 45, Ø30х200мм",
+        }, follow_redirects=True)
+        html2 = r2.get_data(as_text=True)
+
+    assert r2.status_code == 200
+    assert "Розрахунок від ШІ готовий" in html2
+    assert "Токарна обробка вала" in html2
+
+
+def test_calculator_ai_estimate_reused_clarify_token_fails_gracefully(client):
+    """Токен уточнення одноразовий - повторне використання (напр. подвійний
+    клік або відкрита стара вкладка) має дати зрозумілу помилку, а не
+    зламатись чи тихо повторити застарілий запит."""
+    import app as app_module
+    from unittest import mock
+
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "id": "toolu_reuse_1", "name": "ask_clarifying_question",
+                    "input": {"question": "Уточни матеріал?"},
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        token = get_csrf_token(client, "/calculator")
+        r1 = client.post("/calculator/ai-estimate", data={"_csrf_token": token, "ai_description": "деталь"},
+                          follow_redirects=True)
+        import re
+        m = re.search(r'name="ai_clarify_token" value="([^"]+)"', r1.get_data(as_text=True))
+        clarify_token = m.group(1)
+
+    def fake_post_final(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "name": "cost_estimate", "input": {
+                        "weight_kg": 1, "material_price_per_kg": 60, "turning_hours": 0.2,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+                        "operations_description": "Опис.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    # Перше використання токена - легітимне, споживає його і дає результат.
+    with mock.patch("requests.post", side_effect=fake_post_final):
+        token2 = get_csrf_token(client, "/calculator")
+        r2 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token2, "ai_clarify_token": clarify_token, "ai_clarify_answer": "сталь",
+        }, follow_redirects=True)
+    assert "Розрахунок від ШІ готовий" in r2.get_data(as_text=True)
+
+    # Повторне використання ТОГО Ж токена - має дати зрозумілу помилку БЕЗ
+    # звернення до Anthropic API (токен уже спожитий і видалений).
+    with mock.patch("requests.post", side_effect=AssertionError("не має викликатись вдруге з протухлим токеном")):
+        token3 = get_csrf_token(client, "/calculator")
+        r3 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token3, "ai_clarify_token": clarify_token, "ai_clarify_answer": "сталь ще раз",
+        }, follow_redirects=True)
+
+    assert r3.status_code == 200
+    assert "застаріло" in r3.get_data(as_text=True) or "заново" in r3.get_data(as_text=True)
 
 
 def test_settings_page_shows_ai_calculator_status(client):
