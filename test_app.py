@@ -701,6 +701,13 @@ def _make_sample_dxf_bytes():
 
 
 def test_dxf_analysis_computes_correct_perimeter(client):
+    """Калькулятор об'єднано в одну форму (опис/файл + ручні поля, з
+    вибором "Розрахувати вручну"/"Розрахувати через ШІ") - окремий
+    візуальний блок "Автозаповнення з DXF-креслення" з показом ширини/
+    висоти прибрано зі сторінки, тож тут перевіряємо те, що й далі реально
+    видно користувачу (флеш-повідомлення з периметром), а геометрію
+    (ширина/висота) - напряму через analyze_dxf(), який маршрут
+    використовує під капотом і який лишається покритим тестами нижче."""
     import io
     login(client)
     dxf_bytes = _make_sample_dxf_bytes()
@@ -709,12 +716,23 @@ def test_dxf_analysis_computes_correct_perimeter(client):
         "_csrf_token": token,
         "dxf_file": (io.BytesIO(dxf_bytes), "деталь.dxf"),
         "thickness_mm": "3", "density_kg_m3": "7850",
-    }, content_type="multipart/form-data")
+    }, content_type="multipart/form-data", follow_redirects=True)
     html = r.get_data(as_text=True)
     assert r.status_code == 200
     # Периметр: 2 лінії (100+50) + периметр полілінії (300) + коло (2*pi*10≈62.83) = 512.83мм = 0.513м
     assert "0.513" in html
-    assert "100.0" in html  # ширина заготовки
+
+    import app as app_module
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+        tmp.write(dxf_bytes)
+        tmp_path = tmp.name
+    try:
+        dxf_result = app_module.analyze_dxf(tmp_path)
+    finally:
+        os.remove(tmp_path)
+    assert dxf_result["width_mm"] == 100.0
+    assert dxf_result["height_mm"] == 50.0
 
 
 def test_dxf_analysis_rejects_non_dxf_extension(client):
@@ -1556,6 +1574,136 @@ def test_ai_calc_continue_without_answer_raises_clear_error():
     assert "відповідь" in str(exc_info.value)
 
 
+# ---------------------------------------------------------------------------
+# Об'єднана форма калькулятора: ручні поля + ШІ в одній формі
+# (вибір "Розрахувати вручну" / "Розрахувати через ШІ" через formaction)
+# ---------------------------------------------------------------------------
+
+def test_calculator_page_has_single_form_with_two_submit_buttons():
+    """Користувач хоче ОДНУ форму замість трьох окремих - перевіряємо, що
+    на сторінці рівно одна форма, яка охоплює і ручні поля (weight_kg), і
+    ШІ-поля (ai_description/ai_images), з двома кнопками відправки, що
+    ведуть на різні маршрути через formaction (без JS/дублювання полів)."""
+    a = __import__("app")
+    c = a.app.test_client()
+    r = c.get("/login")
+    import re
+    token = re.search(r'name="_csrf_token" value="([^"]+)"', r.get_data(as_text=True)).group(1)
+    c.post("/login", data={"username": "admin", "password": "admin123", "_csrf_token": token})
+    html = c.get("/calculator").get_data(as_text=True)
+
+    # Більше немає окремої видимої секції "Автозаповнення з DXF-креслення" -
+    # ai_description і weight_kg тепер поля ОДНІЄЇ об'єднаної форми.
+    assert "Автозаповнення з DXF-креслення" not in html
+    assert 'action="/calculator/analyze-dxf"' not in html
+    assert html.count('formaction=') == 2
+    assert 'formaction="/calculator"' in html
+    assert 'formaction="/calculator/ai-estimate"' in html
+    # weight_kg більше не обов'язкове - бо тепер це поле спільне для
+    # ручного і ШІ-розрахунку, де воно необов'язкове.
+    weight_field = re.search(r'<input[^>]*name="weight_kg"[^>]*>', html).group(0)
+    assert "required" not in weight_field
+
+
+def test_manual_button_ignores_ai_description_and_uses_only_filled_fields(client):
+    """"Розрахувати вручну" має рахувати ЛИШЕ з заповнених полів і НЕ
+    звертатись до Anthropic API, навіть якщо в тій самій формі є текст
+    опису чи файл - submit на formaction="/calculator" має йти напряму
+    в ручний маршрут, без жодного HTTP-виклику назовні."""
+    from unittest import mock
+    login(client)
+    with mock.patch("requests.post", side_effect=AssertionError("ручний розрахунок не має звертатись до ШІ")):
+        r = post(client, "/calculator", {
+            "weight_kg": "1", "material_price_per_kg": "60", "turning_hours": "0.5",
+            "turning_rate_per_hour": "800", "quantity": "5", "margin_pct": "20",
+            "ai_description": "цей текст має ігноруватись ручним розрахунком",
+        })
+    assert r.status_code == 200
+    assert "грн" in r.get_data(as_text=True)
+
+
+def test_ai_button_respects_manually_filled_fields_and_only_fills_the_rest(client):
+    """Головний сценарій запиту користувача: заповнюємо вручну кількість і
+    вагу, лишаємо решту порожньою й тиснемо "Розрахувати через ШІ" - ШІ
+    повертає СВОЇ (інші) значення для цих полів, але у фінальному
+    результаті мають лишитись САМЕ ті, що ввела людина, а не ШІ."""
+    from unittest import mock
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "name": "cost_estimate", "input": {
+                        # ШІ навмисно повертає ІНШІ weight_kg і quantity, ніж ввів користувач -
+                        # фінальний результат має все одно показати введені людиною 2.5 кг і 7 шт.
+                        "weight_kg": 999, "material_price_per_kg": 60, "turning_hours": 0.4,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 999, "margin_pct": 20,
+                        "operations_description": "Технологічний процес виготовлення деталі.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        token = get_csrf_token(client, "/calculator")
+        r = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token, "weight_kg": "2.5", "quantity": "7", "ai_description": "",
+        }, follow_redirects=True)
+
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "Заготовка: 2.5 кг" in html
+    assert "Партія: 7 шт" in html
+    assert "999" not in html
+
+
+def test_ai_button_with_only_known_fields_and_no_description_still_works(client):
+    """Користувач заповнює лише таблицю (без опису й без файлу) і тисне
+    "Розрахувати через ШІ" - функція має синтезувати короткий опис із
+    заповнених полів замість того, щоб відмовити з "опиши деталь текстом
+    або завантаж фото"."""
+    from unittest import mock
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    captured_payload = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured_payload.update(json or {})
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "name": "cost_estimate", "input": {
+                        "weight_kg": 3, "material_price_per_kg": 60, "turning_hours": 0.5,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 12, "margin_pct": 20,
+                        "operations_description": "Опис техпроцесу.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        token = get_csrf_token(client, "/calculator")
+        r = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token, "weight_kg": "3", "quantity": "12", "ai_description": "",
+        }, follow_redirects=True)
+
+    assert r.status_code == 200
+    assert "Розрахунок від ШІ готовий" in r.get_data(as_text=True)
+    sent_text = next(b["text"] for b in captured_payload["messages"][0]["content"] if b.get("type") == "text")
+    assert "Відомі параметри" in sent_text
+    assert "3" in sent_text and "12" in sent_text
+
+
 def test_calculator_ai_estimate_route_shows_clarifying_question_and_completes_after_answer(client):
     """Наскрізний сценарій через реальний HTTP-маршрут /calculator/ai-estimate:
     (1) короткий опис "вал" без матеріалу й розмірів -> сторінка калькулятора
@@ -1683,6 +1831,274 @@ def test_calculator_ai_estimate_reused_clarify_token_fails_gracefully(client):
 
     assert r3.status_code == 200
     assert "застаріло" in r3.get_data(as_text=True) or "заново" in r3.get_data(as_text=True)
+
+
+def test_ai_calc_apply_correction_continues_conversation_and_forces_cost_estimate():
+    """Юніт-рівень: ai_calc_apply_correction() має продовжити ВЖЕ завершену
+    розмову (повідомлення з попереднього успішного результату, де останній
+    tool_use вже закритий синтетичним tool_result), додати новий user-хід
+    з текстом правки і примусово вимагати cost_estimate (не ask_clarifying_question,
+    щоб правка завжди завершувалась готовим результатом)."""
+    import app as app_module
+    from unittest import mock
+
+    first_response_content = [{
+        "type": "tool_use", "id": "toolu_first_1", "name": "cost_estimate", "input": {
+            "weight_kg": 2.0, "material_price_per_kg": 65, "turning_hours": 0.6,
+            "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+            "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 5, "margin_pct": 20,
+            "operations_description": "Токарна обробка сталі 45.",
+        },
+    }]
+    captured_payload = {}
+
+    class FakeResponse:
+        def __init__(self, content):
+            self._content = content
+            self.status_code = 200
+
+        def json(self):
+            return {"content": self._content}
+
+    call_count = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FakeResponse(first_response_content)
+        captured_payload.update(json or {})
+        return FakeResponse([{
+            "type": "tool_use", "id": "toolu_second_1", "name": "cost_estimate", "input": {
+                "weight_kg": 3.2, "material_price_per_kg": 65, "turning_hours": 0.6,
+                "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 5, "margin_pct": 20,
+                "operations_description": "Токарна обробка сталі 45, вага заготовки 3.2 кг.",
+            },
+        }])
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        first = app_module.ai_estimate_cost_params("деталь, сталь 45", "sk-ant-fake-key")
+        assert first["status"] == "ok"
+        assert first.get("messages"), "успішний результат має повертати продовжувану розмову"
+
+        second = app_module.ai_calc_apply_correction(
+            first["messages"], "вага не 2, а 3.2 кг", "sk-ant-fake-key"
+        )
+
+    assert second["status"] == "ok"
+    assert second["params"]["weight_kg"] == 3.2
+
+    assert captured_payload.get("tool_choice") == {"type": "tool", "name": "cost_estimate"}
+    sent_messages = captured_payload.get("messages", [])
+    last_msg = sent_messages[-1]
+    assert last_msg["role"] == "user"
+    assert last_msg["content"] == "вага не 2, а 3.2 кг"
+    # Правка - продовження ПОВНОЇ попередньої розмови (tool_use + синтетичний
+    # tool_result), а не новий ізольований запит.
+    assert any(
+        m.get("role") == "assistant" and any(b.get("type") == "tool_use" for b in m.get("content", []))
+        for m in sent_messages
+    )
+
+
+def test_ai_calc_apply_correction_rejects_empty_text_and_missing_prior_messages():
+    from app import ai_calc_apply_correction, AICalcError
+
+    with pytest.raises(AICalcError):
+        ai_calc_apply_correction([{"role": "user", "content": "x"}], "   ", "sk-ant-fake-key")
+
+    with pytest.raises(AICalcError):
+        ai_calc_apply_correction([], "вага не 2, а 3.2 кг", "sk-ant-fake-key")
+
+    with pytest.raises(AICalcError):
+        ai_calc_apply_correction([{"role": "user", "content": "x"}], "вага не 2, а 3.2 кг", "")
+
+
+def test_calculator_ai_estimate_shows_correction_chat_and_applies_fix(client):
+    """Наскрізний сценарій через /calculator/ai-estimate: (1) перший
+    розрахунок ШІ показує міні-чат "Щось не так..." з токеном правки;
+    (2) користувач вводить правку через той самий маршрут (ai_correction_token
+    + ai_correction_message) -> сторінка показує ОНОВЛЕНИЙ результат з
+    новими значеннями ШІ, а не старими."""
+    import re
+    from unittest import mock
+
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    def fake_post_first(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "id": "toolu_corr_first", "name": "cost_estimate", "input": {
+                        "weight_kg": 2, "material_price_per_kg": 60, "turning_hours": 0.5,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+                        "operations_description": "Токарна обробка деталі зі сталі.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post_first):
+        token = get_csrf_token(client, "/calculator")
+        r1 = client.post("/calculator/ai-estimate", data={"_csrf_token": token, "ai_description": "деталь зі сталі"},
+                          follow_redirects=True)
+
+    html1 = r1.get_data(as_text=True)
+    assert r1.status_code == 200
+    assert "Щось не так в оцінці ШІ" in html1
+    m = re.search(r'name="ai_correction_token" value="([^"]+)"', html1)
+    assert m, "токен правки не знайдено на сторінці результату"
+    correction_token = m.group(1)
+    assert "Заготовка: 2" in html1
+
+    def fake_post_correction(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "id": "toolu_corr_second", "name": "cost_estimate", "input": {
+                        "weight_kg": 3.2, "material_price_per_kg": 60, "turning_hours": 0.5,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+                        "operations_description": "Токарна обробка деталі зі сталі, вага 3.2 кг.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post_correction):
+        token2 = get_csrf_token(client, "/calculator")
+        r2 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token2, "ai_correction_token": correction_token,
+            "ai_correction_message": "вага не 2, а 3.2 кг",
+        }, follow_redirects=True)
+
+    html2 = r2.get_data(as_text=True)
+    assert r2.status_code == 200
+    assert "Заготовка: 3.2" in html2
+    assert "Заготовка: 2 кг" not in html2
+
+
+def test_calculator_ai_estimate_reused_correction_token_fails_gracefully(client):
+    """Токен правки, як і токен уточнення, одноразовий - повторне
+    використання має дати зрозумілу помилку, без звернення до API."""
+    import re
+    from unittest import mock
+
+    login(client)
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-test123"})
+
+    def fake_post_first(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "id": "toolu_reuse_corr_1", "name": "cost_estimate", "input": {
+                        "weight_kg": 1, "material_price_per_kg": 60, "turning_hours": 0.2,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+                        "operations_description": "Опис.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post_first):
+        token = get_csrf_token(client, "/calculator")
+        r1 = client.post("/calculator/ai-estimate", data={"_csrf_token": token, "ai_description": "деталь"},
+                          follow_redirects=True)
+        m = re.search(r'name="ai_correction_token" value="([^"]+)"', r1.get_data(as_text=True))
+        correction_token = m.group(1)
+
+    def fake_post_correction(url, headers=None, json=None, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"content": [{
+                    "type": "tool_use", "id": "toolu_reuse_corr_2", "name": "cost_estimate", "input": {
+                        "weight_kg": 1.5, "material_price_per_kg": 60, "turning_hours": 0.2,
+                        "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                        "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+                        "operations_description": "Опис.",
+                    },
+                }]}
+
+        return FakeResponse()
+
+    with mock.patch("requests.post", side_effect=fake_post_correction):
+        token2 = get_csrf_token(client, "/calculator")
+        r2 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token2, "ai_correction_token": correction_token,
+            "ai_correction_message": "вага 1.5",
+        }, follow_redirects=True)
+    assert "Заготовка: 1.5" in r2.get_data(as_text=True)
+
+    with mock.patch("requests.post", side_effect=AssertionError("не має звертатись до API з протухлим токеном правки")):
+        token3 = get_csrf_token(client, "/calculator")
+        r3 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token3, "ai_correction_token": correction_token,
+            "ai_correction_message": "вага ще раз інша",
+        }, follow_redirects=True)
+
+    assert r3.status_code == 200
+    assert "застаріло" in r3.get_data(as_text=True) or "заново" in r3.get_data(as_text=True)
+
+
+def test_ai_correction_does_not_reapply_manually_known_fields():
+    """Користувач спершу вручну вписав weight_kg=2 (known_fields), потім у
+    мінічаті написав "вага 3.2" - результат правки має показати 3.2, а НЕ
+    відкотитись назад до вручну введеного 2 (інакше правка була б марною)."""
+    import app as app_module
+    from unittest import mock
+
+    first_response_content = [{
+        "type": "tool_use", "id": "toolu_kf_1", "name": "cost_estimate", "input": {
+            "weight_kg": 2.0, "material_price_per_kg": 60, "turning_hours": 0.5,
+            "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+            "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+            "operations_description": "Опис.",
+        },
+    }]
+
+    class FakeResponse:
+        def __init__(self, content):
+            self._content = content
+            self.status_code = 200
+
+        def json(self):
+            return {"content": self._content}
+
+    call_count = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FakeResponse(first_response_content)
+        return FakeResponse([{
+            "type": "tool_use", "id": "toolu_kf_2", "name": "cost_estimate", "input": {
+                "weight_kg": 3.2, "material_price_per_kg": 60, "turning_hours": 0.5,
+                "turning_rate_per_hour": 800, "milling_hours": 0, "milling_rate_per_hour": 900,
+                "machine_hours": 0, "machine_rate_per_hour": 0, "quantity": 1, "margin_pct": 20,
+                "operations_description": "Опис, вага 3.2 кг.",
+            },
+        }])
+
+    with mock.patch("requests.post", side_effect=fake_post):
+        first = app_module.ai_estimate_cost_params("деталь", "sk-ant-fake-key")
+        corrected = app_module.ai_calc_apply_correction(first["messages"], "вага не 2, а 3.2 кг", "sk-ant-fake-key")
+
+    # Сама функція ai_calc_apply_correction не знає про known_fields - override
+    # відбувається лише в маршруті calculator_ai_estimate(), і саме там він
+    # навмисно вимкнений для correction_token (перевірено наскрізним тестом
+    # test_calculator_ai_estimate_shows_correction_chat_and_applies_fix вище).
+    assert corrected["params"]["weight_kg"] == 3.2
 
 
 def test_settings_page_shows_ai_calculator_status(client):
