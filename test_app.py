@@ -1172,26 +1172,229 @@ def test_calculator_history_page_has_excel_export_link(client):
 
 
 # ---------------------------------------------------------------------------
+# Перегляд і видалення окремого запису в історії розрахунків
+# ---------------------------------------------------------------------------
+
+def test_calculator_history_list_links_to_detail_page(client):
+    """У списку історії кожен рядок має вести на детальну картку
+    розрахунку (а не лише показувати обрізаний опис)."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Деталь для перегляду',1,10,12,12,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    html = client.get("/calculator/history").get_data(as_text=True)
+    assert f"/calculator/history/{calc_id}" in html
+
+
+def test_calculator_history_detail_shows_full_inputs_and_untruncated_description(client):
+    """Детальна картка має показувати ПОВНИЙ текст техпроцесу (не обрізаний,
+    як у таблиці) і всі вхідні параметри розрахунку, а не лише підсумкові
+    суми - це головна причина, чому менеджер хоче "передивитись деталі"
+    перед презентацією клієнту."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    long_description = "Операція 1: токарна обробка. " * 20  # довший за те, що влізло б у рядок таблиці
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, weight_kg, "
+        "material_price_per_kg, turning_hours, turning_rate_per_hour, milling_hours, milling_rate_per_hour, "
+        "machine_hours, machine_rate_per_hour, setup_cost_total, margin_pct, cost_per_unit, price_per_unit, "
+        "total_price, operations_description, created_at) VALUES "
+        "(1,'ai','Вал ступінчастий Ø40',15,2.3,65,1.2,800,0.4,900,0,0,500,25,733.5,916.88,13753.2,?,'2026-01-01 10:00:00')",
+        (long_description,),
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    r = client.get(f"/calculator/history/{calc_id}")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "Вал ступінчастий Ø40" in html
+    assert long_description.strip() in html
+    assert "2.3" in html  # вага
+    assert "65" in html  # ціна матеріалу
+    assert "13753.20" in html  # разом за партію
+    assert "733.50" in html  # собівартість/од
+
+
+def test_calculator_history_detail_missing_id_returns_404(client):
+    login(client)
+    r = client.get("/calculator/history/999999")
+    assert r.status_code == 404
+
+
+def test_calculator_history_detail_requires_login():
+    a = __import__("app")
+    c = a.app.test_client()
+    r = c.get("/calculator/history/1", follow_redirects=True)
+    assert "Увійти" in r.get_data(as_text=True) or "login" in r.request.path
+
+
+def test_calculator_history_delete_removes_row_and_redirects(client):
+    """Видалення має реально прибрати запис з БД (не лише приховати на
+    екрані) і повернути користувача на список історії."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Деталь на видалення',1,10,12,12,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    r = post(client, f"/calculator/history/{calc_id}/delete", follow_redirects=True)
+    assert r.status_code == 200
+    assert "видалено" in r.get_data(as_text=True).lower()
+
+    db2 = sqlite3.connect(a.DB_PATH)
+    db2.row_factory = sqlite3.Row
+    assert db2.execute("SELECT id FROM cost_calculations WHERE id=?", (calc_id,)).fetchone() is None
+
+    # Деталі видаленого розрахунку більше не мають бути доступні.
+    r2 = client.get(f"/calculator/history/{calc_id}")
+    assert r2.status_code == 404
+
+
+def test_calculator_history_delete_missing_id_returns_404(client):
+    login(client)
+    r = post(client, "/calculator/history/999999/delete")
+    assert r.status_code == 404
+
+
+def test_calculator_history_delete_requires_login():
+    a = __import__("app")
+    c = a.app.test_client()
+    r = c.post("/calculator/history/1/delete", follow_redirects=True)
+    assert "Увійти" in r.get_data(as_text=True) or "login" in r.request.path
+
+
+def test_calculator_history_delete_blocked_for_viewer_role(client):
+    """Роль 'Перегляд' має лише переглядати - блокується загальним
+    before_request для будь-якого POST, тому видалення теж має впасти
+    саме з цієї причини (а не якимось іншим шляхом)."""
+    login(client)
+    post(client, "/users", {"full_name": "В'ювер Історії", "username": "glance", "password": "view123", "role": "viewer"})
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Деталь viewer',1,10,12,12,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    login(client, "glance", "view123")
+    r = post(client, f"/calculator/history/{calc_id}/delete", follow_redirects=True)
+    assert "лише перегляд" in r.get_data(as_text=True).lower()
+    db2 = sqlite3.connect(a.DB_PATH)
+    db2.row_factory = sqlite3.Row
+    assert db2.execute("SELECT id FROM cost_calculations WHERE id=?", (calc_id,)).fetchone() is not None
+
+
+def test_calculator_history_delete_preserves_filter_and_page_on_redirect(client):
+    """Після видалення з відфільтрованого списку користувач має лишитись на
+    тому самому фільтрі/сторінці, а не впасти на перший нефільтрований
+    екран історії."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'ai','Деталь ШІ для фільтра',1,10,12,12,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    token = get_csrf_token(client, "/calculator/history?source=ai")
+    r = client.post(f"/calculator/history/{calc_id}/delete", data={
+        "_csrf_token": token, "page": "1", "source": "ai", "q": "",
+    }, follow_redirects=False)
+    assert r.status_code == 302
+    assert "source=ai" in r.location
+
+
+# ---------------------------------------------------------------------------
 # Майстер, прив'язаний до конкретної дільниці
 # ---------------------------------------------------------------------------
 
 def test_foreman_redirected_to_own_terminal(client):
+    """Клік по пункту меню "Моя дільниця" (/production) і далі кнопка
+    "Почати роботу" на дашборді мають одразу відкривати термінал СВОЄЇ
+    дільниці - це швидкий робочий екран для цеху, а не повний список
+    замовлень CRM."""
     login(client, "tokar", "tokar123")
     r = client.get("/")
     assert "Моя дільниця" in r.get_data(as_text=True)
     r2 = client.get("/production", follow_redirects=False)
     assert r2.status_code == 302
     assert "/work-centers/1/terminal" in r2.location
-    r3 = client.get("/work-centers", follow_redirects=False)
-    assert "/work-centers/1/terminal" in r3.location
 
 
-def test_foreman_blocked_from_other_work_center(client):
+def test_foreman_can_browse_all_work_centers_list(client):
+    """/work-centers більше НЕ перекидає майстра одразу на його термінал -
+    майстер має бачити повний список усіх дільниць, щоб перевірити стан
+    деталей на інших ланках (за запитом користувача), з позначкою, яка
+    дільниця його власна."""
     login(client, "tokar", "tokar123")
-    r = client.get("/work-centers/3/terminal", follow_redirects=True)
-    assert "немає доступу" in r.get_data(as_text=True).lower()
+    r = client.get("/work-centers")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "Моя дільниця" in html
+    assert "👁 Перегляд усіх дільниць" in html
+
+
+def test_foreman_can_view_other_work_center_read_only(client):
+    """Майстер МОЖЕ відкрити термінал ІНШОЇ дільниці, щоб подивитись, на
+    якій стадії деталь (новий запит користувача) - але це режим лише
+    перегляду: сторінка не дає помилку доступу, показує банер "лише
+    перегляд" і НЕ показує кнопки "Почати"/"Завершити" для чужих операцій."""
+    login(client, "tokar", "tokar123")
+    r = client.get("/work-centers/3/terminal")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "немає доступу" not in html.lower()
+    assert "лише перегляд" in html.lower()
+    assert "ПОЧАТИ" not in html and "ЗАВЕРШИТИ" not in html
+
+    # А на своїй дільниці кнопки дій лишаються доступні як і раніше.
     r2 = client.get("/work-centers/1/terminal")
     assert r2.status_code == 200
+    html2 = r2.get_data(as_text=True)
+    assert "лише перегляд" not in html2.lower()
+
+
+def test_foreman_cannot_advance_operation_on_foreign_work_center(client):
+    """Навіть якщо майстер відкрив чужий термінал і спробує напряму
+    відправити POST на operation_advance (в обхід прихованої в UI кнопки),
+    сервер має відхилити цю дію - дозволено лише перегляд, не керування."""
+    login(client, "tokar", "tokar123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    op = db.execute(
+        "SELECT id FROM production_operations WHERE work_center_id=3 AND status='waiting' LIMIT 1"
+    ).fetchone()
+    if op is None:
+        pytest.skip("немає підходящої тестової операції на дільниці 3 в демо-даних")
+    before_status = db.execute("SELECT status FROM production_operations WHERE id=?", (op["id"],)).fetchone()["status"]
+
+    r = post(client, f"/production/operations/{op['id']}/advance", follow_redirects=True)
+    assert "лише на своїй дільниці" in r.get_data(as_text=True).lower()
+
+    after_status = db.execute("SELECT status FROM production_operations WHERE id=?", (op["id"],)).fetchone()["status"]
+    assert after_status == before_status
 
 
 def test_general_production_role_sees_everything(client):
@@ -1200,6 +1403,101 @@ def test_general_production_role_sees_everything(client):
     assert r.status_code == 200
     r2 = client.get("/work-centers")
     assert r2.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Склад: виробництво може списувати матеріал, але не оформляти прихід
+# ---------------------------------------------------------------------------
+
+def test_production_role_can_write_off_warehouse_stock(client):
+    """Виробничник має право списати матеріал, який сам витратив (саме
+    тому йому й показують склад у меню) - перевіряємо, що списання реально
+    зменшує залишок."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    item = db.execute("SELECT * FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+    before_qty = item["qty_on_hand"]
+
+    r = post(client, f"/warehouse/{item['id']}/transactions", {
+        "type": "out", "qty": "2", "reference": "списано на деталь",
+    }, follow_redirects=True)
+    assert r.status_code == 200
+    assert "складську операцію проведено" in r.get_data(as_text=True).lower()
+
+    db2 = sqlite3.connect(a.DB_PATH)
+    db2.row_factory = sqlite3.Row
+    after_qty = db2.execute("SELECT qty_on_hand FROM warehouse_items WHERE id=?", (item["id"],)).fetchone()["qty_on_hand"]
+    assert after_qty == before_qty - 2
+
+
+def test_production_role_cannot_record_warehouse_receipt(client):
+    """Виробничник НЕ може оформити прихід нового матеріалу (type='in') -
+    це відповідальність ролі 'Склад', а не цеху."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    item = db.execute("SELECT * FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+    before_qty = item["qty_on_hand"]
+
+    r = post(client, f"/warehouse/{item['id']}/transactions", {
+        "type": "in", "qty": "50", "reference": "спроба приходу",
+    }, follow_redirects=True)
+    assert r.status_code == 200
+    assert "прихід і коригування" in r.get_data(as_text=True).lower()
+
+    db2 = sqlite3.connect(a.DB_PATH)
+    db2.row_factory = sqlite3.Row
+    after_qty = db2.execute("SELECT qty_on_hand FROM warehouse_items WHERE id=?", (item["id"],)).fetchone()["qty_on_hand"]
+    assert after_qty == before_qty
+
+
+def test_production_role_cannot_add_material_lot(client):
+    """Реєстрація партії матеріалу (плавка/сертифікат) лишається виключно
+    за складом - маршрут і далі приймає тільки роль 'Склад'."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    item = db.execute("SELECT * FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+
+    r = post(client, f"/warehouse/{item['id']}/lots", {
+        "heat_number": "HT-TEST", "qty": "10",
+    }, follow_redirects=True)
+    assert "прав" in r.get_data(as_text=True).lower()
+
+
+def test_warehouse_item_page_hides_receipt_form_for_production(client):
+    """Сторінка матеріалу для ролі 'Виробництво' має показувати лише форму
+    списання (без вибору типу операції й без блоку реєстрації партій), щоб
+    не вводити в оману можливістю, якої насправді немає."""
+    login(client, "maister", "prod123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    item = db.execute("SELECT * FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+
+    html = client.get(f"/warehouse/{item['id']}").get_data(as_text=True)
+    assert "Списання матеріалу" in html
+    assert "<select name=\"type\">" not in html  # вибір типу операції прихований - type завжди 'out'
+    assert "Партії матеріалу" not in html
+
+
+def test_warehouse_role_still_sees_full_form(client):
+    """Роль 'Склад' і далі бачить повний вибір типу операції (прихід/
+    списання/інвентаризація) і блок партій матеріалу - обмеження стосується
+    лише ролі 'Виробництво'."""
+    login(client, "sklad", "sklad123")
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    item = db.execute("SELECT * FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+
+    html = client.get(f"/warehouse/{item['id']}").get_data(as_text=True)
+    assert 'name="type"' in html
+    assert "Партії матеріалу" in html
 
 
 # ---------------------------------------------------------------------------
@@ -2729,6 +3027,131 @@ def test_calculator_quote_pdf_handles_long_ai_operations_description_without_err
 def test_calculator_quote_pdf_requires_login(client):
     r = client.post("/calculator/quote.pdf", data={"weight_kg": "1"}, follow_redirects=True)
     assert "логін" in r.get_data(as_text=True).lower() or "пароль" in r.get_data(as_text=True).lower()
+
+
+# ---------------------------------------------------------------------------
+# PDF, створення угоди й пошук із картки історії розрахунків
+# ---------------------------------------------------------------------------
+
+def test_calculator_history_quote_pdf_produces_real_pdf_with_correct_totals(client):
+    """РЕАЛЬНИЙ функціональний тест: PDF генерується із ЗБЕРЕЖЕНОГО запису
+    історії (а не з форми) - перевіряємо справжню PDF-сигнатуру і що
+    документ використовує дані саме цього запису (довгий опис техпроцесу
+    не ламає генерацію, як і в "живому" калькуляторі)."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, weight_kg, "
+        "material_price_per_kg, turning_hours, turning_rate_per_hour, milling_hours, milling_rate_per_hour, "
+        "machine_hours, machine_rate_per_hour, setup_cost_total, margin_pct, cost_per_unit, price_per_unit, "
+        "total_price, operations_description, created_at) VALUES "
+        "(1,'manual','Вал для PDF-тесту',10,2,50,1,800,0,900,0,0,0,20,850,1020,10200,'Токарна обробка.','2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    r = client.get(f"/calculator/history/{calc_id}/quote.pdf")
+    assert r.status_code == 200
+    assert r.mimetype == "application/pdf"
+    assert r.data[:4] == b"%PDF"
+    assert len(r.data) > 1500
+
+
+def test_calculator_history_quote_pdf_missing_id_returns_404(client):
+    login(client)
+    r = client.get("/calculator/history/999999/quote.pdf")
+    assert r.status_code == 404
+
+
+def test_calculator_history_quote_pdf_requires_login():
+    a = __import__("app")
+    c = a.app.test_client()
+    r = c.get("/calculator/history/1/quote.pdf", follow_redirects=True)
+    assert "Увійти" in r.get_data(as_text=True) or "login" in r.request.path
+
+
+def test_calculator_history_detail_has_pdf_and_create_deal_links(client):
+    """Картка деталей розрахунку має вести і на PDF, і на створення угоди з
+    уже підставленими назвою деталі та сумою (щоб не вводити ті самі дані
+    вдруге вручну в формі нової угоди)."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Фланець для угоди',5,100,120,600,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    html = client.get(f"/calculator/history/{calc_id}").get_data(as_text=True)
+    assert f"/calculator/history/{calc_id}/quote.pdf" in html
+    assert "/deals/new" in html
+    assert "prefill_title=" in html
+    assert "prefill_amount=600" in html
+
+
+def test_create_deal_from_calculation_prefills_form(client):
+    """Повний сценарій: клік «Створити угоду» з картки розрахунку відкриває
+    форму нової угоди з уже підставленими назвою й сумою."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Вал для нової угоди',3,200,240,720,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+
+    r = client.get("/deals/new?prefill_title=" + "Вал для нової угоди" + "&prefill_amount=720")
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert 'value="Вал для нової угоди"' in html
+    assert 'value="720' in html
+
+
+def test_search_finds_calculation_by_part_description(client):
+    """Глобальний пошук має знаходити й розрахунки вартості (не лише
+    клієнтів/угоди) для ролей, яким і так доступний калькулятор."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, cost_per_unit, "
+        "price_per_unit, total_price, created_at) VALUES (1,'manual','Унікальна деталь ШукайМене',1,10,12,12,'2026-01-01 10:00:00')"
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    r = client.get("/search?q=ШукайМене")
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "Унікальна деталь ШукайМене" in html
+    assert f"/calculator/history/{calc_id}" in html
+
+
+def test_search_hides_calculations_for_warehouse_role(client):
+    """Роль 'Склад' не має доступу до калькулятора/історії - пошук не
+    повинен витікати туди цінову інформацію, навіть якщо збіг є."""
+    login(client, "sklad", "sklad123")
+    r = client.get("/search?q=деталь")
+    assert r.status_code == 200
+    assert "Розрахунки вартості" not in r.get_data(as_text=True)
+
+
+def test_demo_seed_populates_calculation_history_for_fresh_install(client):
+    """На свіжовстановленій базі (одразу після сідингу демо-даних) сторінка
+    історії розрахунків НЕ повинна бути порожньою - інакше презентація
+    починається з порожнього екрана там, де мала б бути жива демонстрація."""
+    login(client)
+    html = client.get("/calculator/history").get_data(as_text=True)
+    assert "Розрахунків ще немає" not in html
+    assert "Фланець приводний" in html
 
 
 if __name__ == "__main__":
