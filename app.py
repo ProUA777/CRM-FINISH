@@ -1052,6 +1052,45 @@ def seed_data(db):
         (cf_id, 1, "ВІП"),
     )
 
+    # --- Приклади розрахунків вартості в історії калькулятора (наочність на
+    # демо - без цього "Історія розрахунків" після встановлення порожня) ---
+    calc_demo = [
+        # source, опис, к-сть, вага, ціна_мат, токарна_год, токарна_ставка,
+        # фрезерна_год, фрезерна_ставка, доп_год, доп_ставка, наладка, націнка,
+        # техпроцес, собівартість/од, ціна/од, разом
+        # (суми прораховані точно за тією ж формулою, що й сам калькулятор:
+        # собівартість = матеріал + токарна + фрезерна + доп.обробка + наладка/к-сть;
+        # ціна = собівартість × (1 + націнка/100); разом = ціна × к-сть)
+        ("manual", "Вал ступінчастий Ø40х300, сталь 40Х", 20, 2.3, 62, 1.2, 800, 0.3, 900, 0, 0, 600, 25,
+         "", 1402.60, 1753.25, 35065.0),
+        ("ai", "Фланець приводний Ø120, сталь 45, партія під держзамовлення", 50, 1.8, 60, 0.8, 800, 1.1, 900, 0.2, 400,
+         1200, 22,
+         "Технологічний процес виготовлення приводного фланця Ø120 мм зі сталі 45:\n"
+         "1. Розкрій заготовки з прутка Ø130 мм на токарно-відрізному верстаті, довжина заготовки 35 мм з припуском.\n"
+         "2. Встановлення заготовки в трикулачний патрон токарного верстата з ЧПУ, вивірка биття не більше 0.05 мм.\n"
+         "3. Чорнове точіння зовнішнього діаметра та торців з припуском 0.5 мм під чистову обробку.\n"
+         "4. Свердління центрального отвору Ø30 мм наскрізь під подальше розточування.\n"
+         "5. Розточування центрального отвору до Ø32H7 з дотриманням допуску та шорсткості Ra 1.6.\n"
+         "6. Нарізання 6 кріпильних отворів М10 по колу Ø90 мм на фрезерному обробному центрі з ЧПУ.\n"
+         "7. Чистове точіння зовнішнього діаметра Ø120h7 та торцевих поверхонь за програмою ЧПУ.\n"
+         "8. Зняття фасок 1.5х45° по всіх гострих кромках для безпечного поводження та складання.\n"
+         "9. Контроль геометричних розмірів на координатно-вимірювальній машині (ВТК), складання протоколу.\n"
+         "10. Маркування партії відповідно до креслення, консервація антикорозійним мастилом.\n"
+         "11. Упаковка в картонні короби з прокладками, підготовка супровідної документації до відвантаження.",
+         1842.00, 2247.24, 112362.0),
+        ("manual", "Втулка бронзова Ø25х40 для ремонтної партії", 8, 0.3, 450, 0.4, 750, 0, 900, 0, 0, 150, 30,
+         "", 453.75, 589.875, 4719.0),
+    ]
+    for source, desc, qty, weight, mat_price, t_h, t_rate, m_h, m_rate, mc_h, mc_rate, setup, margin, ops_desc, cost_u, price_u, total in calc_demo:
+        cur.execute(
+            """INSERT INTO cost_calculations (user_id, source, part_description, quantity, weight_kg,
+               material_price_per_kg, turning_hours, turning_rate_per_hour, milling_hours, milling_rate_per_hour,
+               machine_hours, machine_rate_per_hour, setup_cost_total, margin_pct, cost_per_unit, price_per_unit,
+               total_price, operations_description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (oleh_id if source == "manual" else admin_id, source, desc, qty, weight, mat_price, t_h, t_rate,
+             m_h, m_rate, mc_h, mc_rate, setup, margin, cost_u, price_u, total, ops_desc, now_iso()),
+        )
+
     # --- Налаштування: API-ключ телеметрії, курси валют ---
     import secrets as _secrets
     cur.execute("INSERT INTO settings (key, value) VALUES (?,?)", ("api_key", _secrets.token_hex(16)))
@@ -3473,9 +3512,9 @@ CALCULATOR_HISTORY_HTML = """
 </div>
 <div class="card table-wrap">
 <table>
-  <tr><th>Дата</th><th>Менеджер</th><th>Джерело</th><th>Деталь</th><th>К-сть</th><th>Собівартість/од</th><th>Ціна/од</th><th>Разом</th></tr>
+  <tr><th>Дата</th><th>Менеджер</th><th>Джерело</th><th>Деталь</th><th>К-сть</th><th>Собівартість/од</th><th>Ціна/од</th><th>Разом</th><th>Дії</th></tr>
   {% for r in rows %}
-  <tr>
+  <tr onclick="window.location='{{ url_for('calculator_history_detail', calc_id=r['id']) }}'" style="cursor:pointer;">
     <td style="white-space:nowrap;">{{ r['created_at'] }}</td>
     <td>{{ r['manager_name'] or '—' }}</td>
     <td>{% if r['source']=='ai' %}<span class="badge badge-low">🤖 ШІ</span>{% else %}<span class="badge">ручний</span>{% endif %}</td>
@@ -3484,9 +3523,19 @@ CALCULATOR_HISTORY_HTML = """
     <td>{{ '%.2f'|format(r['cost_per_unit'] or 0) }}</td>
     <td>{{ '%.2f'|format(r['price_per_unit'] or 0) }}</td>
     <td><b>{{ '%.2f'|format(r['total_price'] or 0) }}</b></td>
+    <td style="white-space:nowrap;" onclick="event.stopPropagation();">
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('calculator_history_detail', calc_id=r['id']) }}">👁 Деталі</a>
+      <form method="post" action="{{ url_for('calculator_history_delete', calc_id=r['id']) }}" style="display:inline;" onsubmit="return confirm('Видалити цей розрахунок з історії? Дію не можна скасувати.');">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="page" value="{{ page }}">
+        <input type="hidden" name="source" value="{{ request.args.get('source','') }}">
+        <input type="hidden" name="q" value="{{ search_q or '' }}">
+        <button class="btn btn-danger btn-sm" type="submit">🗑</button>
+      </form>
+    </td>
   </tr>
   {% else %}
-  <tr><td colspan="8" class="empty">Розрахунків ще немає</td></tr>
+  <tr><td colspan="9" class="empty">Розрахунків ще немає</td></tr>
   {% endfor %}
 </table>
 </div>
@@ -3498,6 +3547,68 @@ CALCULATOR_HISTORY_HTML = """
   {% if page < total_pages %}<a class="btn btn-sm" href="?page={{ page+1 }}{{ qs }}">Наступна →</a>{% endif %}
 </div>
 {% endif %}
+{% endblock %}
+"""
+
+CALCULATOR_HISTORY_DETAIL_HTML = """
+{% extends "base.html" %}
+{% block title %}Розрахунок №{{ r['id'] }}{% endblock %}
+{% block heading %}Розрахунок №{{ r['id'] }}{% endblock %}
+{% block subheading %}{{ r['created_at'] }} · {{ r['manager_name'] or '—' }} · {% if r['source']=='ai' %}🤖 через ШІ{% else %}ручний розрахунок{% endif %}{% endblock %}
+{% block content %}
+<div class="detail-header">
+  <div style="max-width:720px;">
+    <div style="font-weight:600; font-size:15px; margin-bottom:4px;">{{ r['part_description'] or '—' }}</div>
+  </div>
+  <div style="display:flex; gap:8px; flex-wrap:wrap;">
+    <a class="btn btn-ghost" href="{{ url_for('calculator_history') }}">← До історії</a>
+    <a class="btn" href="{{ url_for('calculator_history_quote_pdf', calc_id=r['id']) }}" target="_blank">📄 Скачати PDF</a>
+    <a class="btn btn-primary" href="{{ url_for('deal_new', prefill_title=r['part_description'], prefill_amount=r['total_price']) }}">➕ Створити угоду</a>
+    <form method="post" action="{{ url_for('calculator_history_delete', calc_id=r['id']) }}" onsubmit="return confirm('Видалити цей розрахунок з історії? Дію не можна скасувати.');">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-danger" type="submit">🗑 Видалити</button>
+    </form>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div>
+    <div class="section-title"><span class="accent-dot"></span> Вхідні параметри</div>
+    <div class="card table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значення</th></tr>
+        <tr><td>Кількість у партії</td><td>{{ r['quantity'] }} шт</td></tr>
+        <tr><td>Вага заготовки (на 1 деталь)</td><td>{{ r['weight_kg'] if r['weight_kg'] is not none else '—' }} кг</td></tr>
+        <tr><td>Ціна матеріалу</td><td>{{ r['material_price_per_kg'] if r['material_price_per_kg'] is not none else '—' }} грн/кг</td></tr>
+        <tr><td>Токарна обробка</td><td>{{ r['turning_hours'] if r['turning_hours'] is not none else '—' }} год × {{ r['turning_rate_per_hour'] if r['turning_rate_per_hour'] is not none else '—' }} грн/год</td></tr>
+        <tr><td>Фрезерна/свердлильна обробка</td><td>{{ r['milling_hours'] if r['milling_hours'] is not none else '—' }} год × {{ r['milling_rate_per_hour'] if r['milling_rate_per_hour'] is not none else '—' }} грн/год</td></tr>
+        <tr><td>Додаткова обробка (шліфування/ТО/покриття)</td><td>{{ r['machine_hours'] if r['machine_hours'] is not none else '—' }} год × {{ r['machine_rate_per_hour'] if r['machine_rate_per_hour'] is not none else '—' }} грн/год</td></tr>
+        <tr><td>Наладка (на всю партію)</td><td>{{ '%.2f'|format(r['setup_cost_total'] or 0) }} грн</td></tr>
+        <tr><td>Націнка</td><td>{{ r['margin_pct'] if r['margin_pct'] is not none else '—' }}%</td></tr>
+      </table>
+    </div>
+  </div>
+  <div>
+    <div class="section-title"><span class="accent-dot"></span> Результат розрахунку</div>
+    <div class="card table-wrap">
+      <table>
+        <tr><th>Показник</th><th>Значення</th></tr>
+        <tr><td>Собівартість за одиницю</td><td><b>{{ '%.2f'|format(r['cost_per_unit'] or 0) }} грн</b></td></tr>
+        <tr><td>Ціна за одиницю (з націнкою)</td><td><b>{{ '%.2f'|format(r['price_per_unit'] or 0) }} грн</b></td></tr>
+        <tr><td>Разом за партію ({{ r['quantity'] }} шт)</td><td><b style="color:var(--accent-2); font-size:15px;">{{ '%.2f'|format(r['total_price'] or 0) }} грн</b></td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section-title"><span class="accent-dot"></span> Технологічний опис / маршрут виготовлення</div>
+<div class="card card-pad">
+  {% if r['operations_description'] %}
+  <div style="white-space:pre-wrap; font-size:13px; line-height:1.6;">{{ r['operations_description'] }}</div>
+  {% else %}
+  <div class="empty">Опис техпроцесу не збережено для цього розрахунку</div>
+  {% endif %}
+</div>
 {% endblock %}
 """
 
@@ -4041,11 +4152,16 @@ TERMINAL_HTML = """
 {% extends "base.html" %}
 {% block title %}Термінал: {{ wc['name'] }}{% endblock %}
 {% block heading %}{{ wc['name'] }}{% endblock %}
-{% block subheading %}Термінал цеху — статус деталей на цій дільниці{% endblock %}
+{% block subheading %}{{ 'Перегляд іншої дільниці — статус деталей' if not can_act else 'Термінал цеху — статус деталей на цій дільниці' }}{% endblock %}
 {% block content %}
 <div class="toolbar">
-  <div></div>
-  <a class="btn" href="{{ url_for('work_centers_list') }}">← Всі робочі центри</a>
+  <div>
+    {% if not can_act %}<span class="badge badge-medium">👁 Лише перегляд — це не ваша дільниця</span>{% endif %}
+  </div>
+  <div style="display:flex; gap:8px;">
+    {% if foreman_own_wc and not can_act %}<a class="btn btn-primary" href="{{ url_for('work_center_terminal', wc_id=foreman_own_wc) }}">← Моя дільниця</a>{% endif %}
+    <a class="btn" href="{{ url_for('work_centers_list') }}">{{ 'Інші дільниці' if foreman_own_wc else '← Всі робочі центри' }}</a>
+  </div>
 </div>
 <div style="display:flex; flex-direction:column; gap:14px;">
   {% for op in ops %}
@@ -4067,7 +4183,9 @@ TERMINAL_HTML = """
         <span class="badge badge-{{ 'low' if op.status=='in_progress' else 'medium' }}" style="margin-bottom:10px; display:inline-block;">
           {{ 'У РОБОТІ' if op.status=='in_progress' else 'ОЧІКУЄ' }}
         </span><br>
-        {% if op.ready %}
+        {% if not can_act %}
+        <span style="font-size:11.5px; color:var(--text-dim);">Дії доступні лише на своїй дільниці</span>
+        {% elif op.ready %}
         <form method="post" action="{{ url_for('operation_advance', op_id=op.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
           <button class="btn btn-primary" type="submit" style="font-size:16px; padding:16px 28px;">
             {{ 'ЗАВЕРШИТИ' if op.status=='in_progress' else 'ПОЧАТИ' }}
@@ -4098,16 +4216,20 @@ WORK_CENTERS_HTML = """
 {% block subheading %}Телеметрія з реального обладнання (Haas та інші) + % планового завантаження{% endblock %}
 {% block content %}
 <div class="toolbar">
-  <div class="filters"></div>
+  <div class="filters">
+    {% if foreman_own_wc %}<span class="badge badge-low">👁 Перегляд усіх дільниць — дії доступні лише на вашій</span>{% endif %}
+  </div>
+  {% if foreman_own_wc %}<a class="btn btn-primary btn-sm" href="{{ url_for('work_center_terminal', wc_id=foreman_own_wc) }}">← Моя дільниця</a>{% else %}
   <a class="btn btn-sm" href="{{ url_for('settings_page') }}">⚒ Підключити обладнання (API / Haas)</a>
+  {% endif %}
 </div>
 <div class="grid grid-3">
   {% for wc in work_centers %}
   {% set t = telemetry.get(wc['id']) %}
   {% set rs = runtime_stats.get(wc['id']) %}
-  <div class="card card-pad">
+  <div class="card card-pad" style="{{ 'outline:1px solid var(--accent-2);' if foreman_own_wc==wc['id'] }}">
     <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h3 style="margin:0;">{{ wc['name'] }}</h3>
+      <h3 style="margin:0;">{{ wc['name'] }}{% if foreman_own_wc==wc['id'] %} <span class="badge badge-low" style="font-size:10px;">моя</span>{% endif %}</h3>
       {% if t and t['status']=='running' %}<span class="badge badge-low">▶ працює</span>
       {% elif t and t['status']=='alarm' %}<span class="badge badge-high">⛔ аварія</span>
       {% elif t and t['status']=='idle' %}<span class="badge badge-medium">⏸ простій</span>
@@ -4308,19 +4430,25 @@ WAREHOUSE_ITEM_HTML = """
     </div>
   </div>
   <div>
-    <div class="section-title"><span class="accent-dot"></span> Прихід / списання</div>
+    <div class="section-title"><span class="accent-dot"></span> {{ 'Списання матеріалу' if current_user['role']=='production' else 'Прихід / списання' }}</div>
     <form method="post" action="{{ url_for('warehouse_transaction_add', item_id=item['id']) }}" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      {% if current_user['role']=='production' %}
+      <input type="hidden" name="type" value="out">
+      <p style="font-size:11.5px; color:var(--text-dim); margin-top:0;">Спиши матеріал, який фактично витратив на деталь. Прихід нового матеріалу та коригування залишків проводить склад.</p>
+      {% else %}
       <div class="field" style="margin-bottom:10px;">
         <label>Тип операції</label>
         <select name="type">{% for k,v in WAREHOUSE_TX_TYPES %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select>
       </div>
+      {% endif %}
       <div class="field" style="margin-bottom:10px;"><label>Кількість</label><input type="number" step="0.01" name="qty" required></div>
-      <div class="field" style="margin-bottom:10px;"><label>Примітка</label><input type="text" name="reference"></div>
-      <button class="btn btn-primary" type="submit">Провести операцію</button>
+      <div class="field" style="margin-bottom:10px;"><label>Примітка</label><input type="text" name="reference" placeholder="{{ 'напр.: списано на в.з. №12' if current_user['role']=='production' else '' }}"></div>
+      <button class="btn btn-primary" type="submit">{{ 'Списати' if current_user['role']=='production' else 'Провести операцію' }}</button>
     </form>
   </div>
 </div>
 
+{% if current_user['role'] != 'production' %}
 <div class="section-title"><span class="accent-dot"></span> Партії матеріалу (плавки, сертифікати якості)</div>
 <div class="grid grid-2">
   <div class="card table-wrap">
@@ -4352,6 +4480,7 @@ WAREHOUSE_ITEM_HTML = """
     <button class="btn btn-sm btn-primary" type="submit">+ Зареєструвати партію</button>
   </form>
 </div>
+{% endif %}
 {% endif %}
 {% endblock %}
 """
@@ -4487,6 +4616,16 @@ SEARCH_HTML = """
   {% else %}<tr><td class="empty">Нічого не знайдено</td></tr>{% endfor %}
 </table>
 </div>
+{% if show_calculations %}
+<div class="section-title"><span class="accent-dot"></span> Розрахунки вартості</div>
+<div class="card table-wrap">
+<table>
+  {% for calc in calculations %}
+  <tr onclick="window.location='{{ url_for('calculator_history_detail', calc_id=calc['id']) }}'" style="cursor:pointer;"><td>{{ calc['part_description'] or '—' }}</td><td>{{ '%.2f'|format(calc['total_price'] or 0) }} грн</td></tr>
+  {% else %}<tr><td class="empty">Нічого не знайдено</td></tr>{% endfor %}
+</table>
+</div>
+{% endif %}
 {% endblock %}
 """
 
@@ -4852,6 +4991,7 @@ app.jinja_loader = DictLoader({
     "deal_form.html": DEAL_FORM_HTML,
     "calculator.html": CALCULATOR_HTML,
     "calculator_history.html": CALCULATOR_HISTORY_HTML,
+    "calculator_history_detail.html": CALCULATOR_HISTORY_DETAIL_HTML,
     "deal_detail.html": DEAL_DETAIL_HTML,
     "tasks.html": TASKS_HTML,
     "calendar.html": CALENDAR_HTML,
@@ -5438,6 +5578,59 @@ def calculator_history():
                             total=total, page=page, total_pages=total_pages, search_q=q)
 
 
+@app.route("/calculator/history/<int:calc_id>")
+@login_required
+@role_required("sales")
+def calculator_history_detail(calc_id):
+    """Детальна картка одного збереженого розрахунку - повний опис
+    техпроцесу (без обрізання, на відміну від рядка в таблиці) і всі вхідні
+    параметри та результат, щоб менеджер міг перевірити розрахунок перед
+    тим, як показати його клієнту чи керівнику."""
+    db = get_db()
+    r = db.execute(
+        "SELECT cc.*, u.full_name AS manager_name FROM cost_calculations cc "
+        "LEFT JOIN users u ON u.id = cc.user_id WHERE cc.id=?",
+        (calc_id,),
+    ).fetchone()
+    if not r:
+        abort(404)
+    return render_template("calculator_history_detail.html", active="calculator", r=r)
+
+
+@app.route("/calculator/history/<int:calc_id>/delete", methods=["POST"])
+@login_required
+@role_required("sales")
+def calculator_history_delete(calc_id):
+    """Видаляє один розрахунок з історії - остаточно (без кошика), тому
+    підтвердження береться на формі (confirm()) перед відправкою. Після
+    видалення повертає туди, звідки прийшли (зі сторінки списку - з тим
+    самим фільтром/сторінкою; з картки деталей - на список)."""
+    db = get_db()
+    r = db.execute("SELECT id FROM cost_calculations WHERE id=?", (calc_id,)).fetchone()
+    if not r:
+        abort(404)
+    db.execute("DELETE FROM cost_calculations WHERE id=?", (calc_id,))
+    db.commit()
+    flash("Розрахунок видалено з історії", "success")
+
+    page = request.form.get("page", "").strip()
+    source = request.form.get("source", "").strip()
+    q = request.form.get("q", "").strip()
+    if page:
+        qs = []
+        if page and page != "1":
+            qs.append(f"page={page}")
+        if source:
+            qs.append(f"source={source}")
+        if q:
+            qs.append(f"q={q}")
+        url = url_for("calculator_history")
+        if qs:
+            url += "?" + "&".join(qs)
+        return redirect(url)
+    return redirect(url_for("calculator_history"))
+
+
 @app.route("/export/calculations.xlsx")
 @login_required
 @role_required("sales")
@@ -5636,40 +5829,20 @@ def calculator_ai_estimate():
                             warehouse_items=warehouse_items, ai_description=description)
 
 
-@app.route("/calculator/quote.pdf", methods=["POST"])
-@login_required
-@role_required("sales")
-def calculator_quote_pdf():
-    """Генерує PDF одразу з результату калькулятора (ручного чи ШІ-розрахунку),
-    без потреби спершу створювати угоду - зручно, щоб відразу відправити
-    клієнту розрахунок і повний технологічний процес. Суми НАВМИСНО рахуються
-    заново на сервері з переданих параметрів (а не беруться готовими з
-    прихованих полів форми), щоб підсумок у PDF не залежав від значень, які
-    можна підмінити в інструментах розробника браузера - той самий принцип
-    "довіряй, але перевіряй", що й у решті калькулятора."""
+def _render_quote_pdf(part_description, operations_description, weight_kg, material_price,
+                       turning_hours, turning_rate, milling_hours, milling_rate,
+                       machine_hours, machine_rate, setup_cost_total, quantity, margin_pct):
+    """Будує сам PDF-документ розрахунку вартості (використовується і для
+    щойно порахованого результату на сторінці калькулятора, і для вже
+    збереженого запису з історії - код генерації PDF спільний, щоб не
+    дублювати 150+ рядків reportlab-верстки і щоб обидва джерела завжди
+    давали однаковий за виглядом документ). Повертає BytesIO, готовий до
+    читання (seek(0) вже виконано)."""
     from io import BytesIO
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas as pdf_canvas
-    from flask import Response
-
-    f = request.form
-    try:
-        weight_kg = parse_number(f, "weight_kg", default=0, min_value=0, label="Вага заготовки")
-        material_price = parse_number(f, "material_price_per_kg", default=0, min_value=0, label="Ціна металу за кг")
-        turning_hours = parse_number(f, "turning_hours", default=0, min_value=0, label="Час токарної обробки")
-        turning_rate = parse_number(f, "turning_rate_per_hour", default=0, min_value=0, label="Ставка токарної обробки за годину")
-        milling_hours = parse_number(f, "milling_hours", default=0, min_value=0, label="Час фрезерної обробки")
-        milling_rate = parse_number(f, "milling_rate_per_hour", default=0, min_value=0, label="Ставка фрезерної обробки за годину")
-        machine_hours = parse_number(f, "machine_hours", default=0, min_value=0, label="Машино-години додаткової обробки")
-        machine_rate = parse_number(f, "machine_rate_per_hour", default=0, min_value=0, label="Ставка за машино-годину додаткової обробки")
-        setup_cost_total = parse_number(f, "setup_cost_total", default=0, min_value=0, label="Вартість наладки на партію")
-        quantity = parse_number(f, "quantity", default=1, min_value=1, label="Кількість деталей")
-        margin_pct = parse_number(f, "margin_pct", default=20, min_value=0, label="Націнка, %")
-    except ValidationError as e:
-        flash(str(e), "error")
-        return redirect(url_for("cost_calculator"))
 
     material_cost = weight_kg * material_price
     turning_cost = turning_hours * turning_rate
@@ -5680,8 +5853,8 @@ def calculator_quote_pdf():
     price_per_unit = cost_per_unit * (1 + margin_pct / 100)
     total_price = price_per_unit * quantity
 
-    part_description = (f.get("part_description") or "").strip() or "Розрахунок вартості механообробки"
-    operations_description = (f.get("operations_description") or "").strip()
+    part_description = (part_description or "").strip() or "Розрахунок вартості механообробки"
+    operations_description = (operations_description or "").strip()
 
     def wrap_text(text_obj, text, max_chars):
         for line in text.splitlines() or [""]:
@@ -5797,9 +5970,77 @@ def calculator_quote_pdf():
     c.showPage()
     c.save()
     buf.seek(0)
+    return buf
+
+
+@app.route("/calculator/quote.pdf", methods=["POST"])
+@login_required
+@role_required("sales")
+def calculator_quote_pdf():
+    """Генерує PDF одразу з результату калькулятора (ручного чи ШІ-розрахунку),
+    без потреби спершу створювати угоду - зручно, щоб відразу відправити
+    клієнту розрахунок і повний технологічний процес. Суми НАВМИСНО рахуються
+    заново на сервері з переданих параметрів (а не беруться готовими з
+    прихованих полів форми), щоб підсумок у PDF не залежав від значень, які
+    можна підмінити в інструментах розробника браузера - той самий принцип
+    "довіряй, але перевіряй", що й у решті калькулятора."""
+    from flask import Response
+
+    f = request.form
+    try:
+        weight_kg = parse_number(f, "weight_kg", default=0, min_value=0, label="Вага заготовки")
+        material_price = parse_number(f, "material_price_per_kg", default=0, min_value=0, label="Ціна металу за кг")
+        turning_hours = parse_number(f, "turning_hours", default=0, min_value=0, label="Час токарної обробки")
+        turning_rate = parse_number(f, "turning_rate_per_hour", default=0, min_value=0, label="Ставка токарної обробки за годину")
+        milling_hours = parse_number(f, "milling_hours", default=0, min_value=0, label="Час фрезерної обробки")
+        milling_rate = parse_number(f, "milling_rate_per_hour", default=0, min_value=0, label="Ставка фрезерної обробки за годину")
+        machine_hours = parse_number(f, "machine_hours", default=0, min_value=0, label="Машино-години додаткової обробки")
+        machine_rate = parse_number(f, "machine_rate_per_hour", default=0, min_value=0, label="Ставка за машино-годину додаткової обробки")
+        setup_cost_total = parse_number(f, "setup_cost_total", default=0, min_value=0, label="Вартість наладки на партію")
+        quantity = parse_number(f, "quantity", default=1, min_value=1, label="Кількість деталей")
+        margin_pct = parse_number(f, "margin_pct", default=20, min_value=0, label="Націнка, %")
+    except ValidationError as e:
+        flash(str(e), "error")
+        return redirect(url_for("cost_calculator"))
+
+    part_description = (f.get("part_description") or "").strip()
+    operations_description = (f.get("operations_description") or "").strip()
+
+    buf = _render_quote_pdf(part_description, operations_description, weight_kg, material_price,
+                             turning_hours, turning_rate, milling_hours, milling_rate,
+                             machine_hours, machine_rate, setup_cost_total, quantity, margin_pct)
 
     resp = Response(buf.read(), mimetype="application/pdf")
     resp.headers["Content-Disposition"] = "inline; filename=rozrahunok_vartosti.pdf"
+    return resp
+
+
+@app.route("/calculator/history/<int:calc_id>/quote.pdf")
+@login_required
+@role_required("sales")
+def calculator_history_quote_pdf(calc_id):
+    """Той самий PDF-документ розрахунку, але з уже ЗБЕРЕЖЕНОГО запису в
+    історії (а не з форми калькулятора) - щоб можна було відкрити старий
+    розрахунок через кілька днів і одразу скачати готовий PDF для клієнта,
+    не вводячи всі параметри заново вручну."""
+    from flask import Response
+
+    db = get_db()
+    r = db.execute("SELECT * FROM cost_calculations WHERE id=?", (calc_id,)).fetchone()
+    if not r:
+        abort(404)
+
+    buf = _render_quote_pdf(
+        r["part_description"] or "", r["operations_description"] or "",
+        r["weight_kg"] or 0, r["material_price_per_kg"] or 0,
+        r["turning_hours"] or 0, r["turning_rate_per_hour"] or 0,
+        r["milling_hours"] or 0, r["milling_rate_per_hour"] or 0,
+        r["machine_hours"] or 0, r["machine_rate_per_hour"] or 0,
+        r["setup_cost_total"] or 0, r["quantity"] or 1, r["margin_pct"] or 0,
+    )
+
+    resp = Response(buf.read(), mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = f"inline; filename=rozrahunok_{calc_id}.pdf"
     return resp
 
 
@@ -6916,6 +7157,16 @@ def operation_advance(op_id):
     op = db.execute("SELECT * FROM production_operations WHERE id=?", (op_id,)).fetchone()
     if not op:
         abort(404)
+    # Майстер, закріплений за своєю дільницею, тепер може ВІДКРИВАТИ термінали
+    # інших дільниць для перегляду (work_center_terminal), але ставити статус
+    # операції він і далі може лише на своїй - кнопки дій на чужому терміналі
+    # приховані в шаблоні, а ця перевірка захищає від прямого POST в обхід UI.
+    fw = foreman_work_center_id(get_current_user())
+    if fw and op["work_center_id"] != fw:
+        flash("Ви можете позначати статус операцій лише на своїй дільниці", "error")
+        if request.referrer and "/terminal" in request.referrer:
+            return redirect(request.referrer)
+        return redirect(url_for("work_center_terminal", wc_id=fw))
     if op["status"] == "waiting":
         prev = db.execute(
             "SELECT status FROM production_operations WHERE production_order_id=? AND step_order=?",
@@ -6951,13 +7202,19 @@ def operation_advance(op_id):
 @role_required("production")
 def work_center_terminal(wc_id):
     """Екран для комп'ютера безпосередньо в цеху/дільниці: оператор бачить
-    ЛИШЕ свої поточні завдання (на цьому конкретному робочому центрі, по
-    всіх виробничих замовленнях одразу) і великими кнопками сам ставить
-    статус деталі/заготовки — без потреби відкривати повний інтерфейс CRM."""
+    свої поточні завдання (на цьому конкретному робочому центрі, по всіх
+    виробничих замовленнях одразу) і великими кнопками сам ставить статус
+    деталі/заготовки — без потреби відкривати повний інтерфейс CRM.
+
+    Майстер, закріплений за своєю дільницею (work_center_id), може також
+    ВІДКРИВАТИ термінали ІНШИХ дільниць - щоб побачити, на якій стадії
+    зараз конкретна деталь по всьому цеху, а не лише на своїй ланці. Але
+    керувати (ставити "Почати"/"Завершити") він може лише на СВОЇЙ дільниці
+    - на чужій термінал відкривається в режимі лише перегляду, кнопки дій
+    приховані (і сервер однаково відхилить спробу натиснути їх напряму -
+    див. operation_advance)."""
     fw = foreman_work_center_id(get_current_user())
-    if fw and fw != wc_id:
-        flash("У вас немає доступу до цієї дільниці", "error")
-        return redirect(url_for("work_center_terminal", wc_id=fw))
+    can_act = (not fw) or (fw == wc_id)
     db = get_db()
     wc = db.execute("SELECT * FROM work_centers WHERE id=?", (wc_id,)).fetchone()
     if not wc:
@@ -6981,16 +7238,14 @@ def work_center_terminal(wc_id):
         d = dict(op)
         d["ready"] = (prev is None) or (prev["status"] == "done")
         ops_enriched.append(d)
-    return render_template("terminal.html", active="production", wc=wc, ops=ops_enriched)
+    return render_template("terminal.html", active="production", wc=wc, ops=ops_enriched,
+                            can_act=can_act, foreman_own_wc=fw)
 
 
 @app.route("/work-centers")
 @login_required
 @role_required("production", "sales")
 def work_centers_list():
-    fw = foreman_work_center_id(get_current_user())
-    if fw:
-        return redirect(url_for("work_center_terminal", wc_id=fw))
     db = get_db()
     work_centers = db.execute("SELECT * FROM work_centers ORDER BY id").fetchall()
     telemetry = {r["work_center_id"]: r for r in db.execute("SELECT * FROM machine_telemetry").fetchall()}
@@ -7007,7 +7262,8 @@ def work_centers_list():
         capacity = wc["capacity_hours_per_day"] * 14
         utilization[wc["id"]] = min(round(hours / capacity * 100) if capacity else 0, 100)
     return render_template("work_centers.html", active="production", work_centers=work_centers,
-                            telemetry=telemetry, utilization=utilization, runtime_stats=runtime_stats)
+                            telemetry=telemetry, utilization=utilization, runtime_stats=runtime_stats,
+                            foreman_own_wc=foreman_work_center_id(get_current_user()))
 
 
 # ---------------------------------------------------------------------------
@@ -7174,16 +7430,26 @@ def material_lot_delete(lot_id):
 
 @app.route("/warehouse/<int:item_id>/transactions", methods=["POST"])
 @login_required
-@role_required("warehouse")
+@role_required("warehouse", "production")
 def warehouse_transaction_add(item_id):
+    """Проводить складську операцію (прихід/списання/інвентаризація).
+    Роль 'Склад' може все - прихід нового матеріалу, списання,
+    інвентаризацію. Роль 'Виробництво' бачить склад саме для того, щоб
+    списати матеріал, який сама витратила на деталь (type='out') - але НЕ
+    може оформити прихід чи коригування (type='in'/'adjust'), бо приймання
+    постачання й облік залишків - відповідальність комірника, а не цеху."""
     db = get_db()
     f = request.form
+    user = get_current_user()
+    ttype = f.get("type", "in")
+    if user and user["role"] == "production" and ttype != "out":
+        flash("Виробництво може лише списувати використаний матеріал — прихід і коригування залишків проводить склад", "error")
+        return redirect(url_for("warehouse_item_detail", item_id=item_id))
     try:
         qty = parse_number(f, "qty", required=True, min_value=0.0001, label="Кількість")
     except ValidationError as e:
         flash(str(e), "error")
         return redirect(url_for("warehouse_item_detail", item_id=item_id))
-    ttype = f.get("type", "in")
     delta = qty if ttype == "in" else -qty
     item_check = db.execute("SELECT qty_on_hand, name FROM warehouse_items WHERE id=?", (item_id,)).fetchone()
     if not item_check:
@@ -7518,7 +7784,13 @@ def attachment_delete(attachment_id):
 def search():
     q = request.args.get("q", "").strip()
     db = get_db()
-    clients, deals = [], []
+    clients, deals, calculations = [], [], []
+    user = get_current_user()
+    # Розрахунки вартості показуємо лише тим, хто й так має доступ до
+    # калькулятора/історії (сторінка /calculator/history теж захищена
+    # role_required("sales")) - інакше пошук розкривав би ціни ролям,
+    # яким цей розділ узагалі не показаний у меню.
+    show_calculations = bool(user) and user["role"] in ("admin", "sales", "viewer")
     if q:
         like = f"%{q}%"
         clients = db.execute("SELECT * FROM clients WHERE name LIKE ? ORDER BY name", (like,)).fetchall()
@@ -7528,7 +7800,14 @@ def search():
                  (SELECT id FROM clients WHERE name LIKE ?))""",
             (like, like),
         ).fetchall()
-    return render_template("search.html", active="", q=q, clients=clients, deals=deals)
+        if show_calculations:
+            calculations = db.execute(
+                "SELECT * FROM cost_calculations WHERE part_description LIKE ? "
+                "ORDER BY created_at DESC LIMIT 50",
+                (like,),
+            ).fetchall()
+    return render_template("search.html", active="", q=q, clients=clients, deals=deals,
+                            calculations=calculations, show_calculations=show_calculations)
 
 
 # ---------------------------------------------------------------------------
