@@ -420,6 +420,31 @@ CREATE TABLE IF NOT EXISTS work_centers (
     capacity_hours_per_day REAL NOT NULL DEFAULT 8
 );
 
+-- Змінний журнал виробництва: окремий, незалежний від виробничих замовлень
+-- облік "скільки хто зробив за зміну" (на явний запит користувача - просто
+-- й швидко заповнюється, не залежить від того, чи заведене відповідне
+-- замовлення в CRM).
+CREATE TABLE IF NOT EXISTS shift_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_date TEXT NOT NULL,
+    shift TEXT NOT NULL DEFAULT 'day',
+    work_center_id INTEGER,
+    worker_user_id INTEGER,
+    part_description TEXT NOT NULL,
+    quantity_made INTEGER NOT NULL DEFAULT 0,
+    quantity_scrap INTEGER NOT NULL DEFAULT 0,
+    scrap_reason TEXT,
+    shift_hours REAL,
+    setup_hours REAL,
+    notes TEXT,
+    created_by_user_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    FOREIGN KEY(work_center_id) REFERENCES work_centers(id),
+    FOREIGN KEY(worker_user_id) REFERENCES users(id),
+    FOREIGN KEY(created_by_user_id) REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS routing_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL,
@@ -783,6 +808,12 @@ def seed_data(db):
         ("Переробка партії деталей за старим кресленням (універсал)", 2, 3, 3, "lead", 18000, "USD", 30, 15, oleh_id, d(60), "Виставка", "medium", "Konkurent CNC", "Мала серія, потрібна доробка під нове креслення замовника", None),
         ("Виготовлення партії кронштейнів (програно)", 5, 6, 1, "lost", 40000, "USD", 30, 0, oleh_id, d(-10), "Холодний дзвінок", "low", "Konkurent CNC", None, "Клієнт обрав дешевшого підрядника"),
         ("Виготовлення деталей для обробного центру клієнта", 4, 5, 2, "install", 65000, "USD", 40, 95, admin_id, d(3), "Рекомендація", "high", None, "Контроль якості заплановано на наступний тиждень", None),
+        # Ці дві угоди додані навмисно, щоб на СВІЖІЙ демо-базі виробниче
+        # замовлення охоплювало ВСІ 7 дільниць цеху з коробки (без них
+        # Токарна дільниця №1 і Шліфувальна дільниця лишались порожніми -
+        # на жодній не було жодного завдання, що й помітив користувач).
+        ("Виготовлення валів партія №2 (токарна дільниця)", 1, 1, 1, "prepay", 15000, "USD", 30, 70, admin_id, d(12), "Постійний клієнт", "medium", None, "Партія валів для поточного замовлення, токарна дільниця", None),
+        ("Шліфування посадкових втулок — друга партія", 4, 5, 5, "production", 22000, "USD", 40, 85, oleh_id, d(8), "Рекомендація", "medium", None, "Партія втулок на шліфування, контроль точності 0.002 мм", None),
     ]
     cur.executemany(
         """INSERT INTO deals (title, client_id, contact_id, machine_id, stage, amount, currency,
@@ -982,6 +1013,31 @@ def seed_data(db):
                 db.execute("UPDATE production_orders SET status='in_progress' WHERE id=?", (order_id,))
     db.commit()
 
+    # --- Демо-записи змінного журналу по всіх дільницях ---
+    # (без цього новий розділ "Змінний журнал" був би порожнім одразу після
+    # встановлення - додаємо кілька реалістичних записів за останні дні,
+    # по одному-два на кожну дільницю, щоб було що показати й перевірити)
+    maister_id = db.execute("SELECT id FROM users WHERE username='maister'").fetchone()["id"]
+    tokar_id = db.execute("SELECT id FROM users WHERE username='tokar'").fetchone()["id"]
+    shift_log_seed = [
+        (d(0), "day", 1, maister_id, "Розкрій заготовок зі сталі 40Х", 24, 1, "задир на торці", 8, 0.5),
+        (d(0), "day", 2, tokar_id, "Вал приводний Ф25 — чистове точіння", 18, 0, None, 8, 1.0),
+        (d(-1), "day", 2, tokar_id, "Вал приводний Ф25 — чорнове точіння", 20, 2, "биття різця", 7.5, 1.5),
+        (d(0), "day", 3, maister_id, "Корпус редуктора — фрезерування", 9, 1, "допуск по площині", 8, 2.0),
+        (d(-1), "day", 4, tokar_id, "Втулка посадкова — шліфування", 30, 0, None, 8, 0.5),
+        (d(0), "day", 5, maister_id, "Складання вузла супорта", 6, 0, None, 7, 0),
+        (d(-2), "day", 6, maister_id, "Контроль партії валів (ВТК)", 20, 0, None, 4, 0),
+        (d(0), "day", 7, maister_id, "Пакування партії для відвантаження", 15, 0, None, 3, 0),
+    ]
+    for work_date, shift, wc_id, worker_id, part_desc, made, scrap, scrap_reason, shift_hours, setup_hours in shift_log_seed:
+        db.execute(
+            """INSERT INTO shift_logs (work_date, shift, work_center_id, worker_user_id, part_description,
+               quantity_made, quantity_scrap, scrap_reason, shift_hours, setup_hours, created_by_user_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (work_date, shift, wc_id, worker_id, part_desc, made, scrap, scrap_reason, shift_hours, setup_hours, worker_id, now_iso()),
+        )
+    db.commit()
+
     # --- Реалістична 14-денна історія телеметрії для аналітики верстатів ---
     # (без цього сторінки "Робочі центри" та "Термінал цеху" були б порожні
     # одразу після встановлення - незручно і для демонстрації, і для
@@ -1145,6 +1201,41 @@ def get_current_user():
 def get_managers():
     db = get_db()
     return db.execute("SELECT * FROM users WHERE active=1 AND role IN ('admin','sales') ORDER BY full_name").fetchall()
+
+
+def get_production_workers():
+    db = get_db()
+    return db.execute("SELECT * FROM users WHERE active=1 AND role='production' ORDER BY full_name").fetchall()
+
+
+def can_edit_shift_log(user, log_row):
+    """Хто має право редагувати/видаляти ЧУЖИЙ запис змінного журналу
+    (свій - завжди можна):
+    - адмін - завжди;
+    - виробничник БЕЗ закріпленої дільниці (work_center_id не задано) -
+      це загальний майстер цеху за домовленістю, як і решта застосунку
+      (foreman_work_center_id повертає None саме для такого користувача) -
+      бачить і редагує все;
+    - виробничник, закріплений за СВОЄЮ дільницею (майстер дільниці) -
+      редагує записи, зроблені НА ЙОГО дільниці (незалежно від того, хто
+      саме з робітників їх вносив), плюс завжди свої власні записи;
+    - звичайний робітник без закріпленої дільниці, якщо такий колись
+      з'явиться - за цією ж логікою отримає повний доступ нарівні з
+      майстром цеху, тож для рядових операторів варто закріплювати
+      дільницю (work_center_id) у картці користувача, щоб обмежити їх
+      лише своїми записами й записами своєї дільниці."""
+    if not user:
+        return False
+    if user["role"] == "admin":
+        return True
+    if user["role"] != "production":
+        return False
+    if log_row["worker_user_id"] == user["id"] or log_row["created_by_user_id"] == user["id"]:
+        return True
+    fw = foreman_work_center_id(user)
+    if not fw:
+        return True
+    return log_row["work_center_id"] == fw
 
 
 def fmt_money(amount, currency="USD"):
@@ -1375,9 +1466,16 @@ def set_setting(db, key, value):
 
 def send_webhook_notification(text):
     """Надсилає сповіщення на налаштований вебхук (Slack-сумісний формат).
-    Помилки мережі не повинні ламати основний функціонал CRM."""
-    db = get_db()
-    url = get_setting(db, "webhook_url", "")
+    Помилки мережі не повинні ламати основний функціонал CRM - так само,
+    як і помилки доступу до БД (наприклад, коли ця функція викликається
+    зі штучного test_request_context під час сідингу демо-даних, де немає
+    власного з'єднання з БД і get_db() міг би конфліктувати з відкритою
+    транзакцією сідингу)."""
+    try:
+        db = get_db()
+        url = get_setting(db, "webhook_url", "")
+    except Exception as e:
+        return False, str(e)
     if not url:
         return False, "URL вебхука не налаштовано"
     try:
@@ -1398,9 +1496,12 @@ def send_telegram_notification(text):
     приватності не дозволяє боту писати користувачу лише за юзернеймом,
     поки той сам не написав боту хоч раз. Для каналів достатньо @назви
     каналу, якщо бот доданий туди адміністратором."""
-    db = get_db()
-    token = get_setting(db, "telegram_bot_token", "")
-    chat_id = get_setting(db, "telegram_chat_id", "")
+    try:
+        db = get_db()
+        token = get_setting(db, "telegram_bot_token", "")
+        chat_id = get_setting(db, "telegram_chat_id", "")
+    except Exception as e:
+        return False, str(e)
     if not token or not chat_id:
         return False, "Токен бота або chat_id не налаштовано"
     try:
@@ -2682,6 +2783,9 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       {% if current_user['role'] in ('admin','production','sales','viewer') %}
       <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробництво' }}</a>
       {% endif %}
+      {% if current_user['role'] in ('admin','production') %}
+      <a href="{{ url_for('shift_log_list') }}" class="{{ 'active' if active=='shift_log' }}"><span class="icon">📋</span> Змінний журнал</a>
+      {% endif %}
       {% if current_user['role'] in ('admin','warehouse','production','viewer') %}
       <a href="{{ url_for('warehouse_list') }}" class="{{ 'active' if active=='warehouse' }}"><span class="icon">▤</span> Склад</a>
       {% endif %}
@@ -2857,6 +2961,42 @@ DASHBOARD_HTML = """
     {% endfor %}
   </div>
 </div>
+
+{% if shift_today is not none %}
+<div class="section-title"><span class="accent-dot"></span> Виробництво сьогодні (змінний журнал)</div>
+<div class="grid grid-2">
+  <div class="card card-pad">
+    <div class="grid grid-2" style="gap:10px;">
+      <div class="card kpi" style="box-shadow:none;">
+        <div class="label">Виготовлено, шт</div>
+        <div class="kpi-value">{{ shift_today['made'] }}</div>
+      </div>
+      <div class="card kpi" style="box-shadow:none;">
+        <div class="label">Брак, шт</div>
+        <div class="kpi-value" style="color: {{ 'var(--red)' if shift_today['scrap'] else 'var(--text)' }};">{{ shift_today['scrap'] }}</div>
+      </div>
+    </div>
+    <div style="margin-top:10px;"><a class="btn btn-sm" href="{{ url_for('shift_log_list') }}">📋 Відкрити змінний журнал</a></div>
+  </div>
+  <div class="card card-pad">
+    <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> По дільницях сьогодні</div>
+    {% if shift_by_wc_today %}
+    <table>
+      <tr><th>Дільниця</th><th>Виготовлено</th><th>Брак</th></tr>
+      {% for r in shift_by_wc_today %}
+      <tr>
+        <td>{{ r['work_center_name'] or '—' }}</td>
+        <td>{{ r['made'] or 0 }}</td>
+        <td>{{ r['scrap'] or 0 }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">Записів за сьогодні ще немає</div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
 
 <div class="grid grid-2" style="margin-top:22px;">
   <div class="card card-pad">
@@ -3296,7 +3436,10 @@ document.querySelectorAll('.kanban-body').forEach(col => {
     const stage = col.dataset.stage;
     col.appendChild(dragged);
     fetch(`/deals/${dealId}/move/${stage}`, {method:'POST', headers:{'X-Requested-With':'fetch', 'X-CSRF-Token':'{{ csrf_token() }}'}})
-      .then(r=>r.json()).then(d=>{ location.reload(); })
+      .then(r=>r.json()).then(d=>{
+        if (d.needs_machine && d.redirect) { window.location = d.redirect; return; }
+        location.reload();
+      })
       .catch(()=>location.reload());
   });
 });
@@ -3489,6 +3632,121 @@ CALCULATOR_HTML = """
 {% endblock %}
 """
 
+SHIFT_LOG_LIST_HTML = """
+{% extends "base.html" %}
+{% block title %}Змінний журнал{% endblock %}
+{% block heading %}Змінний журнал виробництва{% endblock %}
+{% block subheading %}За період: виготовлено {{ totals['quantity_made'] }} шт · брак {{ totals['quantity_scrap'] }} шт{% endblock %}
+{% block content %}
+<div class="toolbar">
+  <div class="filters">
+    <form method="get" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <label style="font-size:12px; color:var(--text-dim);">з <input type="date" name="date_from" value="{{ date_from }}" style="width:auto;"></label>
+      <label style="font-size:12px; color:var(--text-dim);">по <input type="date" name="date_to" value="{{ date_to }}" style="width:auto;"></label>
+      <select name="work_center_id" onchange="this.form.submit()" style="width:auto;">
+        <option value="">Усі дільниці</option>
+        {% for wc in work_centers %}<option value="{{ wc['id'] }}" {{ 'selected' if f_wc==wc['id'] }}>{{ wc['name'] }}</option>{% endfor %}
+      </select>
+      <select name="worker_user_id" onchange="this.form.submit()" style="width:auto;">
+        <option value="">Усі робітники</option>
+        {% for w in workers %}<option value="{{ w['id'] }}" {{ 'selected' if f_worker==w['id'] }}>{{ w['full_name'] }}</option>{% endfor %}
+      </select>
+      <button class="btn btn-sm" type="submit">Фільтр</button>
+    </form>
+  </div>
+  <a class="btn btn-primary" href="{{ url_for('shift_log_new') }}">➕ Новий запис</a>
+</div>
+<div class="toolbar" style="margin-top:-6px;">
+  <div class="filters">
+    <form method="get" action="{{ url_for('shift_log_report_pdf') }}" target="_blank" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <label style="font-size:12px; color:var(--text-dim);">Зведення за місяць <input type="month" name="month" value="{{ current_month }}" style="width:auto;"></label>
+      <select name="worker_user_id" style="width:auto;">
+        <option value="">Усі робітники</option>
+        {% for w in workers %}<option value="{{ w['id'] }}" {{ 'selected' if f_worker==w['id'] }}>{{ w['full_name'] }}</option>{% endfor %}
+      </select>
+      <button class="btn btn-sm" type="submit">📄 Скачати PDF за місяць</button>
+    </form>
+  </div>
+</div>
+<div class="card table-wrap">
+<table>
+  <tr><th>Дата</th><th>Зміна</th><th>Дільниця</th><th>Робітник</th><th>Деталь</th><th>Виготовлено</th><th>Брак</th><th>Год. зміни</th><th>Налад., год</th><th>Дії</th></tr>
+  {% for r in logs %}
+  <tr>
+    <td style="white-space:nowrap;">{{ r['work_date'] }}</td>
+    <td>{{ {'day':'Денна','night':'Нічна'}.get(r['shift'], r['shift']) }}</td>
+    <td>{{ r['work_center_name'] or '—' }}</td>
+    <td>{{ r['worker_name'] or '—' }}</td>
+    <td style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ r['part_description'] }}">{{ r['part_description'] }}</td>
+    <td>{{ r['quantity_made'] }}</td>
+    <td>{% if r['quantity_scrap'] %}<span class="badge badge-high">{{ r['quantity_scrap'] }}</span>{% else %}0{% endif %}</td>
+    <td>{{ r['shift_hours'] if r['shift_hours'] is not none else '—' }}</td>
+    <td>{{ r['setup_hours'] if r['setup_hours'] is not none else '—' }}</td>
+    <td style="white-space:nowrap;">
+      {% if r['can_edit'] %}
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('shift_log_edit', log_id=r['id']) }}">✎</a>
+      <form method="post" action="{{ url_for('shift_log_delete', log_id=r['id']) }}" style="display:inline;" onsubmit="return confirm('Видалити цей запис змінного журналу?');">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-danger btn-sm" type="submit">🗑</button>
+      </form>
+      {% else %}
+      <span style="color:var(--text-dim); font-size:12px;">—</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="10" class="empty">Записів за обраний період немає</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}
+"""
+
+SHIFT_LOG_FORM_HTML = """
+{% extends "base.html" %}
+{% block title %}{{ 'Редагувати запис' if log else 'Новий запис змінного журналу' }}{% endblock %}
+{% block heading %}{{ 'Редагувати запис' if log else 'Новий запис змінного журналу' }}{% endblock %}
+{% block content %}
+<form method="post" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+  <div class="form-grid">
+    <div class="field"><label>Дата *</label><input type="date" name="work_date" required value="{{ log['work_date'] if log else today }}"></div>
+    <div class="field">
+      <label>Зміна</label>
+      <select name="shift">
+        <option value="day" {{ 'selected' if (log['shift'] if log else 'day')=='day' }}>Денна</option>
+        <option value="night" {{ 'selected' if log and log['shift']=='night' }}>Нічна</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Дільниця{% if foreman_own_wc %} (ваша){% endif %}</label>
+      <select name="work_center_id" {{ 'disabled' if foreman_own_wc }}>
+        <option value="">— не обрано —</option>
+        {% for wc in work_centers %}<option value="{{ wc['id'] }}" {{ 'selected' if (log and log['work_center_id']==wc['id']) or foreman_own_wc==wc['id'] }}>{{ wc['name'] }}</option>{% endfor %}
+      </select>
+      {% if foreman_own_wc %}<input type="hidden" name="work_center_id" value="{{ foreman_own_wc }}">{% endif %}
+    </div>
+    <div class="field">
+      <label>Робітник</label>
+      <select name="worker_user_id">
+        {% for w in workers %}<option value="{{ w['id'] }}" {{ 'selected' if (log and log['worker_user_id']==w['id']) or (not log and w['id']==current_user['id']) }}>{{ w['full_name'] }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field form-row-full"><label>Деталь *</label><input type="text" name="part_description" required value="{{ log['part_description'] if log else '' }}"></div>
+    <div class="field"><label>Виготовлено, шт *</label><input type="number" name="quantity_made" min="0" step="1" required value="{{ log['quantity_made'] if log else 0 }}"></div>
+    <div class="field"><label>Брак, шт</label><input type="number" name="quantity_scrap" min="0" step="1" value="{{ log['quantity_scrap'] if log else 0 }}"></div>
+    <div class="field form-row-full"><label>Причина браку</label><input type="text" name="scrap_reason" value="{{ log['scrap_reason'] if log else '' }}"></div>
+    <div class="field"><label>Тривалість зміни, год</label><input type="number" step="0.1" min="0" name="shift_hours" value="{{ log['shift_hours'] if log and log['shift_hours'] is not none else '' }}"></div>
+    <div class="field"><label>Години наладки</label><input type="number" step="0.1" min="0" name="setup_hours" value="{{ log['setup_hours'] if log and log['setup_hours'] is not none else '' }}"></div>
+    <div class="field form-row-full"><label>Примітки</label><textarea name="notes">{{ log['notes'] if log else '' }}</textarea></div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="submit">Зберегти</button>
+    <a class="btn btn-ghost" href="{{ url_for('shift_log_list') }}">Скасувати</a>
+  </div>
+</form>
+{% endblock %}
+"""
+
 CALCULATOR_HISTORY_HTML = """
 {% extends "base.html" %}
 {% block title %}Історія розрахунків{% endblock %}
@@ -3664,6 +3922,38 @@ DEAL_FORM_HTML = """
     <a class="btn btn-ghost" href="{{ url_for('deals_board') }}">Скасувати</a>
   </div>
 </form>
+{% endblock %}
+"""
+
+DEAL_SELECT_MACHINE_HTML = """
+{% extends "base.html" %}
+{% block title %}Оберіть верстат{% endblock %}
+{% block heading %}Оберіть верстат / техпроцес{% endblock %}
+{% block subheading %}{{ deal['title'] }}{% endblock %}
+{% block content %}
+<div class="card card-pad" style="max-width:560px;">
+  <p style="color:var(--text-dim); font-size:13px; margin-top:0;">
+    Щоб завести виробниче замовлення й одразу розписати завдання по цехах,
+    потрібно знати, за якою маршрутною картою (типом верстата) виготовляти
+    деталь — ця угода ще без обраного верстата. Оберіть найближчий за
+    технологією, і замовлення піде в цех автоматично.
+  </p>
+  <form method="post">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="next_stage" value="{{ next_stage }}">
+    <div class="field">
+      <label>Верстат / техпроцес *</label>
+      <select name="machine_id" required>
+        <option value="">— оберіть —</option>
+        {% for m in machines %}<option value="{{ m['id'] }}">{{ m['category'] }} — {{ m['model'] }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">Підтвердити і завести в цех</button>
+      <a class="btn btn-ghost" href="{{ url_for('deal_detail', deal_id=deal['id']) }}">Скасувати</a>
+    </div>
+  </form>
+</div>
 {% endblock %}
 """
 
@@ -4415,16 +4705,17 @@ WAREHOUSE_ITEM_HTML = """
     <div class="section-title"><span class="accent-dot"></span> Історія рухів</div>
     <div class="card table-wrap">
       <table>
-        <tr><th>Дата</th><th>Тип</th><th>Кількість</th><th>Примітка</th></tr>
+        <tr><th>Дата</th><th>Тип</th><th>Кількість</th><th>Хто</th><th>Примітка</th></tr>
         {% for t in transactions %}
         <tr>
           <td>{{ t['created_at'][:16] }}</td>
           <td><span class="tag">{{ dict(WAREHOUSE_TX_TYPES).get(t['type'], t['type']) }}</span></td>
           <td style="color:{{ 'var(--green)' if t['qty_delta']>0 else 'var(--red)' }};">{{ '+' if t['qty_delta']>0 else '' }}{{ t['qty_delta'] }}</td>
+          <td>{{ t['user_name'] or '—' }}</td>
           <td>{{ t['reference'] or '' }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="4" class="empty">Рухів ще не було</td></tr>
+        <tr><td colspan="5" class="empty">Рухів ще не було</td></tr>
         {% endfor %}
       </table>
     </div>
@@ -4990,9 +5281,12 @@ app.jinja_loader = DictLoader({
     "deals_board.html": DEALS_BOARD_HTML,
     "deal_form.html": DEAL_FORM_HTML,
     "calculator.html": CALCULATOR_HTML,
+    "shift_log_list.html": SHIFT_LOG_LIST_HTML,
+    "shift_log_form.html": SHIFT_LOG_FORM_HTML,
     "calculator_history.html": CALCULATOR_HISTORY_HTML,
     "calculator_history_detail.html": CALCULATOR_HISTORY_DETAIL_HTML,
     "deal_detail.html": DEAL_DETAIL_HTML,
+    "deal_select_machine.html": DEAL_SELECT_MACHINE_HTML,
     "tasks.html": TASKS_HTML,
     "calendar.html": CALENDAR_HTML,
     "machines.html": MACHINES_HTML,
@@ -5213,6 +5507,25 @@ def dashboard():
            ORDER BY a.created_at DESC LIMIT 8"""
     ).fetchall()
 
+    # Виробничий блок "Змінний журнал за сьогодні" - додається ПОРУЧ із
+    # воронкою продажів (не замінює її), на явний запит користувача:
+    # видно адміну й ролі "Виробництво", бо саме вони вносять ці записи.
+    shift_today = None
+    shift_by_wc_today = []
+    cur_user = get_current_user()
+    if cur_user and cur_user["role"] in ("admin", "production"):
+        shift_today = db.execute(
+            """SELECT COALESCE(SUM(quantity_made),0) made, COALESCE(SUM(quantity_scrap),0) scrap,
+                      COUNT(*) entries FROM shift_logs WHERE work_date=?""",
+            (today_str(),),
+        ).fetchone()
+        shift_by_wc_today = db.execute(
+            """SELECT wc.name AS work_center_name, SUM(sl.quantity_made) made, SUM(sl.quantity_scrap) scrap
+               FROM shift_logs sl LEFT JOIN work_centers wc ON wc.id=sl.work_center_id
+               WHERE sl.work_date=? GROUP BY sl.work_center_id ORDER BY made DESC""",
+            (today_str(),),
+        ).fetchall()
+
     return render_template(
         "dashboard.html", active="dashboard",
         open_deals=open_deals, open_amount=open_amount,
@@ -5223,6 +5536,7 @@ def dashboard():
         revenue_by_month=revenue_by_month, max_revenue=max_revenue,
         leaderboard=leaderboard, recent_lost=recent_lost,
         activity_feed=activity_feed,
+        shift_today=shift_today, shift_by_wc_today=shift_by_wc_today,
     )
 
 
@@ -5357,9 +5671,14 @@ def client_delete(client_id):
 def contact_add(client_id):
     db = get_db()
     f = request.form
+    try:
+        full_name = validate_required(f, "full_name", "ПІБ")
+    except ValidationError as e:
+        flash(str(e), "error")
+        return redirect(url_for("client_detail", client_id=client_id))
     db.execute(
         "INSERT INTO contacts (client_id, full_name, position, phone, email, is_primary) VALUES (?,?,?,?,?,0)",
-        (client_id, f["full_name"], f.get("position"), f.get("phone"), f.get("email")),
+        (client_id, full_name, f.get("position"), f.get("phone"), f.get("email")),
     )
     db.commit()
     flash("Контакт додано", "success")
@@ -6329,17 +6648,18 @@ def deal_move(deal_id, stage):
     deal = db.execute("SELECT * FROM deals WHERE id=?", (deal_id,)).fetchone()
     if not deal:
         abort(404)
-    closed_at = now_iso() if stage in ("won", LOST_STAGE) else deal["closed_at"]
-    db.execute("UPDATE deals SET stage=?, updated_at=?, closed_at=? WHERE id=?",
-               (stage, now_iso(), closed_at, deal_id))
-    label = STAGE_LABEL.get(stage, stage)
-    log_activity(db, deal_id, deal["client_id"], "stage", f"Стадію угоди змінено на «{label}»")
-    auto = AUTO_TASKS_ON_STAGE.get(stage)
-    if auto:
-        title, ttype, offset = auto
-        create_task(db, deal_id, deal["client_id"], title, ttype, offset)
-    if stage == "prepay":
-        create_production_order_from_deal(db, deal)
+    if stage == "prepay" and not deal["machine_id"]:
+        # Виробниче замовлення заводиться по маршрутній карті, прив'язаній до
+        # верстата (create_production_order_from_deal мовчки нічого не робить
+        # без machine_id) - типово для угод, створених одним кліком з історії
+        # калькулятора (там верстат не обирається). Раніше угода просто
+        # переходила на "Передоплата" без жодного сліду в цехах - тепер
+        # питаємо верстат і одразу заводимо завдання.
+        redirect_url = url_for("deal_select_machine", deal_id=deal_id, next_stage=stage)
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify(ok=False, needs_machine=True, redirect=redirect_url)
+        return redirect(redirect_url)
+    _apply_deal_stage_move(db, deal, stage)
     db.commit()
     # Kanban drag-and-drop calls this via fetch() with X-Requested-With: fetch and wants JSON back.
     # The buttons on the deal detail page submit a normal HTML form and expect a redirect back.
@@ -6347,6 +6667,65 @@ def deal_move(deal_id, stage):
         return jsonify(ok=True)
     flash("Стадію угоди оновлено", "success")
     return redirect(url_for("deal_detail", deal_id=deal_id))
+
+
+def _apply_deal_stage_move(db, deal, stage):
+    """Спільна логіка переходу угоди на нову стадію - винесена окремо, щоб
+    нею міг скористатись і звичайний deal_move, і deal_select_machine
+    (після того, як верстат щойно обрано і треба довершити той самий
+    перехід стадії). Повертає id щойно заведеного виробничого замовлення,
+    якщо воно було створене (стадія 'prepay' і верстат вже відомий)."""
+    closed_at = now_iso() if stage in ("won", LOST_STAGE) else deal["closed_at"]
+    db.execute("UPDATE deals SET stage=?, updated_at=?, closed_at=? WHERE id=?",
+               (stage, now_iso(), closed_at, deal["id"]))
+    label = STAGE_LABEL.get(stage, stage)
+    log_activity(db, deal["id"], deal["client_id"], "stage", f"Стадію угоди змінено на «{label}»")
+    auto = AUTO_TASKS_ON_STAGE.get(stage)
+    if auto:
+        title, ttype, offset = auto
+        create_task(db, deal["id"], deal["client_id"], title, ttype, offset)
+    order_id = None
+    if stage == "prepay":
+        order_id = create_production_order_from_deal(db, deal)
+    return order_id
+
+
+@app.route("/deals/<int:deal_id>/select-machine", methods=["GET", "POST"])
+@login_required
+@role_required('sales')
+def deal_select_machine(deal_id):
+    """Проміжний крок для угод без обраного верстата (типово - угоди,
+    створені одним кліком з історії калькулятора вартості): перш ніж
+    перевести угоду на 'Передоплата отримана' і завести виробниче
+    замовлення, треба знати, за якою маршрутною картою його вести -
+    просимо вибрати верстат і одразу довершуємо перехід стадії."""
+    db = get_db()
+    deal = db.execute("SELECT * FROM deals WHERE id=?", (deal_id,)).fetchone()
+    if not deal:
+        abort(404)
+    next_stage = request.values.get("next_stage", "prepay")
+    if next_stage not in STAGE_KEYS and next_stage != LOST_STAGE:
+        next_stage = "prepay"
+    machines = db.execute("SELECT * FROM machines ORDER BY category, model").fetchall()
+    if request.method == "POST":
+        try:
+            machine_id = validate_required(request.form, "machine_id", "Верстат / техпроцес")
+        except ValidationError as e:
+            flash(str(e), "error")
+            return render_template("deal_select_machine.html", active="deals", deal=deal,
+                                    machines=machines, next_stage=next_stage)
+        db.execute("UPDATE deals SET machine_id=?, updated_at=? WHERE id=?", (machine_id, now_iso(), deal_id))
+        deal = db.execute("SELECT * FROM deals WHERE id=?", (deal_id,)).fetchone()
+        order_id = _apply_deal_stage_move(db, deal, next_stage)
+        db.commit()
+        if order_id:
+            flash(f"Верстат обрано, угоду переведено на «{STAGE_LABEL.get(next_stage, next_stage)}», "
+                  f"заведено виробниче замовлення №{order_id} у цех", "success")
+        else:
+            flash("Верстат обрано, угоду переведено на нову стадію", "success")
+        return redirect(url_for("deal_detail", deal_id=deal_id))
+    return render_template("deal_select_machine.html", active="deals", deal=deal,
+                            machines=machines, next_stage=next_stage)
 
 
 @app.route("/deals/<int:deal_id>/delete", methods=["POST"])
@@ -6422,9 +6801,14 @@ def activity_add(deal_id):
     db = get_db()
     deal = db.execute("SELECT client_id FROM deals WHERE id=?", (deal_id,)).fetchone()
     f = request.form
+    try:
+        text = validate_required(f, "text", "Текст")
+    except ValidationError as e:
+        flash(str(e), "error")
+        return redirect(url_for("deal_detail", deal_id=deal_id))
     db.execute(
         "INSERT INTO activities (deal_id, client_id, type, text, manager_id, created_at) VALUES (?,?,?,?,?,?)",
-        (deal_id, deal["client_id"] if deal else None, f.get("type", "note"), f["text"],
+        (deal_id, deal["client_id"] if deal else None, f.get("type", "note"), text,
          session.get("user_id"), now_iso()),
     )
     db.commit()
@@ -6511,10 +6895,17 @@ def calendar_view():
 def task_add():
     db = get_db()
     f = request.form
+    try:
+        title = validate_required(f, "title", "Назва задачі")
+    except ValidationError as e:
+        flash(str(e), "error")
+        if f.get("deal_id"):
+            return redirect(url_for("deal_detail", deal_id=f.get("deal_id")))
+        return redirect(url_for("tasks_list"))
     db.execute(
         """INSERT INTO tasks (deal_id, client_id, title, description, type, due_date, done,
            manager_id, created_at) VALUES (?,?,?,?,?,?,0,?,?)""",
-        (f.get("deal_id") or None, f.get("client_id") or None, f["title"], f.get("description"),
+        (f.get("deal_id") or None, f.get("client_id") or None, title, f.get("description"),
          f.get("type", "call"), f.get("due_date") or None, session.get("user_id"), now_iso()),
     )
     db.commit()
@@ -6677,10 +7068,16 @@ def service_detail(ticket_id):
 def service_add():
     db = get_db()
     f = request.form
+    try:
+        client_id = validate_required(f, "client_id", "Клієнт")
+        issue = validate_required(f, "issue", "Опис проблеми")
+    except ValidationError as e:
+        flash(str(e), "error")
+        return redirect(url_for("service_list"))
     db.execute(
         """INSERT INTO service_tickets (client_id, machine_id, issue, status, priority, engineer,
            created_at) VALUES (?,?,?,?,?,?,?)""",
-        (f["client_id"], f.get("machine_id") or None, f["issue"], "new", f.get("priority", "medium"),
+        (client_id, f.get("machine_id") or None, issue, "new", f.get("priority", "medium"),
          f.get("engineer"), now_iso()),
     )
     db.commit()
@@ -6693,7 +7090,11 @@ def service_add():
 @role_required('service')
 def service_update_status(ticket_id):
     db = get_db()
-    status = request.form["status"]
+    try:
+        status = validate_required(request.form, "status", "Статус")
+    except ValidationError as e:
+        flash(str(e), "error")
+        return redirect(url_for("service_list"))
     resolved_at = now_iso() if status == "done" else None
     db.execute("UPDATE service_tickets SET status=?, resolved_at=? WHERE id=?",
                (status, resolved_at, ticket_id))
@@ -7267,6 +7668,286 @@ def work_centers_list():
 
 
 # ---------------------------------------------------------------------------
+# Змінний журнал виробництва (shift log)
+#
+# Свідомо НЕ прив'язаний до production_orders/production_operations -
+# "незалежний журнал" на явний вибір користувача: швидкий і простий облік
+# "скільки хто зробив за зміну", який заповнюється незалежно від того, чи
+# заведене відповідне замовлення в CRM.
+# ---------------------------------------------------------------------------
+@app.route("/shift-log")
+@login_required
+@role_required("production")
+def shift_log_list():
+    db = get_db()
+    user = get_current_user()
+    fw = foreman_work_center_id(user)
+    work_centers = db.execute("SELECT * FROM work_centers ORDER BY id").fetchall()
+    workers = get_production_workers()
+
+    date_from = request.args.get("date_from") or (datetime.date.today() - datetime.timedelta(days=13)).strftime("%Y-%m-%d")
+    date_to = request.args.get("date_to") or today_str()
+    f_wc = request.args.get("work_center_id", type=int)
+    f_worker = request.args.get("worker_user_id", type=int)
+
+    sql = """SELECT sl.*, wc.name AS work_center_name, w.full_name AS worker_name,
+                     cb.full_name AS created_by_name
+              FROM shift_logs sl
+              LEFT JOIN work_centers wc ON wc.id = sl.work_center_id
+              LEFT JOIN users w ON w.id = sl.worker_user_id
+              LEFT JOIN users cb ON cb.id = sl.created_by_user_id
+              WHERE sl.work_date >= ? AND sl.work_date <= ?"""
+    params = [date_from, date_to]
+    if f_wc:
+        sql += " AND sl.work_center_id=?"
+        params.append(f_wc)
+    if f_worker:
+        sql += " AND sl.worker_user_id=?"
+        params.append(f_worker)
+    sql += " ORDER BY sl.work_date DESC, sl.id DESC"
+    rows = db.execute(sql, params).fetchall()
+
+    logs = []
+    totals = {"quantity_made": 0, "quantity_scrap": 0}
+    for r in rows:
+        d = dict(r)
+        d["can_edit"] = can_edit_shift_log(user, r)
+        logs.append(d)
+        totals["quantity_made"] += r["quantity_made"] or 0
+        totals["quantity_scrap"] += r["quantity_scrap"] or 0
+
+    return render_template("shift_log_list.html", active="shift_log", logs=logs, work_centers=work_centers,
+                            workers=workers, date_from=date_from, date_to=date_to,
+                            f_wc=f_wc, f_worker=f_worker, totals=totals, foreman_own_wc=fw,
+                            current_month=today_str()[:7])
+
+
+def _shift_log_form_context(db, user, log=None):
+    return dict(
+        work_centers=db.execute("SELECT * FROM work_centers ORDER BY id").fetchall(),
+        workers=get_production_workers(),
+        log=log,
+        foreman_own_wc=foreman_work_center_id(user),
+    )
+
+
+@app.route("/shift-log/new", methods=["GET", "POST"])
+@login_required
+@role_required("production")
+def shift_log_new():
+    db = get_db()
+    user = get_current_user()
+    fw = foreman_work_center_id(user)
+    if request.method == "POST":
+        f = request.form
+        try:
+            part_description = validate_required(f, "part_description", "Деталь")
+            work_date = f.get("work_date") or today_str()
+            quantity_made = int(parse_number(f, "quantity_made", default=0, min_value=0, label="Кількість виготовлено"))
+            quantity_scrap = int(parse_number(f, "quantity_scrap", default=0, min_value=0, label="Брак, шт"))
+            shift_hours = parse_number(f, "shift_hours", default=None, min_value=0, label="Тривалість зміни, год") if f.get("shift_hours") else None
+            setup_hours = parse_number(f, "setup_hours", default=None, min_value=0, label="Години наладки") if f.get("setup_hours") else None
+            worker_user_id = f.get("worker_user_id", type=int) or user["id"]
+        except ValidationError as e:
+            flash(str(e), "error")
+            ctx = _shift_log_form_context(db, user)
+            return render_template("shift_log_form.html", active="shift_log", **ctx)
+        if fw and worker_user_id != user["id"]:
+            # Майстер дільниці вносить запис за іншого робітника лише своєї дільниці -
+            # work_center_id нижче в будь-якому разі перевизначається на fw для майстра,
+            # тож тут достатньо просто дозволити вибір будь-якого працівника.
+            pass
+        work_center_id = f.get("work_center_id", type=int)
+        if fw:
+            # Майстер дільниці завжди пише запис на СВОЮ дільницю - так само, як
+            # термінал дозволяє діяти лише на своїй дільниці (operation_advance).
+            work_center_id = fw
+        db.execute(
+            """INSERT INTO shift_logs (work_date, shift, work_center_id, worker_user_id, part_description,
+               quantity_made, quantity_scrap, scrap_reason, shift_hours, setup_hours, notes,
+               created_by_user_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (work_date, f.get("shift", "day"), work_center_id, worker_user_id, part_description,
+             quantity_made, quantity_scrap, f.get("scrap_reason") or None, shift_hours, setup_hours,
+             f.get("notes") or None, user["id"], now_iso()),
+        )
+        db.commit()
+        flash("Запис змінного журналу додано", "success")
+        return redirect(url_for("shift_log_list"))
+    ctx = _shift_log_form_context(db, user)
+    return render_template("shift_log_form.html", active="shift_log", **ctx)
+
+
+@app.route("/shift-log/<int:log_id>/edit", methods=["GET", "POST"])
+@login_required
+@role_required("production")
+def shift_log_edit(log_id):
+    db = get_db()
+    user = get_current_user()
+    log = db.execute("SELECT * FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    if not log:
+        abort(404)
+    if not can_edit_shift_log(user, log):
+        flash("Ви можете редагувати лише свої записи або записи своєї дільниці", "error")
+        return redirect(url_for("shift_log_list"))
+    fw = foreman_work_center_id(user)
+    if request.method == "POST":
+        f = request.form
+        try:
+            part_description = validate_required(f, "part_description", "Деталь")
+            work_date = f.get("work_date") or log["work_date"]
+            quantity_made = int(parse_number(f, "quantity_made", default=0, min_value=0, label="Кількість виготовлено"))
+            quantity_scrap = int(parse_number(f, "quantity_scrap", default=0, min_value=0, label="Брак, шт"))
+            shift_hours = parse_number(f, "shift_hours", default=None, min_value=0, label="Тривалість зміни, год") if f.get("shift_hours") else None
+            setup_hours = parse_number(f, "setup_hours", default=None, min_value=0, label="Години наладки") if f.get("setup_hours") else None
+            worker_user_id = f.get("worker_user_id", type=int) or log["worker_user_id"]
+        except ValidationError as e:
+            flash(str(e), "error")
+            ctx = _shift_log_form_context(db, user, log=log)
+            return render_template("shift_log_form.html", active="shift_log", **ctx)
+        work_center_id = f.get("work_center_id", type=int)
+        if fw:
+            work_center_id = fw
+        db.execute(
+            """UPDATE shift_logs SET work_date=?, shift=?, work_center_id=?, worker_user_id=?,
+               part_description=?, quantity_made=?, quantity_scrap=?, scrap_reason=?, shift_hours=?,
+               setup_hours=?, notes=?, updated_at=? WHERE id=?""",
+            (work_date, f.get("shift", "day"), work_center_id, worker_user_id, part_description,
+             quantity_made, quantity_scrap, f.get("scrap_reason") or None, shift_hours, setup_hours,
+             f.get("notes") or None, now_iso(), log_id),
+        )
+        db.commit()
+        flash("Запис змінного журналу оновлено", "success")
+        return redirect(url_for("shift_log_list"))
+    ctx = _shift_log_form_context(db, user, log=log)
+    return render_template("shift_log_form.html", active="shift_log", **ctx)
+
+
+@app.route("/shift-log/<int:log_id>/delete", methods=["POST"])
+@login_required
+@role_required("production")
+def shift_log_delete(log_id):
+    db = get_db()
+    user = get_current_user()
+    log = db.execute("SELECT * FROM shift_logs WHERE id=?", (log_id,)).fetchone()
+    if not log:
+        abort(404)
+    if not can_edit_shift_log(user, log):
+        flash("Ви можете видаляти лише свої записи або записи своєї дільниці", "error")
+        return redirect(url_for("shift_log_list"))
+    db.execute("DELETE FROM shift_logs WHERE id=?", (log_id,))
+    db.commit()
+    flash("Запис видалено", "success")
+    return redirect(url_for("shift_log_list"))
+
+
+@app.route("/shift-log/report.pdf")
+@login_required
+@role_required("production")
+def shift_log_report_pdf():
+    """PDF-зведення змінного журналу за місяць - окремий розділ на кожного
+    робітника (токаря, фрезерувальника тощо): щоденні записи + підсумок
+    виготовлено/брак/години. Зручно роздрукувати або додати до нарахування
+    зарплати за виробітком. За замовчуванням - поточний місяць і всі
+    робітники; можна звузити до одного робітника через worker_user_id."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas as pdf_canvas
+
+    db = get_db()
+    month = request.args.get("month") or today_str()[:7]
+    if not _re.match(r"^\d{4}-\d{2}$", month):
+        month = today_str()[:7]
+    worker_filter = request.args.get("worker_user_id", type=int)
+
+    sql = """SELECT sl.*, wc.name AS work_center_name, w.full_name AS worker_name
+              FROM shift_logs sl
+              LEFT JOIN work_centers wc ON wc.id=sl.work_center_id
+              LEFT JOIN users w ON w.id=sl.worker_user_id
+              WHERE sl.work_date LIKE ?"""
+    params = [f"{month}%"]
+    if worker_filter:
+        sql += " AND sl.worker_user_id=?"
+        params.append(worker_filter)
+    sql += " ORDER BY w.full_name, sl.work_date"
+    rows = db.execute(sql, params).fetchall()
+
+    by_worker = {}
+    for r in rows:
+        key = r["worker_user_id"] or 0
+        g = by_worker.setdefault(key, {"name": r["worker_name"] or "— без робітника —", "rows": [],
+                                        "made": 0, "scrap": 0, "hours": 0.0})
+        g["rows"].append(r)
+        g["made"] += r["quantity_made"] or 0
+        g["scrap"] += r["quantity_scrap"] or 0
+        g["hours"] += r["shift_hours"] or 0
+
+    buf = BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    steel = colors.HexColor("#2a2e35")
+
+    def draw_header(worker_name, totals):
+        c.setFillColor(steel)
+        c.rect(0, height - 26 * mm, width, 26 * mm, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(20 * mm, height - 12 * mm, f"Змінний журнал — {worker_name}")
+        c.setFont("Helvetica", 10)
+        c.drawString(20 * mm, height - 19 * mm,
+                     f"Місяць: {month}   Виготовлено: {totals['made']} шт   "
+                     f"Брак: {totals['scrap']} шт   Годин: {totals['hours']:.1f}")
+
+    def draw_table_header(y):
+        col_x = [20, 35, 58, 128, 148, 168]
+        headers = ["Дата", "Дільниця", "Деталь", "Зроблено", "Брак", "Год."]
+        c.setFillColor(steel)
+        c.rect(20 * mm, y - 6 * mm, width - 40 * mm, 6 * mm, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 8)
+        for x, h in zip(col_x, headers):
+            c.drawString(x * mm, y - 4.5 * mm, h)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 8)
+        return col_x, y - 6 * mm
+
+    if not by_worker:
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(20 * mm, height - 30 * mm, f"Змінний журнал за {month} — записів немає")
+        c.showPage()
+    else:
+        for key in sorted(by_worker, key=lambda k: by_worker[k]["name"]):
+            g = by_worker[key]
+            draw_header(g["name"], g)
+            y = height - 34 * mm
+            col_x, y = draw_table_header(y)
+            row_h = 7 * mm
+            for r in g["rows"]:
+                if y - row_h < 25 * mm:
+                    c.showPage()
+                    y = height - 20 * mm
+                    col_x, y = draw_table_header(y)
+                c.rect(20 * mm, y - row_h, width - 40 * mm, row_h, fill=0, stroke=1)
+                c.drawString(col_x[0] * mm, y - 5 * mm, r["work_date"])
+                c.drawString(col_x[1] * mm, y - 5 * mm, (r["work_center_name"] or "—")[:16])
+                c.drawString(col_x[2] * mm, y - 5 * mm, (r["part_description"] or "")[:32])
+                c.drawString(col_x[3] * mm, y - 5 * mm, str(r["quantity_made"] or 0))
+                c.drawString(col_x[4] * mm, y - 5 * mm, str(r["quantity_scrap"] or 0))
+                c.drawString(col_x[5] * mm, y - 5 * mm, f"{r['shift_hours']:.1f}" if r["shift_hours"] is not None else "—")
+                y -= row_h
+            c.showPage()
+
+    c.save()
+    buf.seek(0)
+    from flask import Response
+    resp = Response(buf.read(), mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = f"inline; filename=shift_log_{month}.pdf"
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Склад
 # ---------------------------------------------------------------------------
 
@@ -7384,7 +8065,10 @@ def warehouse_item_detail(item_id):
     if not item:
         abort(404)
     transactions = db.execute(
-        "SELECT * FROM warehouse_transactions WHERE item_id=? ORDER BY created_at DESC", (item_id,)
+        """SELECT t.*, u.full_name AS user_name FROM warehouse_transactions t
+           LEFT JOIN users u ON u.id = t.user_id
+           WHERE t.item_id=? ORDER BY t.created_at DESC""",
+        (item_id,),
     ).fetchall()
     lots = db.execute(
         "SELECT * FROM material_lots WHERE item_id=? ORDER BY received_date DESC", (item_id,)
