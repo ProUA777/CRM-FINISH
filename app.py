@@ -64,14 +64,40 @@ def _default_data_dir():
 DATA_DIR = os.environ.get("CRM_DATA_DIR") or _default_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "crm.db")
 
+def _get_or_create_secret_key():
+    """Секретний ключ сесій: якщо адмін свідомо задав CRM_SECRET_KEY через
+    змінну середовища - використовуємо його. Якщо ні (типовий випадок для
+    звичайного запуску .exe без жодних налаштувань) - НЕ використовуємо
+    вшитий у код типовий ключ (це була б дірка в безпеці, якщо програма
+    стане доступна по мережі), а замість цього самі один раз генеруємо
+    випадковий надійний ключ і зберігаємо його поруч із базою даних
+    (DATA_DIR/secret_key.txt), щоб при наступних запусках сесії й логін
+    не ламались. Це прибирає з користувача необхідність щось налаштовувати
+    руками, зберігаючи той самий рівень безпеки."""
+    env_key = os.environ.get("CRM_SECRET_KEY")
+    if env_key:
+        return env_key
+    key_path = os.path.join(DATA_DIR, "secret_key.txt")
+    if os.path.exists(key_path):
+        try:
+            with open(key_path, "r", encoding="utf-8") as f:
+                saved = f.read().strip()
+            if saved:
+                return saved
+        except Exception:
+            pass
+    import secrets as _secrets
+    new_key = _secrets.token_urlsafe(48)
+    try:
+        with open(key_path, "w", encoding="utf-8") as f:
+            f.write(new_key)
+    except Exception:
+        pass
+    return new_key
+
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("CRM_SECRET_KEY", "cnc-crm-super-secret-key-change-me")
-if app.secret_key == "cnc-crm-super-secret-key-change-me" and os.environ.get("CRM_DEBUG", "0") != "1":
-    import warnings
-    warnings.warn(
-        "CRM_SECRET_KEY не встановлено — використовується типовий ключ із коду. "
-        "Перед реальним використанням постав власний секрет через змінну середовища CRM_SECRET_KEY."
-    )
+app.secret_key = _get_or_create_secret_key()
 MAX_UPLOAD_SIZE_MB = 25
 
 app.config.update(
@@ -2878,6 +2904,17 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
         dd.classList.remove('open');
       }
     });
+    // Клавіша "/" фокусує глобальний пошук з будь-якого місця сторінки -
+    // зручно, щоб не тягнутись мишкою до поля вгорі. Не перехоплюємо "/",
+    // якщо людина вже друкує в якомусь полі/textarea (інакше неможливо
+    // було б ввести сам символ "/" в адресу, нотатки тощо).
+    document.addEventListener('keydown', function(e){
+      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+      var tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+      var box = document.getElementById('global-search-input');
+      if (box) { e.preventDefault(); box.focus(); box.select(); }
+    });
   </script>
   <div class="main">
     <div class="topbar">
@@ -2902,7 +2939,7 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
           </div>
         </div>
         <form class="search-box" method="get" action="{{ url_for('search') }}">
-          <input type="text" name="q" placeholder="Пошук клієнтів, угод..." value="{{ request.args.get('q','') }}">
+          <input type="text" id="global-search-input" name="q" placeholder="Пошук клієнтів, угод... (/)" value="{{ request.args.get('q','') }}">
         </form>
       </div>
     </div>
@@ -2960,6 +2997,27 @@ DASHBOARD_HTML = """
 {% block heading %}Дашборд{% endblock %}
 {% block subheading %}Загальна картина по замовленнях на металообробку · зведені суми — в грн за курсом із «Налаштувань»{% endblock %}
 {% block content %}
+{% if current_user['role'] in ('admin','sales','production','warehouse','service') %}
+<div class="toolbar" style="margin-bottom:18px;">
+  <div class="filters" style="gap:8px; display:flex; flex-wrap:wrap;">
+    {% if current_user['role'] in ('admin','sales') %}
+    <a class="btn btn-primary btn-sm" href="{{ url_for('client_new') }}">+ Клієнт</a>
+    <a class="btn btn-primary btn-sm" href="{{ url_for('deal_new') }}">+ Угода</a>
+    <a class="btn btn-sm" href="{{ url_for('cost_calculator') }}">🧮 Розрахунок</a>
+    <a class="btn btn-sm" href="{{ url_for('tasks_list') }}">+ Задача</a>
+    {% endif %}
+    {% if current_user['role'] in ('admin','production') %}
+    <a class="btn btn-primary btn-sm" href="{{ url_for('shift_log_new') }}">+ Запис у змінний журнал</a>
+    {% endif %}
+    {% if current_user['role'] in ('admin','warehouse') %}
+    <a class="btn btn-primary btn-sm" href="{{ url_for('warehouse_item_new') }}">+ Позиція складу</a>
+    {% endif %}
+    {% if current_user['role'] in ('admin','service') %}
+    <a class="btn btn-primary btn-sm" href="{{ url_for('service_list') }}">+ Рекламація</a>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
 <div class="grid grid-4">
   <div class="card kpi">
     <div class="label">Відкриті угоди</div>
@@ -3189,11 +3247,14 @@ CLIENTS_LIST_HTML = """
 <div class="toolbar">
   <div class="filters">
     <form method="get" style="display:flex; gap:8px;">
+      <input type="text" name="q" placeholder="Пошук за назвою, містом, телефоном..." value="{{ request.args.get('q','') }}" style="min-width:240px;">
       <select name="status" onchange="this.form.submit()">
         <option value="">Всі статуси</option>
         <option value="active" {{ 'selected' if request.args.get('status')=='active' }}>Активні</option>
         <option value="lost" {{ 'selected' if request.args.get('status')=='lost' }}>Втрачені</option>
       </select>
+      <button class="btn btn-sm" type="submit">Знайти</button>
+      {% if request.args.get('q') or request.args.get('status') %}<a class="btn btn-sm btn-ghost" href="{{ url_for('clients_list') }}">Очистити</a>{% endif %}
     </form>
   </div>
   <a class="btn btn-primary" href="{{ url_for('client_new') }}">+ Новий клієнт</a>
@@ -3220,9 +3281,9 @@ CLIENTS_LIST_HTML = """
 </div>
 {% if total_pages > 1 %}
 <div style="display:flex; gap:8px; justify-content:center; margin-top:16px;">
-  {% if page > 1 %}<a class="btn btn-sm" href="?page={{ page-1 }}{{ '&status='+request.args.get('status') if request.args.get('status') }}">← Попередня</a>{% endif %}
+  {% if page > 1 %}<a class="btn btn-sm" href="?page={{ page-1 }}{{ '&status='+request.args.get('status') if request.args.get('status') }}{{ '&q='+request.args.get('q') if request.args.get('q') }}">← Попередня</a>{% endif %}
   <span style="padding:6px 10px; color:var(--text-dim); font-size:12.5px;">Сторінка {{ page }} з {{ total_pages }}</span>
-  {% if page < total_pages %}<a class="btn btn-sm" href="?page={{ page+1 }}{{ '&status='+request.args.get('status') if request.args.get('status') }}">Наступна →</a>{% endif %}
+  {% if page < total_pages %}<a class="btn btn-sm" href="?page={{ page+1 }}{{ '&status='+request.args.get('status') if request.args.get('status') }}{{ '&q='+request.args.get('q') if request.args.get('q') }}">Наступна →</a>{% endif %}
 </div>
 {% endif %}
 {% endblock %}
@@ -3419,6 +3480,7 @@ DEALS_BOARD_HTML = """
         {% for m in managers %}<option value="{{ m['id'] }}" {{ 'selected' if request.args.get('manager_id')|string == m['id']|string }}>{{ m['full_name'] }}</option>{% endfor %}
       </select>
     </form>
+    <input type="text" id="deal-filter-input" placeholder="Швидкий пошук по назві чи клієнту..." oninput="filterDealCards(this.value)" style="min-width:260px;">
   </div>
   <a class="btn btn-primary" href="{{ url_for('deal_new') }}">+ Нова угода</a>
   <a class="btn" href="{{ url_for('export_deals_xlsx') }}">⬇ Excel</a>
@@ -3459,6 +3521,13 @@ DEALS_BOARD_HTML = """
   </div>
 </div>
 <script>
+function filterDealCards(text) {
+  const needle = text.trim().toLowerCase();
+  document.querySelectorAll('.deal-card').forEach(card => {
+    const hay = card.textContent.toLowerCase();
+    card.style.display = (!needle || hay.includes(needle)) ? '' : 'none';
+  });
+}
 let dragged = null;
 document.querySelectorAll('.deal-card').forEach(card => {
   card.addEventListener('dragstart', e => { dragged = card; card.classList.add('dragging'); e.stopPropagation(); });
@@ -5136,6 +5205,29 @@ SETTINGS_HTML = """
   </div>
 </div>
 
+<div class="section-title"><span class="accent-dot"></span> 🌐 Доступ з інших комп'ютерів у мережі</div>
+<div class="card card-pad" style="margin-bottom:22px;">
+  {% if network_url %}
+  <p style="font-size:12.5px; color:var(--text-dim); margin-top:0;">
+    На ІНШИХ комп'ютерах у тій же Wi-Fi/локальній мережі відкрий цю адресу в браузері —
+    нічого встановлювати на них не треба, дані спільні й оновлюються одразу:
+  </p>
+  <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <code style="font-size:16px; padding:8px 14px; background:var(--bg-2, rgba(255,255,255,.04)); border-radius:8px;" id="network-url-text">{{ network_url }}</code>
+    <button type="button" class="btn btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('network-url-text').textContent).then(()=>{this.textContent='Скопійовано ✓'; setTimeout(()=>this.textContent='Копіювати',1500);})">Копіювати</button>
+  </div>
+  <p style="font-size:11.5px; color:var(--text-dim); margin-bottom:0;">
+    Той самий адрес можна побачити й через значок у системному треї (біля годинника Windows) →
+    «Адреса для інших комп'ютерів». Цей комп'ютер має лишатись увімкненим, щоб інші мали доступ.
+  </p>
+  {% else %}
+  <p style="font-size:12.5px; color:var(--text-dim); margin-top:0; margin-bottom:0;">
+    Не вдалося визначити адресу цього комп'ютера в мережі (можливо, немає підключення до
+    Wi-Fi/мережі прямо зараз). Перевір з'єднання і відкрий цю сторінку знову.
+  </p>
+  {% endif %}
+</div>
+
 <div class="grid grid-2">
   <div>
     <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> 📱 Сповіщення в Telegram</div>
@@ -5253,6 +5345,23 @@ SETTINGS_HTML = """
         <summary style="cursor:pointer; font-size:12px; color:var(--accent-2);">Автоматично щоночі (cron, Linux/macOS)</summary>
         <pre style="background:var(--bg-soft); padding:12px; border-radius:8px; font-size:11px; overflow-x:auto; white-space:pre-wrap; margin-top:8px;">0 2 * * * cd /шлях/до/crm && python3 -c "import app; app.backup_database()"</pre>
       </details>
+    </div>
+
+    <div class="section-title"><span class="accent-dot" style="background:var(--red, #c23b2f);"></span> ⚠️ Скинути до демо-даних</div>
+    <div class="card card-pad" style="border-color:#c23b2f33;">
+      <p style="font-size:12.5px; color:var(--text-dim);">
+        Повністю очищує базу і наповнює її заново актуальним демо-набором (клієнти, угоди, виробництво, склад тощо) —
+        тим самим, що й при першому встановленні. Використовуйте після оновлення версії, щоб побачити нові демо-дані.
+        <b>Усі наявні записи буде видалено</b> (перед цим автоматично створюється резервна копія в <code>backups/</code>).
+      </p>
+      <form method="post" action="{{ url_for('settings_reset_demo_data') }}" onsubmit="return confirm('Точно скинути базу і втратити всі поточні дані? Резервна копія буде створена автоматично.');">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <div class="field" style="max-width:280px; margin-bottom:10px;">
+          <label>Введіть «СКИНУТИ» для підтвердження</label>
+          <input type="text" name="confirm" placeholder="СКИНУТИ" autocomplete="off">
+        </div>
+        <button class="btn btn-sm" style="background:#c23b2f; color:#fff;" type="submit">Скинути й наповнити демо-даними</button>
+      </form>
     </div>
   </div>
 
@@ -5589,6 +5698,7 @@ def dashboard():
 def clients_list():
     db = get_db()
     status = request.args.get("status", "")
+    search_q = request.args.get("q", "").strip()
     page = max(request.args.get("page", 1, type=int), 1)
     per_page = 50
     q = "SELECT c.*, u.full_name as manager_name FROM clients c LEFT JOIN users u ON u.id=c.manager_id WHERE 1=1"
@@ -5596,6 +5706,10 @@ def clients_list():
     if status:
         q += " AND c.status=?"
         params.append(status)
+    if search_q:
+        like = f"%{search_q}%"
+        q += " AND (c.name LIKE ? OR c.city LIKE ? OR c.phone LIKE ? OR c.email LIKE ?)"
+        params += [like, like, like, like]
     scope, scope_params = manager_scope_sql("c.manager_id")
     q += scope
     params += scope_params
@@ -7056,10 +7170,31 @@ def machine_edit(machine_id):
 @role_required('sales', 'production')
 def machine_delete(machine_id):
     db = get_db()
-    used_in_deals = db.execute("SELECT COUNT(*) c FROM deals WHERE machine_id=?", (machine_id,)).fetchone()["c"]
-    if used_in_deals:
-        flash("Неможливо видалити: обладнання використовується в активних угодах", "error")
+    # Раніше тут перевірялось "є хоч одна угода з цим verstat'ом взагалі" —
+    # через це верстат лишався незнищенним НАЗАВЖДИ, щойно хоч раз
+    # використовувався навіть у вже закритій (виграна/програна) угоді, хоча
+    # повідомлення явно обіцяло блокувати лише "активні" угоди. Тепер
+    # перевіряємо саме активність: незакриті угоди й незавершене виробниче
+    # замовлення на цьому верстаті — те саме визначення "активна угода", що
+    # й у решті системи (stage NOT IN ('won','lost')).
+    active_deals = db.execute(
+        "SELECT COUNT(*) c FROM deals WHERE machine_id=? AND stage NOT IN ('won','lost')",
+        (machine_id,),
+    ).fetchone()["c"]
+    active_production = db.execute(
+        "SELECT COUNT(*) c FROM production_orders WHERE machine_id=? AND status NOT IN ('done','cancelled')",
+        (machine_id,),
+    ).fetchone()["c"]
+    if active_deals or active_production:
+        flash("Неможливо видалити: обладнання використовується в активних угодах або виробництві", "error")
         return redirect(url_for("machines_list"))
+    # Жодних активних прив'язок немає — відв'язуємо верстат від уже закритих
+    # (виграних/програних) угод та іншої історичної інформації, щоб не
+    # лишати "висячих" посилань на видалений id, і видаляємо сам верстат.
+    db.execute("UPDATE deals SET machine_id=NULL WHERE machine_id=?", (machine_id,))
+    db.execute("UPDATE production_orders SET machine_id=NULL WHERE machine_id=?", (machine_id,))
+    db.execute("UPDATE client_equipment SET machine_id=NULL WHERE machine_id=?", (machine_id,))
+    db.execute("UPDATE service_tickets SET machine_id=NULL WHERE machine_id=?", (machine_id,))
     db.execute("DELETE FROM machines WHERE id=?", (machine_id,))
     db.commit()
     flash("Верстат видалено з каталогу", "success")
@@ -8197,6 +8332,24 @@ def warehouse_transaction_add(item_id):
 # Налаштування та інтеграції
 # ---------------------------------------------------------------------------
 
+def get_lan_ip():
+    """Локальна IP-адреса цього комп'ютера в мережі - показуємо її в
+    «Налаштуваннях», щоб адмін міг назвати/скопіювати адресу колегам,
+    не заходячи окремо в системний трей. Той самий трюк з UDP-сокетом,
+    що і в launcher.py (навмисно продубльований, а не імпортований -
+    launcher.py може бути відсутній, якщо запущено напряму python app.py)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return None
+
+
 @app.route("/settings")
 @login_required
 @role_required()
@@ -8205,7 +8358,11 @@ def settings_page():
         flash("Доступно лише адміністратору", "error")
         return redirect(url_for("dashboard"))
     db = get_db()
-    return render_template("settings.html", active="settings", settings=get_all_settings(db), detected_chats=None)
+    lan_ip = get_lan_ip()
+    network_port = os.environ.get("CRM_PORT", "5000")
+    network_url = f"http://{lan_ip}:{network_port}" if lan_ip else None
+    return render_template("settings.html", active="settings", settings=get_all_settings(db), detected_chats=None,
+                            network_url=network_url)
 
 
 @app.route("/settings/custom-fields", methods=["GET", "POST"])
@@ -8612,6 +8769,55 @@ def settings_backup_now():
         abort(403)
     path = backup_database()
     flash(f"Резервну копію створено: {os.path.basename(path)}", "success")
+    return redirect(url_for("settings_page"))
+
+
+def reset_to_demo_data(db):
+    """Повністю очищує базу і наповнює її актуальними демо-даними — та сама
+    логіка, що виконується автоматично при першому запуску (fresh install),
+    але викликана вручну на вже існуючій базі. Навмисно НЕ видаляє файл
+    crm.db з диска (на відміну від видалення файлу вручну): просто очищує
+    всі таблиці через SQL, щоб однаково надійно працювати і в зібраному
+    .exe, і без нього, без ризику лишити файл заблокованим на Windows."""
+    tables = [
+        row["name"]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    ]
+    db.execute("PRAGMA foreign_keys = OFF")
+    for table in tables:
+        db.execute(f"DELETE FROM {table}")
+    # Скидаємо лічильники AUTOINCREMENT, щоб нові id знову починались з 1 —
+    # seed_data() посилається на конкретні числові id (client_id=6 тощо),
+    # тож без цього кроку демо-дані прив'язались би не до тих рядків.
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+        db.execute("DELETE FROM sqlite_sequence")
+    db.commit()
+    db.execute("PRAGMA foreign_keys = ON")
+    seed_data(db)
+    db.commit()
+
+
+@app.route("/settings/reset-demo-data", methods=["POST"])
+@login_required
+def settings_reset_demo_data():
+    if not is_admin():
+        abort(403)
+    confirm = (request.form.get("confirm") or "").strip()
+    if confirm != "СКИНУТИ":
+        flash('Для підтвердження введіть слово "СКИНУТИ" точно як написано.', "error")
+        return redirect(url_for("settings_page"))
+    # Завжди робимо резервну копію перед повним скиданням — щоб реальні дані
+    # (якщо це не свіжа тестова машина) можна було відновити з backups/.
+    try:
+        backup_database()
+    except Exception as e:
+        flash(f"Не вдалося створити резервну копію перед скиданням, скасовано: {e}", "error")
+        return redirect(url_for("settings_page"))
+    db = get_db()
+    reset_to_demo_data(db)
+    flash("Базу скинуто й наповнено актуальними демо-даними. Резервну копію попереднього стану збережено в backups/.", "success")
     return redirect(url_for("settings_page"))
 
 
