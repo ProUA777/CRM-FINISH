@@ -52,6 +52,8 @@ jobs:
           --hidden-import=reportlab.graphics.barcode
           --hidden-import=openpyxl.cell._writer
           --hidden-import=waitress
+          --hidden-import=tkinter
+          --hidden-import=tkinter.messagebox
           --hidden-import=ezdxf
           --hidden-import=ezdxf.addons.drawing
           --hidden-import=ezdxf.addons.drawing.matplotlib
