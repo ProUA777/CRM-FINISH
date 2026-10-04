@@ -32,10 +32,15 @@ def client(monkeypatch):
     db_path = os.path.join(tmp_dir, "test_crm.db")
     monkeypatch.setenv("CRM_SECRET_KEY", "test-secret-key")
     monkeypatch.setenv("CRM_DEBUG", "0")
+    # CRM_DATA_DIR теж ізолюємо в tmp_dir ДО перезавантаження модуля: інакше
+    # DATA_DIR (а з ним UPLOAD_DIR/LOG_DIR і тека backups/ для
+    # backup_database()) лишається рахованим від реального BASE_DIR і тести
+    # писали б файли в справжню робочу теку застосунку, а не у тимчасову.
+    monkeypatch.setenv("CRM_DATA_DIR", tmp_dir)
 
     import importlib
     import app as app_module
-    importlib.reload(app_module)  # щоб підхопився новий DB_PATH нижче
+    importlib.reload(app_module)  # щоб підхопився новий DATA_DIR/DB_PATH нижче
     app_module.DB_PATH = db_path
     if os.path.exists(db_path):
         os.remove(db_path)
@@ -252,6 +257,13 @@ def test_schema_migration_preserves_old_data(tmp_path, monkeypatch):
     """)
     old_db.commit()
     old_db.close()
+
+    # Ізолюємо CRM_DATA_DIR і тут: інакше автогенерація secret_key.txt
+    # (коли CRM_SECRET_KEY не задано) писала б файл у справжню теку
+    # застосунку замість тимчасової - та сама пастка, що колись була
+    # з backup_database() і теж знайдена реальним тестом, а не оглядом коду.
+    monkeypatch.setenv("CRM_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("CRM_SECRET_KEY", raising=False)
 
     import importlib
     import app as app_module
@@ -3674,6 +3686,294 @@ def test_service_add_with_valid_data_still_works(client):
     r = post(client, "/service/add", data={"client_id": "1", "issue": "Тестова несправність"},
              follow_redirects=True)
     assert "Сервісну заявку створено" in r.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
+# Скидання до демо-даних (/settings/reset-demo-data)
+# ---------------------------------------------------------------------------
+
+def test_reset_demo_data_requires_admin(client):
+    login(client, "oleh", "manager123")
+    r = post(client, "/settings/reset-demo-data", data={"confirm": "СКИНУТИ"})
+    assert r.status_code == 403
+
+
+def test_reset_demo_data_requires_login(client):
+    r = client.post("/settings/reset-demo-data", data={"confirm": "СКИНУТИ"}, follow_redirects=True)
+    assert "Увійти" in r.get_data(as_text=True) or r.status_code in (302, 401)
+
+
+def test_reset_demo_data_wrong_confirmation_word_does_nothing(client):
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute("INSERT INTO clients (name, source, status, created_at) VALUES ('Реальний клієнт','ручний','active','2026-01-01')")
+    db.commit()
+    before = db.execute("SELECT COUNT(*) c FROM clients").fetchone()["c"]
+    db.close()
+
+    r = post(client, "/settings/reset-demo-data", data={"confirm": "ні"}, follow_redirects=True)
+    assert "точно як написано" in r.get_data(as_text=True)
+
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    after = db.execute("SELECT COUNT(*) c FROM clients").fetchone()["c"]
+    still_there = db.execute("SELECT COUNT(*) c FROM clients WHERE name='Реальний клієнт'").fetchone()["c"]
+    db.close()
+    assert after == before
+    assert still_there == 1
+
+
+def test_reset_demo_data_with_correct_confirmation_reseeds_everything(client):
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    # Додаємо "реальний" запис, якого не має бути в демо-наборі.
+    db.execute("INSERT INTO clients (name, source, status, created_at) VALUES ('Старий клієнт для видалення','ручний','active','2026-01-01')")
+    db.commit()
+    db.close()
+
+    r = post(client, "/settings/reset-demo-data", data={"confirm": "СКИНУТИ"}, follow_redirects=True)
+    assert "наповнено актуальними демо-даними" in r.get_data(as_text=True)
+
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    clients_count = db.execute("SELECT COUNT(*) c FROM clients").fetchone()["c"]
+    deals_count = db.execute("SELECT COUNT(*) c FROM deals").fetchone()["c"]
+    stale_still_there = db.execute(
+        "SELECT COUNT(*) c FROM clients WHERE name='Старий клієнт для видалення'"
+    ).fetchone()["c"]
+    admin_row = db.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+    work_centers_with_ops = db.execute(
+        """SELECT COUNT(DISTINCT wc.id) c FROM work_centers wc
+           JOIN production_operations op ON op.work_center_id=wc.id"""
+    ).fetchone()["c"]
+    db.close()
+
+    assert clients_count == 10
+    assert deals_count == 21
+    assert stale_still_there == 0
+    assert admin_row is not None and admin_row["id"] == 1
+    assert work_centers_with_ops == 7  # усі 7 дільниць знову мають завдання
+
+
+def test_reset_demo_data_creates_backup_file_first(client):
+    login(client)
+    a = client._app_module
+    backup_dir = os.path.join(a.DATA_DIR, "backups")
+    before = set(os.listdir(backup_dir)) if os.path.exists(backup_dir) else set()
+
+    post(client, "/settings/reset-demo-data", data={"confirm": "СКИНУТИ"})
+
+    after = set(os.listdir(backup_dir))
+    new_files = after - before
+    assert any(f.startswith("crm_backup_") and f.endswith(".db") for f in new_files)
+
+
+def test_machine_delete_allowed_when_used_only_in_closed_deals(client):
+    """Раніше verstat лишався незнищенним НАЗАВЖДИ, щойно його хоч раз
+    використали навіть у вже виграній/програній угоді — всупереч тому, що
+    повідомлення про помилку явно обіцяло блокувати лише активні угоди."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    machine_id = db.execute("SELECT id FROM machines ORDER BY id LIMIT 1").fetchone()["id"]
+    # Прибираємо всі активні прив'язки до цього верстата: переводимо угоди
+    # в закриті стадії, а виробничі замовлення — у 'done'.
+    db.execute("UPDATE deals SET stage='won' WHERE machine_id=?", (machine_id,))
+    db.execute("UPDATE production_orders SET status='done' WHERE machine_id=?", (machine_id,))
+    db.commit()
+    db.close()
+
+    r = post(client, f"/machines/{machine_id}/delete", {}, follow_redirects=True)
+    assert "Верстат видалено з каталогу" in r.get_data(as_text=True)
+
+    db2 = sqlite3.connect(a.DB_PATH)
+    db2.row_factory = sqlite3.Row
+    assert db2.execute("SELECT COUNT(*) c FROM machines WHERE id=?", (machine_id,)).fetchone()["c"] == 0
+    # Закриті угоди лишаються, але з очищеним machine_id — без "висячого" id.
+    dangling = db2.execute("SELECT COUNT(*) c FROM deals WHERE machine_id=?", (machine_id,)).fetchone()["c"]
+    assert dangling == 0
+    db2.close()
+
+
+def test_machine_delete_blocked_by_active_production_order_even_without_active_deal(client):
+    """Угода вже закрита (won), але виробниче замовлення на цьому верстаті
+    ще не завершене — видаляти верстат усе одно не можна."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    order = db.execute(
+        "SELECT id, machine_id, deal_id FROM production_orders WHERE machine_id IS NOT NULL AND status!='done' LIMIT 1"
+    ).fetchone()
+    assert order is not None, "потрібне демо-замовлення в роботі для цього тесту"
+    machine_id = order["machine_id"]
+    db.execute("UPDATE deals SET stage='won' WHERE id=?", (order["deal_id"],))
+    db.commit()
+    db.close()
+
+    r = post(client, f"/machines/{machine_id}/delete", {}, follow_redirects=True)
+    assert "Неможливо видалити" in r.get_data(as_text=True)
+
+    db2 = sqlite3.connect(a.DB_PATH)
+    still_there = db2.execute("SELECT COUNT(*) c FROM machines WHERE id=?", (machine_id,)).fetchone()
+    assert still_there[0] == 1
+    db2.close()
+
+
+def test_reset_demo_data_session_survives_reset(client):
+    """Адмін лишається залогіненим і дашборд відкривається одразу після скидання
+    (id=1 для admin відновлюється тим самим при повторному засіві)."""
+    login(client)
+    post(client, "/settings/reset-demo-data", data={"confirm": "СКИНУТИ"})
+    r = client.get("/")
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Зручність використання: швидкі дії на дашборді, пошук у списку клієнтів
+# ---------------------------------------------------------------------------
+
+def test_dashboard_quick_actions_visible_for_sales(client):
+    """Менеджер з продажу бачить швидкі кнопки «+ Клієнт» / «+ Угода» на
+    дашборді - не треба заходити в розділ, щоб почати нову картку."""
+    login(client, "oleh", "manager123")
+    r = client.get("/")
+    body = r.get_data(as_text=True)
+    assert "clients/new" in body
+    assert "deals/new" in body
+
+
+def test_dashboard_quick_actions_hidden_for_accountant(client):
+    """Бухгалтеру швидкі кнопки створення клієнта/угоди не потрібні і не
+    показуються - у нього немає доступу до цих розділів взагалі."""
+    login(client, "buh", "buh12345")
+    r = client.get("/")
+    body = r.get_data(as_text=True)
+    assert "clients/new" not in body
+    assert "deals/new" not in body
+
+
+def test_dashboard_warehouse_quick_action_link_works(client):
+    """Кнопка «+ Позиція складу» на дашборді складівника веде на справжню
+    робочу сторінку (а не на застарілий/неіснуючий маршрут)."""
+    login(client, "sklad", "sklad123")
+    r = client.get("/")
+    assert "/warehouse/new" in r.get_data(as_text=True)
+    r2 = client.get("/warehouse/new")
+    assert r2.status_code == 200
+
+
+def test_dashboard_service_quick_action_link_works(client):
+    """Кнопка «+ Рекламація» на дашборді сервісника веде на сторінку, де
+    справді є форма додавання (а не на відсутню окрему сторінку)."""
+    login(client, "servis", "servis123")
+    r = client.get("/")
+    assert '"/service"' in r.get_data(as_text=True)
+    r2 = client.get("/service")
+    assert r2.status_code == 200
+
+
+def test_clients_list_search_by_name(client):
+    """Пошук у списку клієнтів за назвою компанії знаходить потрібний запис
+    і не показує інші."""
+    login(client)
+    r = client.get("/clients?q=ПромЕлектро")
+    body = r.get_data(as_text=True)
+    assert "ПромЕлектро" in body
+
+
+def test_clients_list_search_by_city_and_no_match(client):
+    """Пошук за містом теж працює, а запит без збігів чесно каже, що
+    нічого не знайдено (а не показує всіх клієнтів чи падає з помилкою)."""
+    login(client)
+    r = client.get("/clients?q=Запоріжжя")
+    assert r.status_code == 200
+    assert "ПромЕлектро" in r.get_data(as_text=True)
+
+    r2 = client.get("/clients?q=ЦьогоТочноНемаєВБазі12345")
+    assert r2.status_code == 200
+    assert "Клієнтів не знайдено" in r2.get_data(as_text=True)
+
+
+def test_clients_list_search_combines_with_status_filter(client):
+    """Пошук за текстом і фільтр за статусом працюють разом, а не
+    перекривають один одного."""
+    login(client)
+    r = client.get("/clients?q=ТОВ&status=active")
+    assert r.status_code == 200
+
+
+def test_deals_board_has_quick_filter_input(client):
+    """На воронці угод є миттєвий текстовий фільтр по картках (клієнтська
+    JS-фільтрація без перезавантаження сторінки)."""
+    login(client)
+    r = client.get("/deals")
+    body = r.get_data(as_text=True)
+    assert 'id="deal-filter-input"' in body
+    assert "function filterDealCards" in body
+
+
+def test_global_search_shortcut_markup_present(client):
+    """Поле глобального пошуку має id, потрібний для гарячої клавіші «/»,
+    і обробник клавіші підключений на базовому шаблоні."""
+    login(client)
+    r = client.get("/")
+    body = r.get_data(as_text=True)
+    assert 'id="global-search-input"' in body
+    assert "e.key !== '/'" in body
+
+
+# ---------------------------------------------------------------------------
+# Автогенерація секретного ключа і сторінка "мережевий доступ"
+# ---------------------------------------------------------------------------
+
+def test_secret_key_auto_generated_and_persisted(monkeypatch, tmp_path):
+    """Якщо CRM_SECRET_KEY не задано вручну - застосунок сам генерує
+    надійний ключ і зберігає його поруч із базою (secret_key.txt), а не
+    використовує вшитий у код типовий ключ (це була б дірка в безпеці
+    щойно CRM стає доступна по мережі, а не лише на 127.0.0.1)."""
+    monkeypatch.setenv("CRM_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("CRM_SECRET_KEY", raising=False)
+
+    import importlib
+    import app as app_module
+    importlib.reload(app_module)
+
+    key_file = tmp_path / "secret_key.txt"
+    assert key_file.exists()
+    first_key = app_module.app.secret_key
+    assert first_key != "cnc-crm-super-secret-key-change-me"
+    assert len(first_key) > 20
+
+    # Перезапуск (новий importlib.reload, емулює новий старт процесу) -
+    # ключ має лишитись тим самим, інакше всі сесії й логіни ламались би
+    # щоразу, коли людина вимикає й знову вмикає комп'ютер.
+    importlib.reload(app_module)
+    assert app_module.app.secret_key == first_key
+
+
+def test_settings_shows_network_access_card(client):
+    """У «Налаштуваннях» адмін бачить адресу для доступу з інших
+    комп'ютерів у мережі - саме цю адресу треба давати колегам, щоб
+    вони зайшли в CRM зі свого комп'ютера через браузер."""
+    login(client)
+    r = client.get("/settings")
+    body = r.get_data(as_text=True)
+    assert "Доступ з інших комп'ютерів" in body
+    assert 'id="network-url-text"' in body
+
+
+def test_settings_network_card_hidden_from_non_admin(client):
+    """Рядова роль узагалі не бачить сторінку «Налаштування» (і картку
+    мережевого доступу разом з нею) - вона доступна лише адміну."""
+    login(client, "oleh", "manager123")
+    r = client.get("/settings", follow_redirects=True)
+    assert "Доступ з інших комп'ютерів" not in r.get_data(as_text=True)
 
 
 if __name__ == "__main__":
