@@ -1,93 +1,44 @@
-name: Build Windows Installer
+@echo off
+REM Збірка Оснастка-Маркет у один .exe-файл на Windows.
+REM Запускати ЛИШЕ на Windows (PyInstaller не вміє крос-компіляцію
+REM з Linux/macOS у Windows-exe — це обмеження самого PyInstaller,
+REM не цього проєкту).
+REM
+REM Використання:
+REM   1. Встанови Python 3.11+ з python.org (позначити "Add to PATH")
+REM   2. Відкрий цю теку в командному рядку (cmd) і виконай:
+REM        build_exe.bat
+REM   3. Готовий файл з'явиться в dist\OsnastkaMarket.exe
 
-# Збирає OsnastkaMarket.exe та повноцінний Setup.exe-інсталятор на СПРАВЖНЬОМУ
-# Windows-раннері GitHub (безкоштовно для публічних репозиторіїв,
-# і в межах безкоштовного ліміту для приватних). Не потребує Windows-ПК
-# у розробника — усе відбувається в хмарі GitHub.
-#
-# Як користуватись:
-#   1. Заведи безкоштовний акаунт на github.com, створи новий репозиторій
-#   2. Заливай туди всі файли з цієї поставки (app.py, launcher.py,
-#      make_icon.py, installer.iss, requirements.txt, і цю теку .github/)
-#   3. Відкрий вкладку "Actions" у репозиторії — збірка запуститься сама
-#      при кожному push, або натисни "Run workflow" вручну
-#   4. Через кілька хвилин у розділі "Artifacts" завершеного запуску
-#      з'явиться OsnastkaMarket-Setup.exe — завантаж і роздай колегам
+echo === Оснастка-Маркет: збірка .exe ===
 
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch: {}
+python -m venv build_venv
+call build_venv\Scripts\activate.bat
 
-jobs:
-  build:
-    runs-on: windows-latest
-    env:
-      # Додатковий шар захисту (основний фікс - у самому коді Python):
-      # примусово UTF-8 для стандартного виводу на всіх кроках цього job,
-      # незалежно від локалі Windows-раннера.
-      PYTHONIOENCODING: utf-8
-      PYTHONUTF8: "1"
-    steps:
-      - name: Checkout коду
-        uses: actions/checkout@v4
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install pyinstaller pystray pillow
 
-      - name: Встановити Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+python make_icon.py
 
-      - name: Встановити залежності
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller pystray pillow
+pyinstaller --onefile --noconsole --name OsnastkaMarket --icon=icon.ico ^
+    --hidden-import=reportlab.graphics.barcode ^
+    --hidden-import=openpyxl.cell._writer ^
+    --hidden-import=waitress ^
+    --hidden-import=tkinter ^
+    --hidden-import=tkinter.messagebox ^
+    --hidden-import=ezdxf ^
+    --hidden-import=ezdxf.addons.drawing ^
+    --hidden-import=ezdxf.addons.drawing.matplotlib ^
+    --hidden-import=matplotlib.backends.backend_agg ^
+    --hidden-import=fitz ^
+    --collect-all reportlab ^
+    --collect-all ezdxf ^
+    --collect-all matplotlib ^
+    --collect-all pymupdf ^
+    launcher.py
 
-      - name: Згенерувати іконку
-        run: python make_icon.py
-
-      - name: Зібрати OsnastkaMarket.exe (PyInstaller)
-        run: >
-          pyinstaller --onefile --noconsole --name OsnastkaMarket --icon=icon.ico
-          --hidden-import=reportlab.graphics.barcode
-          --hidden-import=openpyxl.cell._writer
-          --hidden-import=waitress
-          --hidden-import=ezdxf
-          --hidden-import=ezdxf.addons.drawing
-          --hidden-import=ezdxf.addons.drawing.matplotlib
-          --hidden-import=matplotlib.backends.backend_agg
-          --hidden-import=fitz
-          --collect-all reportlab
-          --collect-all ezdxf
-          --collect-all matplotlib
-          --collect-all pymupdf
-          launcher.py
-
-      - name: Перевірка, що exe справді запускається
-        run: |
-          Start-Process -FilePath "dist\OsnastkaMarket.exe"
-          Start-Sleep -Seconds 8
-          $response = Invoke-WebRequest -Uri "http://127.0.0.1:5000/login" -UseBasicParsing
-          if ($response.StatusCode -ne 200) { throw "CRM не відповідає на /login" }
-          Write-Host "OK: OsnastkaMarket.exe відповідає на порту 5000"
-          Get-Process OsnastkaMarket | Stop-Process -Force
-        shell: pwsh
-
-      - name: Встановити Inno Setup
-        run: choco install innosetup -y
-
-      - name: Зібрати інсталятор (Setup.exe)
-        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
-        shell: pwsh
-
-      - name: Завантажити OsnastkaMarket.exe як артефакт
-        uses: actions/upload-artifact@v4
-        with:
-          name: OsnastkaMarket-exe-only
-          path: dist/OsnastkaMarket.exe
-
-      - name: Завантажити повний інсталятор як артефакт
-        uses: actions/upload-artifact@v4
-        with:
-          name: OsnastkaMarket-Setup-installer
-          path: Output/OsnastkaMarket-Setup.exe
+echo.
+echo === Готово: dist\OsnastkaMarket.exe ===
+echo Далі можна обгорнути в повноцінний інсталятор через installer.iss (Inno Setup).
+pause
