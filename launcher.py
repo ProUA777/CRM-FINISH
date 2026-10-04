@@ -4,12 +4,22 @@
 
 Що робить при запуску:
   1. Піднімає застосунок через waitress (продакшн WSGI-сервер, працює
-     на Windows, на відміну від gunicorn) на http://127.0.0.1:5000.
+     на Windows, на відміну від gunicorn) на порту 5000, слухаючи ВСІ
+     мережеві інтерфейси (0.0.0.0) - це дає доступ з інших комп'ютерів
+     у тій же Wi-Fi/локальній мережі без жодних додаткових налаштувань:
+     просто вводять IP-адресу цього комп'ютера в браузері. На самому
+     цьому комп'ютері все одно відкривається звичний http://127.0.0.1.
   2. Автоматично відкриває цю адресу в браузері за замовчуванням.
   3. Показує іконку в системному треї з пунктами "Відкрити CRM",
+     "Адреса для інших комп'ютерів" (копіює в буфер і показує адресу),
      "Тека з даними" (бекапи/логи/crm.db) і "Вийти".
      Якщо pystray/Pillow з якоїсь причини недоступні у зібраному .exe —
      чемно падає назад у режим звичайного консольного вікна.
+
+  Перший запуск після прив'язки до 0.0.0.0 - Windows Defender Firewall
+  зазвичай сам питає одноразовим вікном "Дозволити доступ?" (достатньо
+  натиснути "Дозволити"), це стандартна поведінка Windows для будь-якої
+  програми, що починає слухати мережу, і коду для цього не потрібно.
 
 Це не веб-фреймворк і не частина самого app.py — окремий, тонкий
 "обгортковий" скрипт саме для десктопної зручності (щоб не пояснювати
@@ -24,9 +34,16 @@ import webbrowser
 import logging
 from logging.handlers import RotatingFileHandler
 
-HOST = "127.0.0.1"
+# BIND_HOST - на чому слухає сервер (0.0.0.0 = приймає з'єднання з усієї
+# мережі, не лише з цього комп'ютера). LOCAL_URL - адреса, яку відкриваємо
+# в браузері САМЕ на цьому комп'ютері (навмисно 127.0.0.1, а не 0.0.0.0-
+# останній не всі браузери коректно відкривають як "цей комп'ютер").
+# За потреби можна явно повернутись до старої поведінки "лише цей
+# комп'ютер" через CRM_HOST=127.0.0.1.
+BIND_HOST = os.environ.get("CRM_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CRM_PORT", "5000"))
-URL = f"http://{HOST}:{PORT}"
+LOCAL_URL = f"http://127.0.0.1:{PORT}"
+URL = LOCAL_URL
 
 
 def _is_port_free(host, port):
@@ -117,12 +134,17 @@ def start_server():
     """Запускає CRM через waitress у поточному потоці (викликається з окремого
     daemon-потоку в main(), тож завершення головного потоку автоматично
     зупиняє й сервер)."""
+    # Якщо порт 5000 був зайнятий і main() підібрав інший - кладемо реальний
+    # порт у змінну середовища ДО імпорту app.py, щоб сторінка "Налаштування"
+    # у самій CRM показувала правильну адресу для інших комп'ютерів, а не
+    # завжди 5000.
+    os.environ["CRM_PORT"] = str(PORT)
     import app as crm_app  # імпорт тут, а не на верху файлу: тільки в цей момент
                             # DATA_DIR/DB_PATH з app.py вже коректно визначені
                             # для frozen-режиму (див. app.py: _default_data_dir)
     from waitress import serve
     log.info("Оснастка-Маркет: дані зберігаються в %s", crm_app.DATA_DIR)
-    serve(crm_app.app, host=HOST, port=PORT, _quiet=True)
+    serve(crm_app.app, host=BIND_HOST, port=PORT, _quiet=True)
 
 
 def open_data_dir():
@@ -137,6 +159,57 @@ def open_data_dir():
             os.system(f'xdg-open "{path}"')
     except Exception as e:
         log.warning("Не вдалось відкрити теку даних: %s", e)
+
+
+def get_lan_ip():
+    """Визначає локальну IP-адресу цього комп'ютера в мережі - саме її
+    треба вводити в браузері на ІНШИХ комп'ютерах, щоб відкрити CRM тут.
+    Трюк з UDP-сокетом: питаємо ОС, яким мережевим інтерфейсом пішов би
+    пакет до 8.8.8.8, без фактичної відправки будь-яких даних назовні
+    (жодного реального з'єднання з інтернетом не відбувається)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return None
+
+
+def show_network_address():
+    """Пункт трея "Адреса для інших комп'ютерів": копіює адресу в буфер
+    обміну і показує її у віконці, щоб людина могла або просто вставити
+    (Ctrl+V) в браузер на іншому комп'ютері, або прочитати й ввести вручну.
+    Tkinter навмисно обраний для цього, а не окрема бібліотека - він уже
+    входить у стандартну поставку Python, тож не додає нових залежностей
+    до збірки .exe."""
+    lan_ip = get_lan_ip()
+    if not lan_ip:
+        message = ("Не вдалося автоматично визначити адресу цього комп'ютера "
+                    "в мережі. Перевір, що Wi-Fi/мережевий кабель підключені, "
+                    "і повтори спробу ще раз через меню трея.")
+    else:
+        lan_url = f"http://{lan_ip}:{PORT}"
+        message = (f"Адресу скопійовано в буфер обміну:\n\n{lan_url}\n\n"
+                    "Відкрий цю адресу в браузері на ІНШОМУ комп'ютері в тій "
+                    "же Wi-Fi мережі, щоб зайти в CRM з нього. На цьому "
+                    "комп'ютері нічого встановлювати на інших машинах не треба.")
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        if lan_ip:
+            root.clipboard_clear()
+            root.clipboard_append(f"http://{lan_ip}:{PORT}")
+            root.update()
+        messagebox.showinfo("Оснастка-Маркет — адреса для мережі", message)
+        root.destroy()
+    except Exception as e:
+        log.warning("Не вдалось показати вікно з адресою (%s). Адреса: %s", e, message)
 
 
 def make_tray_icon_image():
@@ -169,6 +242,9 @@ def run_with_tray():
     def on_data_dir(icon, item):
         open_data_dir()
 
+    def on_network_address(icon, item):
+        show_network_address()
+
     def on_exit(icon, item):
         icon.stop()
         os._exit(0)  # daemon-потік сервера теж завершиться разом з процесом
@@ -179,6 +255,7 @@ def run_with_tray():
         "Оснастка-Маркет",
         menu=pystray.Menu(
             Item("Відкрити CRM", on_open, default=True),
+            Item("Адреса для інших комп'ютерів", on_network_address),
             Item("Тека з даними", on_data_dir),
             Item("Вийти", on_exit),
         ),
@@ -188,6 +265,9 @@ def run_with_tray():
 
 def run_console_fallback():
     log.info("Оснастка-Маркет запущено: %s", URL)
+    lan_ip = get_lan_ip()
+    if lan_ip and BIND_HOST != "127.0.0.1":
+        log.info("Доступ з інших комп'ютерів у цій мережі: http://%s:%s", lan_ip, PORT)
     log.info("Це вікно можна згорнути. Щоб зупинити сервер — закрийте вікно або натисніть Ctrl+C.")
     try:
         while True:
@@ -198,12 +278,12 @@ def run_console_fallback():
 
 def main():
     global PORT, URL
-    chosen_port = _find_free_port(HOST, PORT)
+    chosen_port = _find_free_port(BIND_HOST, PORT)
     if chosen_port != PORT:
         log.warning("Порт %s зайнятий іншою програмою на цьому комп'ютері — використовую порт %s замість нього",
                     PORT, chosen_port)
     PORT = chosen_port
-    URL = f"http://{HOST}:{PORT}"
+    URL = f"http://127.0.0.1:{PORT}"
 
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
