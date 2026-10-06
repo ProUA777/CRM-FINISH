@@ -1,0 +1,21 @@
+# Дані та артефакти запуску — ніколи не комітити (особливо crm.db з реальними
+# даними клієнтів, якщо репозиторій колись стане публічним чи розшариться)
+crm.db
+crm.db-wal
+crm.db-shm
+logs/
+backups/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Артефакти збірки .exe
+build_venv/
+build/
+dist/
+Output/
+icon.ico
+*.spec
+
+# Секрети
+.env
