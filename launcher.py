@@ -144,6 +144,10 @@ def start_server():
                             # для frozen-режиму (див. app.py: _default_data_dir)
     from waitress import serve
     log.info("Оснастка-Маркет: дані зберігаються в %s", crm_app.DATA_DIR)
+    try:
+        crm_app.start_machine_poller()  # опитування верстатів по MTConnect (якщо задані в CRM)
+    except Exception:
+        log.exception("Не вдалось запустити опитування верстатів")
     serve(crm_app.app, host=BIND_HOST, port=PORT, _quiet=True)
 
 
@@ -177,6 +181,51 @@ def get_lan_ip():
             s.close()
     except Exception:
         return None
+
+
+AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE_NAME = "OsnastkaMarket"
+
+
+def autostart_supported():
+    """Автозапуск має сенс лише для зібраного .exe на Windows (для
+    `python launcher.py` у розробці sys.executable - це Python, а не наша програма)."""
+    return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
+
+
+def is_autostart_enabled():
+    if not autostart_supported():
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            return bool(value)
+    except Exception:
+        return False
+
+
+def set_autostart(enabled):
+    """Додає/прибирає програму з автозапуску Windows для ПОТОЧНОГО користувача
+    (гілка HKEY_CURRENT_USER - прав адміністратора не потрібно). Після
+    перезавантаження головного комп'ютера CRM сама піднімається, і колегам
+    не треба нікого просити її запускати. Повертає True, якщо вдалось."""
+    if not autostart_supported():
+        return False
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, f'"{sys.executable}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as e:
+        log.warning("Не вдалось змінити автозапуск: %s", e)
+        return False
 
 
 def show_network_address():
@@ -245,20 +294,29 @@ def run_with_tray():
     def on_network_address(icon, item):
         show_network_address()
 
+    def on_toggle_autostart(icon, item):
+        set_autostart(not is_autostart_enabled())
+
     def on_exit(icon, item):
         icon.stop()
         os._exit(0)  # daemon-потік сервера теж завершиться разом з процесом
 
+    menu_items = [
+        Item("Відкрити CRM", on_open, default=True),
+        Item("Адреса для інших комп'ютерів", on_network_address),
+    ]
+    if autostart_supported():
+        menu_items.append(Item("Запускати разом з Windows", on_toggle_autostart,
+                                checked=lambda item: is_autostart_enabled()))
+    menu_items += [
+        Item("Тека з даними", on_data_dir),
+        Item("Вийти", on_exit),
+    ]
     icon = pystray.Icon(
         "OsnastkaMarket",
         make_tray_icon_image(),
         "Оснастка-Маркет",
-        menu=pystray.Menu(
-            Item("Відкрити CRM", on_open, default=True),
-            Item("Адреса для інших комп'ютерів", on_network_address),
-            Item("Тека з даними", on_data_dir),
-            Item("Вийти", on_exit),
-        ),
+        menu=pystray.Menu(*menu_items),
     )
     icon.run()
 
