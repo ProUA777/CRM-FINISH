@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import datetime
 
 import pytest
 
@@ -1230,11 +1231,79 @@ def test_calculator_history_detail_shows_full_inputs_and_untruncated_description
     assert r.status_code == 200
     html = r.get_data(as_text=True)
     assert "Вал ступінчастий Ø40" in html
-    assert long_description.strip() in html
+    # Опис тепер розкладається на окремі пункти (а не стіна тексту), тому
+    # перевіряємо, що зміст на місці, а не те, що він іде одним суцільним рядком.
+    assert "Операція 1: токарна обробка." in html
+    assert html.count("ops-note") >= 20
     assert "2.3" in html  # вага
     assert "65" in html  # ціна матеріалу
     assert "13753.20" in html  # разом за партію
     assert "733.50" in html  # собівартість/од
+
+
+def test_split_operations_text_numbered_lines(client):
+    """Новий формат ШІ: етап на рядок -> окремі етапи з назвою й поясненням,
+    а рядок «Припущення» - окрема примітка."""
+    a = client._app_module
+    items = a.split_operations_text(
+        "1. Заготовка — пруток Ø60, 10 хв.\n2. Чорнове точіння — на токарному; 25 хв.\nПрипущення: ціни типові"
+    )
+    assert [i["kind"] for i in items] == ["step", "step", "note"]
+    assert items[0]["num"] == "1" and items[0]["title"] == "Заготовка" and "пруток" in items[0]["body"]
+    assert items[2]["body"].startswith("Припущення")
+
+
+def test_split_operations_text_legacy_single_paragraph(client):
+    """Старі записи (весь текст одним абзацом із вбудованою нумерацією або без
+    неї) теж розкладаються на пункти, а не лишаються купою."""
+    a = client._app_module
+    inline = a.split_operations_text("Вступ. 1) Заготовка: різка 10 хв. 2) Токарна: чорнове 25 хв. 3) ВТК: контроль.")
+    assert [i["num"] for i in inline if i["kind"] == "step"] == ["1", "2", "3"]
+    sentences = a.split_operations_text("Спочатку ріжемо. Потім точимо. Далі фрезеруємо.")
+    assert len(sentences) == 3
+    assert a.split_operations_text("") == []
+    assert a.split_operations_text(None) == []
+
+
+def test_operations_html_escapes_markup(client):
+    """Текст від ШІ/користувача виводиться екранованим - жодного виконання HTML/JS."""
+    a = client._app_module
+    html = str(a.render_operations_html("1. Етап — <script>alert(1)</script>\n<b>примітка</b>"))
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    assert "<b>примітка</b>" not in html
+
+
+def test_calculator_history_detail_shows_stage_cards(client):
+    """На сторінці збереженого розрахунку етапи показані списком карток."""
+    login(client)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.execute(
+        "INSERT INTO cost_calculations (user_id, source, part_description, quantity, weight_kg, "
+        "material_price_per_kg, turning_hours, turning_rate_per_hour, milling_hours, milling_rate_per_hour, "
+        "machine_hours, machine_rate_per_hour, setup_cost_total, margin_pct, cost_per_unit, price_per_unit, "
+        "total_price, operations_description, created_at) VALUES "
+        "(1,'ai','Втулка',1,1,50,1,800,0,0,0,0,0,20,850,1020,1020,?,'2026-01-01 10:00:00')",
+        ("1. Заготовка — пруток Ø40\n2. Точіння — Haas ST-20\n3. ВТК — штангенциркуль",),
+    )
+    db.commit()
+    calc_id = db.execute("SELECT id FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()[0]
+    db.close()
+    html = client.get(f"/calculator/history/{calc_id}").get_data(as_text=True)
+    assert html.count('class="ops-step"') == 3
+    assert "ops-title\">Точіння" in html
+
+
+def test_quote_pdf_with_multistage_operations(client):
+    """PDF із багатоетапним описом генерується без помилок."""
+    login(client)
+    a = client._app_module
+    buf = a._render_quote_pdf(
+        "Втулка", "1. Заготовка — пруток Ø40\n2. Точіння — Haas ST-20\nПрипущення: ціни типові",
+        1, 50, 1, 800, 0, 0, 0, 0, 0, 1, 20,
+    )
+    assert buf.read(5) == b"%PDF-"
 
 
 def test_calculator_history_detail_missing_id_returns_404(client):
@@ -1992,7 +2061,9 @@ def test_ai_button_respects_manually_filled_fields_and_only_fills_the_rest(clien
     assert r.status_code == 200
     assert "Заготовка: 2.5 кг" in html
     assert "Партія: 7 шт" in html
-    assert "999" not in html
+    # Не шукаємо просто "999": випадковий CSRF-токен у HTML інколи містить таку послідовність (флейки).
+    assert "Заготовка: 999" not in html
+    assert "Партія: 999" not in html
 
 
 def test_ai_button_with_only_known_fields_and_no_description_still_works(client):
@@ -3976,6 +4047,627 @@ def test_settings_network_card_hidden_from_non_admin(client):
     assert "Доступ з інших комп'ютерів" not in r.get_data(as_text=True)
 
 
+# ---------------------------------------------------------------------------
+# Зручність підключення: QR, адреса за іменем, нагадування про пароль, автозапуск
+# ---------------------------------------------------------------------------
+
+def test_settings_shows_qr_hostname_and_tailscale_hint(client):
+    login(client)
+    body = client.get("/settings").get_data(as_text=True)
+    assert 'id="network-qr"' in body and "<svg" in body
+    assert 'id="network-host-url"' in body
+    assert "Tailscale" in body
+
+
+def test_make_qr_svg_returns_svg_or_none(client):
+    a = client._app_module
+    svg = str(a.make_qr_svg("http://192.168.1.50:5000"))
+    assert svg.startswith("<svg")
+    assert a.make_qr_svg(None) is None
+
+
+def test_default_password_warning_shown_and_cleared_after_change(client):
+    login(client)  # admin / admin123 - типовий пароль
+    assert 'id="default-password-warning"' in client.get("/").get_data(as_text=True)
+    post(client, "/my-profile", {"current_password": "admin123", "new_password": "Nova-Parol-77",
+                                 "confirm_password": "Nova-Parol-77"})
+    assert 'id="default-password-warning"' not in client.get("/").get_data(as_text=True)
+
+
+def test_no_default_password_warning_for_custom_password(client):
+    login(client)
+    post(client, "/my-profile", {"current_password": "admin123", "new_password": "Nova-Parol-77",
+                                 "confirm_password": "Nova-Parol-77"})
+    client.get("/logout")
+    login(client, "admin", "Nova-Parol-77")
+    assert 'id="default-password-warning"' not in client.get("/").get_data(as_text=True)
+
+
+def test_launcher_autostart_registry_logic(monkeypatch, tmp_path):
+    """Логіка автозапуску Windows перевіряється на підробленому winreg
+    (на Linux справжнього реєстру немає)."""
+    import sys, types, importlib
+    monkeypatch.setenv("CRM_DATA_DIR", str(tmp_path))
+    store = {}
+
+    class FakeKey:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    fake = types.SimpleNamespace(
+        HKEY_CURRENT_USER=1, KEY_READ=1, KEY_SET_VALUE=2, REG_SZ=1,
+        OpenKey=lambda *a, **k: FakeKey(),
+        CreateKeyEx=lambda *a, **k: FakeKey(),
+        QueryValueEx=lambda key, name: (store[name], 1) if name in store else (_ for _ in ()).throw(FileNotFoundError()),
+        SetValueEx=lambda key, name, r, t, v: store.__setitem__(name, v),
+        DeleteValue=lambda key, name: store.pop(name) if name in store else (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    sys.modules.pop("launcher", None)
+    import launcher
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+    monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(launcher.sys, "executable", r"C:\\Apps\\OsnastkaMarket.exe")
+
+    assert launcher.is_autostart_enabled() is False
+    assert launcher.set_autostart(True) is True
+    assert launcher.is_autostart_enabled() is True
+    assert store["OsnastkaMarket"] == '"C:\\\\Apps\\\\OsnastkaMarket.exe"'
+    assert launcher.set_autostart(False) is True
+    assert launcher.is_autostart_enabled() is False
+    assert launcher.set_autostart(False) is True  # повторне вимкнення не падає
+
+
+def test_launcher_autostart_unsupported_when_not_frozen(monkeypatch, tmp_path):
+    import sys
+    monkeypatch.setenv("CRM_DATA_DIR", str(tmp_path))
+    sys.modules.pop("launcher", None)
+    import launcher
+    monkeypatch.setattr(launcher.sys, "frozen", False, raising=False)
+    assert launcher.autostart_supported() is False
+    assert launcher.set_autostart(True) is False
+
+
+def test_mobile_layout_markup_present(client):
+    """Мобільний вигляд: кнопка-гамбургер, фон-перекривач і CSS для вузьких екранів."""
+    login(client)
+    body = client.get("/").get_data(as_text=True)
+    assert 'id="nav-toggle"' in body
+    assert 'class="nav-overlay"' in body
+    assert "@media(max-width:820px)" in body
+    assert "translateX(-105%)" in body
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Вбудоване підключення верстатів по MTConnect
+# ---------------------------------------------------------------------------
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+MTC_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:1.3">
+ <Streams><DeviceStream name="HAAS" uuid="x">
+  <ComponentStream component="Controller" name="controller">
+   <Events>
+    <Execution dataItemId="exec">{execution}</Execution>
+    <ControllerMode dataItemId="mode">{mode}</ControllerMode>
+    <Program dataItemId="prog">{program}</Program>
+    <PartCountAct dataItemId="pc">{parts}</PartCountAct>
+   </Events>
+   <Condition>{condition}</Condition>
+  </ComponentStream>
+  <ComponentStream component="Rotary" name="C">
+   <Samples><Load dataItemId="Sload" name="Sload">{load}</Load></Samples>
+  </ComponentStream>
+ </DeviceStream></Streams>
+</MTConnectStreams>"""
+
+
+def mtc_xml(execution="ACTIVE", mode="AUTOMATIC", program="O1234", parts="57",
+            condition="<Normal dataItemId=\"c\"/>", load="63.5"):
+    return MTC_XML.format(execution=execution, mode=mode, program=program,
+                          parts=parts, condition=condition, load=load)
+
+
+@pytest.fixture()
+def fake_haas():
+    """Імітація MTConnect-агента верстата на локальному порту."""
+    state = {"body": mtc_xml(), "hits": 0}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["hits"] += 1
+            if self.path != "/current":
+                self.send_response(404); self.end_headers(); return
+            data = state["body"].encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/xml")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    state["port"] = srv.server_address[1]
+    state["server"] = srv
+    yield state
+    srv.shutdown()
+    srv.server_close()
+
+
+def _telemetry(client, wc_id=1):
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute("SELECT * FROM machine_telemetry WHERE work_center_id=?", (wc_id,)).fetchone()
+    db.close()
+    return row
+
+
+def test_mtconnect_parse_running_idle_alarm_and_garbage(client):
+    a = client._app_module
+    r = a.parse_mtconnect_current(mtc_xml())
+    assert r["status"] == "running" and r["program_name"] == "O1234"
+    assert r["part_count"] == 57 and r["mode"] == "AUTOMATIC" and r["spindle_load_pct"] == 63.5
+    assert a.parse_mtconnect_current(mtc_xml(execution="READY"))["status"] == "idle"
+    assert a.parse_mtconnect_current(mtc_xml(execution="FEED_HOLD"))["status"] == "idle"
+    alarm = a.parse_mtconnect_current(mtc_xml(condition='<Fault dataItemId="c">Servo</Fault>'))
+    assert alarm["status"] == "alarm"
+    unavailable = a.parse_mtconnect_current(mtc_xml(execution="UNAVAILABLE", program="UNAVAILABLE", parts="UNAVAILABLE"))
+    assert unavailable["status"] == "offline" and unavailable["part_count"] is None
+    import xml.etree.ElementTree as ET
+    with pytest.raises(ET.ParseError):
+        a.parse_mtconnect_current("not xml at all")
+    with pytest.raises(ValueError):
+        a.parse_mtconnect_current("<html><body>hello</body></html>")
+
+
+def test_mtconnect_connect_saves_and_shows_live_status(client, fake_haas):
+    login(client)
+    r = post(client, "/work-centers/1/connect",
+             {"mtc_host": "127.0.0.1", "mtc_port": str(fake_haas["port"])}, follow_redirects=True)
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "Зв&#39;язок є" in html or "Зв'язок є" in html
+    t = _telemetry(client)
+    assert t["status"] == "running" and t["program_name"] == "O1234"
+    assert t["part_count"] == 57 and t["source"] == "mtconnect"
+    assert "Підключено: 127.0.0.1" in html and "▶ працює" in html
+
+
+def test_mtconnect_poll_follows_machine_state_and_goes_offline(client, fake_haas):
+    login(client)
+    post(client, "/work-centers/1/connect", {"mtc_host": "127.0.0.1", "mtc_port": str(fake_haas["port"])})
+    a = client._app_module
+    fake_haas["body"] = mtc_xml(condition='<Fault dataItemId="c">Alarm 108</Fault>', parts="58")
+    assert a.poll_machines_once() == {1: None}
+    t = _telemetry(client)
+    assert t["status"] == "alarm" and t["part_count"] == 58
+    fake_haas["body"] = mtc_xml(execution="READY")
+    a.poll_machines_once()
+    assert _telemetry(client)["status"] == "idle"
+    fake_haas["server"].shutdown()  # верстат "вимкнули"
+    fake_haas["server"].server_close()
+    res = a.poll_machines_once()
+    assert res[1] is not None
+    assert _telemetry(client)["status"] == "offline"
+    db = sqlite3.connect(a.DB_PATH)
+    n_before = db.execute("SELECT COUNT(*) FROM machine_telemetry_log WHERE work_center_id=1").fetchone()[0]
+    a.poll_machines_once()  # вже offline - журнал не роздувається
+    n_after = db.execute("SELECT COUNT(*) FROM machine_telemetry_log WHERE work_center_id=1").fetchone()[0]
+    db.close()
+    assert n_after == n_before
+
+
+def test_mtconnect_unreachable_machine_saved_without_crash(client):
+    login(client)
+    r = post(client, "/work-centers/1/connect", {"mtc_host": "127.0.0.1", "mtc_port": "9"}, follow_redirects=True)
+    assert r.status_code == 200
+    assert "верстат не відповів" in r.get_data(as_text=True)
+    a = client._app_module
+    db = sqlite3.connect(a.DB_PATH)
+    row = db.execute("SELECT mtc_host, mtc_enabled FROM work_centers WHERE id=1").fetchone()
+    db.close()
+    assert row == ("127.0.0.1", 1)
+
+
+def test_mtconnect_connect_validation_blank_disables_and_non_admin_forbidden(client, fake_haas):
+    login(client)
+    bad = post(client, "/work-centers/1/connect", {"mtc_host": "http://evil/x?y", "mtc_port": "8082"}, follow_redirects=True)
+    assert "Перевірте адресу" in bad.get_data(as_text=True)
+    bad2 = post(client, "/work-centers/1/connect", {"mtc_host": "127.0.0.1", "mtc_port": "99999"}, follow_redirects=True)
+    assert "Перевірте адресу" in bad2.get_data(as_text=True)
+    post(client, "/work-centers/1/connect", {"mtc_host": "127.0.0.1", "mtc_port": str(fake_haas["port"])})
+    off = post(client, "/work-centers/1/connect", {"mtc_host": "", "mtc_port": "8082"}, follow_redirects=True)
+    assert "вимкнено" in off.get_data(as_text=True)
+    assert client._app_module.poll_machines_once() == {}
+    assert post(client, "/work-centers/999/connect", {"mtc_host": "1.2.3.4"}).status_code == 404
+    client.get("/logout")
+    login(client, "oleh", "manager123")
+    assert post(client, "/work-centers/1/connect", {"mtc_host": "127.0.0.1"}).status_code == 403
+    page = client.get("/work-centers").get_data(as_text=True)
+    assert "mtc-connect" not in page
+
+
+def test_mtconnect_admin_sees_connect_form_and_poller_starts_once(client, monkeypatch):
+    login(client)
+    assert "mtc-connect" in client.get("/work-centers").get_data(as_text=True)
+    a = client._app_module
+    calls = []
+    monkeypatch.setattr(a, "poll_machines_once", lambda: calls.append(1) or {})
+    monkeypatch.setattr(a, "_poller_started", False)
+    assert a.start_machine_poller(interval=1) is True
+    assert a.start_machine_poller(interval=1) is False
+    import time as _t
+    try:
+        _t.sleep(1.3)
+        assert len(calls) >= 1
+    finally:
+        a.stop_machine_poller()
+
+
+# ---------------------------------------------------------------------------
+# Валюти: історія курсів, НБУ, PLN, попередження; автобекап
+# ---------------------------------------------------------------------------
+
+def _raw_db(client):
+    db = sqlite3.connect(client._app_module.DB_PATH)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def test_rates_history_keeps_old_months_stable_after_rate_change(client):
+    a = client._app_module
+    db = _raw_db(client)
+    a.save_rates(db, 40.0, 44.0, 10.0)           # курс "раніше"
+    db.execute("UPDATE rates_history SET recorded_on='2026-03-01' WHERE source='вручну' OR source='manual'")
+    db.commit()
+    a.save_rates(db, 50.0, 55.0, 12.0)           # курс сьогодні
+    assert a.to_uah(db, 100, "USD", "2026-03-15") == 4000.0     # березень лишився за старим
+    assert a.to_uah(db, 100, "USD") == 5000.0                    # сьогодні за новим
+    assert a.to_uah(db, 100, "PLN", "2020-01-01") is not None
+    assert a.to_uah(db, 100, "UAH", "2026-03-15") == 100
+    db.close()
+
+
+def test_baseline_preserves_pre_history_rate(client):
+    a = client._app_module
+    db = _raw_db(client)
+    old = float(a.get_setting(db, "rate_usd"))
+    a.save_rates(db, old + 10, None, None)
+    assert a.to_uah(db, 1, "USD", "2001-01-01") == old
+    db.close()
+
+
+def test_rates_reject_invalid_and_keep_previous(client):
+    login(client)
+    before = float(client._app_module.get_setting(_raw_db(client), "rate_usd"))
+    r = post(client, "/settings/save", {"form": "rates", "rate_usd": "abc", "rate_eur": "-5", "rate_pln": "0"}, follow_redirects=True)
+    assert "додатним числом" in r.get_data(as_text=True)
+    assert float(client._app_module.get_setting(_raw_db(client), "rate_usd")) == before
+    ok = post(client, "/settings/save", {"form": "rates", "rate_usd": "42,5", "rate_eur": "46", "rate_pln": "11", "rates_auto": "1"}, follow_redirects=True)
+    assert "Курси валют оновлено" in ok.get_data(as_text=True)
+    db = _raw_db(client)
+    assert float(client._app_module.get_setting(db, "rate_usd")) == 42.5
+    assert client._app_module.get_setting(db, "rates_auto") == "1"
+    db.close()
+
+
+def test_nbu_update_route_with_mocked_api_and_failure(client, monkeypatch):
+    login(client)
+    a = client._app_module
+    monkeypatch.setattr(a, "fetch_nbu_rates", lambda timeout=8: {"usd": 41.9, "eur": 48.1, "pln": 11.2})
+    r = post(client, "/settings/rates/nbu", {}, follow_redirects=True)
+    assert "з НБУ" in r.get_data(as_text=True)
+    db = _raw_db(client)
+    assert a.get_setting(db, "rate_pln") == "11.2" and a.get_setting(db, "rates_source") == "НБУ"
+    db.close()
+    def boom(timeout=8):
+        raise OSError("немає мережі")
+    monkeypatch.setattr(a, "fetch_nbu_rates", boom)
+    r2 = post(client, "/settings/rates/nbu", {}, follow_redirects=True)
+    assert "Не вдалось отримати курси НБУ" in r2.get_data(as_text=True)
+    client.get("/logout")
+    login(client, "oleh", "manager123")
+    assert post(client, "/settings/rates/nbu", {}).status_code == 403
+
+
+def test_stale_rates_warning_on_dashboard_and_pln_currency(client):
+    login(client)
+    a = client._app_module
+    assert "PLN" in a.CURRENCIES and a.fmt_money(100, "PLN").strip().startswith("zł")
+    assert 'id="rates-warning"' not in client.get("/").get_data(as_text=True)
+    db = _raw_db(client)
+    a.set_setting(db, "rates_updated_on", (datetime.date.today() - datetime.timedelta(days=9)).isoformat())
+    db.commit(); db.close()
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="rates-warning"' in html and "9 дн" in html
+    db = _raw_db(client)
+    db.execute("DELETE FROM settings WHERE key='rate_eur'"); db.commit(); db.close()
+    assert "Не задано курс для EUR" in client.get("/").get_data(as_text=True)
+
+
+def test_old_db_gets_pln_rate_via_migration(client):
+    a = client._app_module
+    db = _raw_db(client)
+    db.execute("DELETE FROM settings WHERE key='rate_pln'"); db.commit()
+    a.migrate_schema(db)
+    assert a.get_setting(db, "rate_pln") == "10.5"
+    db.close()
+
+
+def test_scheduled_backup_runs_once_a_day_and_copies_to_extra_dir(client, tmp_path):
+    a = client._app_module
+    login(client)
+    extra = tmp_path / "usb"
+    r = post(client, "/settings/save", {"form": "backup", "backup_auto": "1", "backup_extra_dir": str(extra)}, follow_redirects=True)
+    assert "копіювання збережено" in r.get_data(as_text=True)
+    first = a.run_scheduled_backup()
+    assert first and os.path.exists(first)
+    assert len(list(extra.glob("crm_backup_*.db"))) == 1
+    assert a.run_scheduled_backup() is None          # другий раз за день - ні
+    db = _raw_db(client)
+    a.set_setting(db, "backup_auto", "0"); a.set_setting(db, "backup_last_on", "2000-01-01"); db.commit(); db.close()
+    assert a.run_scheduled_backup() is None          # вимкнено
+    # копія валідна SQLite з даними
+    check = sqlite3.connect(first)
+    assert check.execute("SELECT COUNT(*) FROM clients").fetchone()[0] > 0
+    check.close()
+
+
+def test_scheduled_backup_extra_dir_failure_is_reported_not_fatal(client, tmp_path):
+    a = client._app_module
+    blocker = tmp_path / "file.txt"
+    blocker.write_text("x")
+    db = _raw_db(client)
+    a.set_setting(db, "backup_extra_dir", str(blocker / "sub")); db.commit()
+    path = a.run_scheduled_backup(db)
+    assert path and os.path.exists(path)
+    assert a.get_setting(db, "backup_last_error")
+    db.close()
+
+
+def test_pdfs_render_cyrillic_with_embedded_unicode_font(client):
+    """Стандартний Helvetica не має кирилиці - раніше в PDF усе українське
+    перетворювалось на 'IIII'. Перевіряємо, що текст справді читається."""
+    pymupdf = pytest.importorskip("pymupdf")
+    login(client)
+    for url, needle in [("/deals/1/proposal.pdf", "Комерційна пропозиція"),
+                        ("/production/1/route-sheet.pdf", "МАРШРУТНИЙ ЛИСТ"),
+                        ("/shift-log/report.pdf", "Змінний журнал")]:
+        r = client.get(url)
+        assert r.status_code == 200, url
+        doc = pymupdf.open(stream=r.data, filetype="pdf")
+        text = doc[0].get_text()
+        assert needle in text, (url, text[:80])
+        fonts = [f[3] for f in doc[0].get_fonts()]
+        assert any("CRMSans" in f or "DejaVu" in f or "Arial" in f for f in fonts), fonts
+
+
+# ---------------------------------------------------------------------------
+# Розширення: каталог деталей, план/факт, закупівля, якість, оплати, повтори, дошка, аудит
+# ---------------------------------------------------------------------------
+
+def _wc_id(db):
+    return db.execute("SELECT id FROM work_centers ORDER BY id").fetchone()["id"]
+
+
+def test_extension_pages_open_for_admin(client):
+    login(client)
+    for path in ["/parts", "/parts/new", "/production/costs", "/warehouse/purchase", "/quality", "/quality/new",
+                 "/payments/overdue", "/clients/reorder", "/production/board", "/audit", "/"]:
+        assert client.get(path).status_code == 200, path
+
+
+def test_parts_catalog_crud_and_new_deal(client):
+    login(client)
+    db = _raw_db(client)
+    cid = db.execute("SELECT id FROM clients ORDER BY id").fetchone()["id"]
+    r = post(client, "/parts/new", {"name": "", "currency": "UAH"})
+    assert "обов" in r.get_data(as_text=True)
+    r = post(client, "/parts/new", {"name": "Вал Ø40", "drawing_no": "VL-40", "client_id": cid, "material": "Сталь 45",
+                                    "last_price": "1200", "currency": "UAH", "routing_text": "Токарна; Фрезерна"})
+    assert r.status_code == 302
+    pid = db.execute("SELECT id FROM parts WHERE name='Вал Ø40'").fetchone()["id"]
+    assert "VL-40" in client.get("/parts?q=VL-40").get_data(as_text=True)
+    assert "Вал Ø40" not in client.get("/parts?q=nomatch").get_data(as_text=True)
+    assert post(client, "/parts/%d/edit" % pid, {"name": "Вал Ø42", "last_price": "-5"}).status_code == 200
+    r = post(client, "/parts/%d/new-deal" % pid)
+    assert r.status_code == 302
+    d = db.execute("SELECT * FROM deals ORDER BY id DESC LIMIT 1").fetchone()
+    assert d["title"] == "Вал Ø40" and d["amount"] == 1200 and d["client_id"] == cid and "Сталь 45" in d["tech_requirements"]
+    post(client, "/parts/%d/delete" % pid)
+    assert db.execute("SELECT COUNT(*) c FROM parts").fetchone()["c"] == 0
+
+
+def test_plan_fact_costs_math(client):
+    login(client)
+    db = _raw_db(client)
+    deal = db.execute("SELECT id FROM deals WHERE stage='production' LIMIT 1").fetchone()
+    wc = _wc_id(db)
+    db.execute("INSERT INTO production_orders (deal_id, quantity, status, created_at) VALUES (?,?,?,?)",
+               (deal["id"], 1, "in_progress", "2026-01-01 08:00:00"))
+    oid = db.execute("SELECT MAX(id) m FROM production_orders").fetchone()["m"]
+    db.execute("""INSERT INTO production_operations (production_order_id, step_order, operation_name, work_center_id,
+                  planned_hours, status, actual_start, actual_end) VALUES (?,?,?,?,?,?,?,?)""",
+               (oid, 1, "Токарна", wc, 4, "done", "2026-01-01 08:00:00", "2026-01-01 13:00:00"))
+    db.execute("""INSERT INTO production_operations (production_order_id, step_order, operation_name, work_center_id,
+                  planned_hours, status) VALUES (?,?,?,?,?,?)""", (oid, 2, "Фрезерна", wc, 6, "waiting"))
+    db.execute("INSERT INTO warehouse_items (sku, name, qty_on_hand, min_qty, unit_cost, currency) VALUES ('X-T','Пруток',100,5,50,'UAH')")
+    item = db.execute("SELECT id FROM warehouse_items WHERE sku='X-T'").fetchone()["id"]
+    db.execute("INSERT INTO warehouse_transactions (item_id, qty_delta, type, reference, created_at) VALUES (?,?,?,?,?)",
+               (item, -3, "out", "Виробниче замовлення №%d: Токарна" % oid, "2026-01-01 09:00:00"))
+    db.commit()
+    html = client.get("/production/costs").get_data(as_text=True)
+    # ціна матеріалів 3*50 = 150, факт 5 год проти 4 плану = +25%
+    assert "+25%" in html
+    assert ">150<" in html.replace(" ", "")
+    # бухгалтер бачить, токар — ні
+    client.get("/logout")
+    login(client, "tokar", "tokar123")
+    assert client.get("/production/costs").status_code in (302, 403)
+
+
+def test_purchase_request_export_and_telegram_fallback(client):
+    login(client)
+    db = _raw_db(client)
+    db.execute("INSERT INTO warehouse_items (sku, name, qty_on_hand, min_qty, unit_cost, currency, unit) VALUES ('LOW-1','Фреза',2,10,100,'UAH','шт')")
+    db.commit()
+    item = db.execute("SELECT id FROM warehouse_items WHERE sku='LOW-1'").fetchone()["id"]
+    assert "Фреза" in client.get("/warehouse/purchase").get_data(as_text=True)
+    r = post(client, "/warehouse/purchase/export", {"item_id": item, "pick_%d" % item: "1", "qty_%d" % item: "18"})
+    assert r.status_code == 200 and r.data[:2] == b"PK"
+    import openpyxl
+    from io import BytesIO
+    ws = openpyxl.load_workbook(BytesIO(r.data)).active
+    assert ws.cell(2, 2).value == "Фреза" and ws.cell(2, 5).value == 18 and ws.cell(2, 8).value == 1800
+    r = post(client, "/warehouse/purchase/export", {})
+    assert r.status_code == 302
+    r = post(client, "/warehouse/purchase/telegram", {"item_id": item, "pick_%d" % item: "1", "qty_%d" % item: "5"},
+             follow_redirects=True)
+    assert "не налаштовані" in r.get_data(as_text=True)
+
+
+def test_quality_validation_stats_and_notify(client, monkeypatch):
+    login(client, "maister", "prod123")
+    sent = []
+    monkeypatch.setattr(client._app_module, "notify_all", lambda t: sent.append(t))
+    db = _raw_db(client)
+    assert "Вкажіть, скільки" in post(client, "/quality/new", {"qty_checked": "0"}).get_data(as_text=True)
+    assert "від 0 до" in post(client, "/quality/new", {"qty_checked": "5", "qty_defect": "9"}).get_data(as_text=True)
+    assert "причину" in post(client, "/quality/new", {"qty_checked": "5", "qty_defect": "1"}).get_data(as_text=True)
+    assert post(client, "/quality/new", {"qty_checked": "20", "qty_defect": "2", "defect_reason": "Розмір",
+                                          "ck_dim": "1", "ck_surf": "1"}).status_code == 302
+    row = db.execute("SELECT * FROM quality_checks").fetchone()
+    assert row["qty_defect"] == 2 and row["checklist"] == "dim,surf"
+    assert any("Брак" in t for t in sent)
+    assert "10.0%" in client.get("/quality").get_data(as_text=True)
+
+
+def test_overdue_payments_dashboard_and_documents(client, monkeypatch):
+    login(client)
+    db = _raw_db(client)
+    deal = db.execute("SELECT id FROM deals LIMIT 1").fetchone()["id"]
+    db.execute("DELETE FROM payments")
+    db.execute("INSERT INTO payments (deal_id, kind, amount, currency, status, due_date, created_at) VALUES (?,?,?,?,?,?,?)",
+               (deal, "prepayment", 1000, "UAH", "pending", "2020-01-01", "2020-01-01 00:00:00"))
+    db.execute("INSERT INTO payments (deal_id, kind, amount, currency, status, due_date, created_at) VALUES (?,?,?,?,?,?,?)",
+               (deal, "balance", 500, "UAH", "paid", "2020-01-01", "2020-01-01 00:00:00"))
+    db.execute("INSERT INTO payments (deal_id, kind, amount, currency, status, due_date, created_at) VALUES (?,?,?,?,?,?,?)",
+               (deal, "final", 700, "UAH", "pending", "2999-01-01", "2020-01-01 00:00:00"))
+    db.commit()
+    html = client.get("/payments/overdue").get_data(as_text=True)
+    assert "1000" in html.replace(" ", "").replace("\xa0", "") or "1 000" in html
+    assert html.count("Рахунок</a>") == 1
+    assert 'id="overdue-card"' in client.get("/").get_data(as_text=True)
+    for url in (f"/deals/{deal}/invoice.pdf", f"/deals/{deal}/act.pdf"):
+        r = client.get(url)
+        assert r.status_code == 200 and r.data[:4] == b"%PDF"
+    assert client.get("/deals/99999/invoice.pdf").status_code == 404
+    # щоденне повідомлення — один раз
+    sent = []
+    monkeypatch.setattr(client._app_module, "notify_all", lambda t: sent.append(t))
+    assert client._app_module.send_overdue_reminder() is True
+    assert client._app_module.send_overdue_reminder() is False
+    assert len(sent) == 1 and "Прострочені" in sent[0]
+
+
+def test_reorder_candidates_and_task(client):
+    login(client)
+    db = _raw_db(client)
+    cid = db.execute("SELECT id FROM clients ORDER BY id").fetchone()["id"]
+    db.execute("DELETE FROM deals WHERE client_id=?", (cid,))
+    db.execute("""INSERT INTO deals (title, client_id, stage, amount, currency, closed_at, created_at, updated_at)
+                  VALUES ('Стара угода',?,?,100,'UAH',?,?,?)""", (cid, "won", "2020-01-01 00:00:00", "2020-01-01", "2020-01-01"))
+    db.commit()
+    assert "Стара угода" not in client.get("/clients/reorder").get_data(as_text=True)  # показуємо клієнта, не угоду
+    name = db.execute("SELECT name FROM clients WHERE id=?", (cid,)).fetchone()["name"]
+    assert name in client.get("/clients/reorder").get_data(as_text=True)
+    post(client, "/clients/%d/reorder-task" % cid)
+    t = db.execute("SELECT * FROM tasks WHERE client_id=? ORDER BY id DESC", (cid,)).fetchone()
+    assert "повторне замовлення" in t["title"]
+    # відкрита угода прибирає клієнта зі списку
+    db.execute("""INSERT INTO deals (title, client_id, stage, amount, currency, created_at, updated_at)
+                  VALUES ('Нова',?,?,1,'UAH','2026-01-01','2026-01-01')""", (cid, "lead"))
+    db.commit()
+    assert name not in client.get("/clients/reorder").get_data(as_text=True).split("<table")[-1]
+
+
+def test_load_board_move_rules(client):
+    login(client)
+    db = _raw_db(client)
+    deal = db.execute("SELECT id FROM deals LIMIT 1").fetchone()["id"]
+    wcs = [r["id"] for r in db.execute("SELECT id FROM work_centers ORDER BY id")]
+    db.execute("INSERT INTO production_orders (deal_id, quantity, status, created_at) VALUES (?,?,?,?)",
+               (deal, 1, "planned", "2026-01-01 08:00:00"))
+    oid = db.execute("SELECT MAX(id) m FROM production_orders").fetchone()["m"]
+    for i, st in enumerate(("waiting", "done")):
+        db.execute("""INSERT INTO production_operations (production_order_id, step_order, operation_name, work_center_id,
+                      planned_hours, status, planned_start, planned_end) VALUES (?,?,?,?,?,?,?,?)""",
+                   (oid, i + 1, f"Оп{i}", wcs[0], 2, st, "2026-10-07 09:00:00", "2026-10-07 11:00:00"))
+    db.commit()
+    op_wait, op_done = [r["id"] for r in db.execute("SELECT id FROM production_operations WHERE production_order_id=? ORDER BY id", (oid,))]
+    assert "Оп0" in client.get("/production/board?start=2026-10-07").get_data(as_text=True)
+    hdr = {"X-Requested-With": "fetch"}
+    tok = get_csrf_token(client)
+    r = client.post(f"/production/operations/{op_wait}/move", data={"date": "2026-10-09", "work_center_id": wcs[-1]},
+                    headers={**hdr, "X-CSRF-Token": tok})
+    assert r.get_json()["ok"] is True
+    row = db.execute("SELECT * FROM production_operations WHERE id=?", (op_wait,)).fetchone()
+    assert row["planned_start"] == "2026-10-09 09:00:00" and row["planned_end"] == "2026-10-09 11:00:00" and row["work_center_id"] == wcs[-1]
+    assert client.post(f"/production/operations/{op_done}/move", data={"date": "2026-10-09"},
+                       headers={**hdr, "X-CSRF-Token": tok}).status_code == 400
+    assert client.post(f"/production/operations/{op_wait}/move", data={"date": "не-дата"},
+                       headers={**hdr, "X-CSRF-Token": tok}).status_code == 400
+    client.post(f"/production/operations/{op_wait}/move", data={"date": "2026-10-20"})  # без CSRF — відхиляється
+    assert db.execute("SELECT planned_start FROM production_operations WHERE id=?", (op_wait,)).fetchone()[0].startswith("2026-10-09")
+    client.get("/logout")
+    login(client, "sklad", "sklad123")
+    assert client.get("/production/board").status_code in (302, 403)
+
+
+def test_audit_log_records_and_masks(client):
+    login(client)
+    post(client, "/parts/new", {"name": "Аудит-деталь", "currency": "UAH"})
+    db = _raw_db(client)
+    row = db.execute("SELECT * FROM audit_log WHERE endpoint='parts_new' ORDER BY id DESC").fetchone()
+    assert row and row["username"] == "admin" and "Аудит-деталь" in row["detail"] and row["result"] == "ok"
+    assert "_csrf" not in row["detail"]
+    # паролі не потрапляють у журнал
+    post(client, "/users/new", {"username": "zz", "password": "SuperSecret1", "full_name": "Z", "role": "sales"})
+    assert not db.execute("SELECT 1 FROM audit_log WHERE detail LIKE '%SuperSecret1%'").fetchone()
+    assert "Аудит-деталь" in client.get("/audit").get_data(as_text=True)
+    assert "Аудит-деталь" not in client.get("/audit?q=немає-такого").get_data(as_text=True)
+    client.get("/logout")
+    login(client, "oleh", "manager123")
+    assert client.get("/audit").status_code in (302, 403)
+
+
+def test_milling_operator_has_own_mobile_terminal(client):
+    """Фрезерувальник працює з телефона так само, як токар: свій термінал,
+    дії лише на своїй (фрезерній) дільниці, на токарній — тільки перегляд."""
+    login(client, "frezer", "frezer123")
+    r = client.get("/production", follow_redirects=False)
+    assert r.status_code == 302 and "/work-centers/3/terminal" in r.location
+    own = client.get("/work-centers/3/terminal").get_data(as_text=True)
+    assert "лише перегляд" not in own.lower()
+    other = client.get("/work-centers/1/terminal").get_data(as_text=True)
+    assert "лише перегляд" in other.lower() and "ПОЧАТИ" not in other
+    db = _raw_db(client)
+    op = db.execute("SELECT id FROM production_operations WHERE work_center_id=1 AND status='waiting' LIMIT 1").fetchone()
+    if op:
+        r = post(client, f"/production/operations/{op['id']}/advance", follow_redirects=True)
+        assert "лише на своїй дільниці" in r.get_data(as_text=True).lower()
+        assert db.execute("SELECT status FROM production_operations WHERE id=?", (op["id"],)).fetchone()[0] == "waiting"
+    # термінал адаптований під телефон: переглядова область і великі кнопки
+    assert 'name="viewport"' in own
