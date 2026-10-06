@@ -96,6 +96,41 @@ def _get_or_create_secret_key():
     return new_key
 
 
+# ---------------------------------------------------------------------------
+# Шрифт для PDF (кирилиця)
+# ---------------------------------------------------------------------------
+# Стандартний Helvetica у reportlab не має кириличних гліфів: усі українські
+# тексти в PDF виходили б рядками однакових "I". Тому реєструємо TTF-шрифт з
+# кирилицею: DejaVu Sans з matplotlib (він іде в комплекті з .exe), інакше
+# Arial з Windows чи DejaVu з Linux.
+
+def _register_pdf_fonts():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    candidates = []
+    try:
+        import matplotlib
+        base = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+        candidates.append((os.path.join(base, "DejaVuSans.ttf"), os.path.join(base, "DejaVuSans-Bold.ttf")))
+    except Exception:
+        pass
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    candidates.append((os.path.join(windir, "Fonts", "arial.ttf"), os.path.join(windir, "Fonts", "arialbd.ttf")))
+    candidates.append(("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"))
+    for regular, bold in candidates:
+        if os.path.exists(regular) and os.path.exists(bold):
+            try:
+                pdfmetrics.registerFont(TTFont("CRMSans", regular))
+                pdfmetrics.registerFont(TTFont("CRMSans-Bold", bold))
+                return "CRMSans", "CRMSans-Bold"
+            except Exception:
+                continue
+    return "Helvetica", "Helvetica-Bold"
+
+
+PDF_FONT, PDF_FONT_BOLD = _register_pdf_fonts()
+
+
 app = Flask(__name__)
 app.secret_key = _get_or_create_secret_key()
 MAX_UPLOAD_SIZE_MB = 25
@@ -206,7 +241,7 @@ MACHINE_CATEGORIES = [
 ]
 
 PRIORITIES = [("low", "Низький"), ("medium", "Середній"), ("high", "Високий")]
-CURRENCIES = ["UAH", "USD", "EUR"]
+CURRENCIES = ["UAH", "USD", "EUR", "PLN"]
 LEAD_SOURCES = ["Виставка", "Сайт / заявка", "Холодний дзвінок", "Рекомендація",
                 "Постійний клієнт", "Тендер", "Партнер / дилер"]
 TASK_TYPES = [("call", "Дзвінок"), ("meeting", "Зустріч"), ("email", "Лист"),
@@ -443,7 +478,10 @@ CREATE TABLE IF NOT EXISTS work_centers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     type TEXT,
-    capacity_hours_per_day REAL NOT NULL DEFAULT 8
+    capacity_hours_per_day REAL NOT NULL DEFAULT 8,
+    mtc_host TEXT,
+    mtc_port INTEGER DEFAULT 8082,
+    mtc_enabled INTEGER DEFAULT 0
 );
 
 -- Змінний журнал виробництва: окремий, незалежний від виробничих замовлень
@@ -547,6 +585,54 @@ CREATE TABLE IF NOT EXISTS service_ticket_parts (
     qty REAL NOT NULL DEFAULT 1,
     FOREIGN KEY(ticket_id) REFERENCES service_tickets(id),
     FOREIGN KEY(item_id) REFERENCES warehouse_items(id)
+);
+
+CREATE TABLE IF NOT EXISTS parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    drawing_no TEXT,
+    client_id INTEGER,
+    material TEXT,
+    routing_text TEXT,
+    last_price REAL,
+    currency TEXT DEFAULT 'UAH',
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS quality_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    production_order_id INTEGER,
+    work_center_id INTEGER,
+    inspector_user_id INTEGER,
+    qty_checked INTEGER NOT NULL DEFAULT 0,
+    qty_defect INTEGER NOT NULL DEFAULT 0,
+    defect_reason TEXT,
+    checklist TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    user_id INTEGER,
+    username TEXT,
+    method TEXT,
+    endpoint TEXT,
+    path TEXT,
+    label TEXT,
+    detail TEXT,
+    result TEXT
+);
+
+CREATE TABLE IF NOT EXISTS rates_history (
+    recorded_on TEXT PRIMARY KEY,
+    usd REAL,
+    eur REAL,
+    pln REAL,
+    source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS machine_telemetry (
@@ -725,6 +811,8 @@ def migrate_schema(db):
             ("program_name", "TEXT"), ("mode", "TEXT"), ("source", "TEXT DEFAULT 'generic'"),
         ],
         "users": [("work_center_id", "INTEGER")],
+        "work_centers": [("mtc_host", "TEXT"), ("mtc_port", "INTEGER DEFAULT 8082"),
+                         ("mtc_enabled", "INTEGER DEFAULT 0")],
     }
     for table, columns in expected_columns.items():
         table_exists = db.execute(
@@ -736,6 +824,9 @@ def migrate_schema(db):
         for col_name, col_def in columns:
             if col_name not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
+        # стара база без злотого: додаємо стартовий курс (його можна оновити з НБУ)
+        db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rate_pln', '10.5')")
     db.commit()
 
 
@@ -768,6 +859,10 @@ def seed_data(db):
     cur.execute(
         "INSERT INTO users (username, password_hash, full_name, role, work_center_id) VALUES (?,?,?,?,?)",
         ("tokar", generate_password_hash("tokar123"), "Василь Токарук", "production", 1),
+    )
+    cur.execute(
+        "INSERT INTO users (username, password_hash, full_name, role, work_center_id) VALUES (?,?,?,?,?)",
+        ("frezer", generate_password_hash("frezer123"), "Андрій Фрезеренко", "production", 3),
     )
     cur.execute(
         "INSERT INTO users (username, password_hash, full_name, role) VALUES (?,?,?,?)",
@@ -1217,6 +1312,7 @@ def seed_data(db):
     cur.execute("INSERT INTO settings (key, value) VALUES (?,?)", ("api_key", _secrets.token_hex(16)))
     cur.execute("INSERT INTO settings (key, value) VALUES (?,?)", ("rate_usd", "41.5"))
     cur.execute("INSERT INTO settings (key, value) VALUES (?,?)", ("rate_eur", "45.0"))
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)", ("rate_pln", "10.5"))
     cur.execute("INSERT INTO settings (key, value) VALUES (?,?)", ("webhook_url", ""))
 
     db.commit()
@@ -1306,11 +1402,77 @@ def can_edit_shift_log(user, log_row):
 def fmt_money(amount, currency="USD"):
     if amount is None or not isinstance(amount, (int, float)):
         amount = 0
-    symbols = {"USD": "$", "EUR": "€", "UAH": "₴"}
+    symbols = {"USD": "$", "EUR": "€", "UAH": "₴", "PLN": "zł "}
     return "{}{:,.0f}".format(symbols.get(currency, ""), amount).replace(",", " ")
 
 
 app.jinja_env.filters["money"] = fmt_money
+
+
+def split_operations_text(text):
+    """Розбиває текст технологічного опису (від ШІ чи збережений в історії)
+    на окремі пункти, щоб його можна було показати як список етапів, а не
+    суцільною стіною тексту. Повертає список словників:
+        {"kind": "step", "num": "1", "title": "...", "body": "..."}  - нумерований етап
+        {"kind": "note", "body": "..."}                              - примітка/припущення чи вільний рядок
+
+    Працює і з новим форматом (кожен етап з нового рядка: «1. Заготовка — ...»),
+    і зі старими записами, де все було одним абзацом: вбудовану нумерацію
+    «1) ... 2) ...» або «1. ... 2. ...» розрізає по номерах, а якщо нумерації
+    немає зовсім - по реченнях."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Єдиний рядок з вбудованою нумерацією -> розкладаємо по рядках.
+    if "\n" not in text:
+        text = _re.sub(r"\s+(?=\d{1,2}[.)]\s+[^\d\s])", "\n", text)
+    # Досі один рядок - ріжемо за реченнями (старі записи без структури).
+    if "\n" not in text:
+        text = _re.sub(r"(?<=[.!?])\s+(?=[А-ЯІЇЄҐA-Z])", "\n", text)
+
+    items = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _re.match(r"^(\d{1,2})[.)]\s*(.+)$", line)
+        if m:
+            num, rest = m.group(1), m.group(2).strip()
+            # Назва етапу - те, що до першого « — », « - » чи «:» (якщо воно коротке).
+            title, body = rest, ""
+            sm = _re.match(r"^(.{3,60}?)\s*(?:—|–|-|:)\s+(.+)$", rest)
+            if sm:
+                title, body = sm.group(1).strip().rstrip(":"), sm.group(2).strip()
+            items.append({"kind": "step", "num": num, "title": title, "body": body})
+        else:
+            items.append({"kind": "note", "body": line})
+    return items
+
+
+def render_operations_html(text):
+    """Jinja-фільтр: безпечно (з екрануванням HTML) малює технологічний опис
+    як акуратний список етапів - номер, жирна назва, нижче пояснення."""
+    from markupsafe import Markup, escape
+    items = split_operations_text(text)
+    if not items:
+        return Markup("")
+    parts = ['<div class="ops-list">']
+    for it in items:
+        if it["kind"] == "step":
+            body_html = f'<div class="ops-body">{escape(it["body"])}</div>' if it["body"] else ""
+            parts.append(
+                '<div class="ops-step">'
+                f'<div class="ops-num">{escape(it["num"])}</div>'
+                f'<div class="ops-text"><div class="ops-title">{escape(it["title"])}</div>{body_html}</div>'
+                '</div>'
+            )
+        else:
+            parts.append(f'<div class="ops-note">{escape(it["body"])}</div>')
+    parts.append("</div>")
+    return Markup("".join(parts))
+
+
+app.jinja_env.filters["ops_html"] = render_operations_html
 
 
 def is_admin():
@@ -1585,6 +1747,16 @@ def send_telegram_notification(text):
         return False, str(e)
 
 
+def notify_event(text):
+    """Сповіщення про події (нова угода, зміна етапу): вмикається в
+    «Налаштуваннях». Збої каналів не ламають основну дію."""
+    try:
+        if get_setting(get_db(), "notify_events", "1") == "1":
+            notify_all(text)
+    except Exception:
+        pass
+
+
 def notify_all(text):
     """Надсилає сповіщення в усі налаштовані канали одразу (вебхук + Telegram).
     Використовується для критичних подій: аварії обладнання, низький залишок."""
@@ -1612,7 +1784,10 @@ AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог ток
 
 Але якщо опису мінімально НЕ вистачає для самого розрахунку - тобто ти не можеш визначити ні матеріал (з чого деталь - сталь, алюміній, нержавійка тощо), ні розмір/вагу заготовки (немає ні розмірів у тексті, ні зображення, з якого їх видно), ні які операції взагалі потрібні (просто "деталь" без жодного опису форми чи процесу) - НЕ вигадуй ці критичні дані з нуля і НЕ вважай типове значення прийнятним заміною. Замість цього виклич інструмент ask_clarifying_question і постав ОДНЕ конкретне, вузьке питання українською, яке справді закриє прогалину (напр. "З якого металу деталь і які її приблизні габарити (діаметр/довжина або довжина×ширина×висота)?"). Питай лише тоді, коли без відповіді оцінка була б беззмістовною - якщо є хоч якісь орієнтири (навіть неповні), користуйся ними та розумними припущеннями замість питання.
 
-У полі operations_description дай РОЗГОРНУТИЙ, детальний опис технологічного процесу - це має читатись як справжня технологічна карта, а не коротка анотація. Структуруй його по етапах, кожен окремим реченням чи групою речень, і для КОЖНОЇ операції механообробки явно назви верстат з парку вище:
+У полі operations_description дай РОЗГОРНУТИЙ, детальний опис технологічного процесу - це має читатись як справжня технологічна карта, а не коротка анотація. ФОРМАТ ВАЖЛИВИЙ: кожен етап пиши з НОВОГО РЯДКА (символ переносу рядка між етапами), у вигляді «N. Назва етапу — пояснення, верстат, орієнтовний час», без загального вступу і без суцільного абзацу. Приклад двох рядків:
+1. Заготовка — пруток Ø60 мм, сталь 45, довжина 120 мм; обрано пруток, бо деталь — тіло обертання. Час підготовки ~10 хв.
+2. Чорнове точіння — зовнішні поверхні з припуском 0,5 мм на токарному верстаті з ЧПУ; ~25 хв.
+Якщо є припущення чи застереження (типові ціни, розбіжність між текстом і кресленням) - винеси їх в окремий останній рядок, що починається зі слова «Припущення:». Структуруй по етапах і для КОЖНОЇ операції механообробки явно назви верстат з парку вище:
 1) заготовка - з чого і якого розміру (пруток Ø.. мм, поковка, лита заготовка) і чому саме така;
 2) базування/закріплення заготовки (патрон, цанга, лещата, оснастка) на конкретному верстаті;
 3) чорнове точіння (якщо є) - які поверхні, припуск, на якому верстаті;
@@ -1825,7 +2000,7 @@ AI_CALC_COST_ESTIMATE_TOOL = {
             "margin_pct": {"type": "number", "description": "Рекомендована націнка, %"},
             "operations_description": {
                 "type": "string",
-                "description": "РОЗГОРНУТИЙ технологічний маршрут українською, мінімум 10-15 речень, з назвою конкретного верстата на кожній операції",
+                "description": "РОЗГОРНУТИЙ технологічний маршрут українською: кожен етап з нового рядка у форматі «N. Назва етапу — пояснення, верстат, час», мінімум 10-15 речень загалом, з назвою конкретного верстата на кожній операції; припущення - окремим останнім рядком «Припущення: ...»",
             },
         },
         "required": AI_CALC_REQUIRED_PARAMS,
@@ -2182,13 +2357,120 @@ def block_viewer_writes():
         return redirect(request.referrer or url_for("dashboard"))
 
 
-def to_uah(db, amount, currency):
+RATE_CURRENCIES = ("usd", "eur", "pln")
+
+
+def _positive_float(value):
+    try:
+        v = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def rate_for(db, currency, on_date=None):
+    """Курс валюти до UAH. З on_date ('YYYY-MM-DD') повертає курс, що діяв на
+    ту дату (з історії), щоб старі звіти не "пливли" після зміни курсу.
+    None — якщо курсу немає взагалі."""
+    cur = (currency or "UAH").lower()
+    if cur == "uah":
+        return 1.0
+    if cur not in RATE_CURRENCIES:
+        return None
+    if on_date:
+        row = db.execute(
+            f"SELECT {cur} AS r FROM rates_history WHERE recorded_on<=? AND {cur} IS NOT NULL ORDER BY recorded_on DESC LIMIT 1",
+            (str(on_date)[:10],),
+        ).fetchone()
+        if row is None:  # дата раніше за всю історію - беремо найстаріший запис
+            row = db.execute(
+                f"SELECT {cur} AS r FROM rates_history WHERE {cur} IS NOT NULL ORDER BY recorded_on LIMIT 1"
+            ).fetchone()
+        if row and row["r"]:
+            return row["r"]
+    return _positive_float(get_setting(db, f"rate_{cur}", ""))
+
+
+def to_uah(db, amount, currency, on_date=None):
     if not amount:
         return 0
-    if currency == "UAH":
+    if currency == "UAH" or not currency:
         return amount
-    rate = float(get_setting(db, f"rate_{currency.lower()}", "1") or 1)
+    rate = rate_for(db, currency, on_date)
+    if rate is None:
+        rate = 1.0  # курсу немає: сума не втрачається, а на дашборді показується попередження (rates_warning)
     return amount * rate
+
+
+def save_rates(db, usd=None, eur=None, pln=None, source="manual"):
+    """Зберігає курси: оновлює поточні налаштування і додає запис в історію
+    на сьогодні. Невалідні/невід'ємні значення ігноруються. Повертає список
+    прийнятих валют."""
+    new = {"usd": _positive_float(usd), "eur": _positive_float(eur), "pln": _positive_float(pln)}
+    accepted = [k for k, v in new.items() if v]
+    if not accepted:
+        return []
+    if db.execute("SELECT 1 FROM rates_history LIMIT 1").fetchone() is None:
+        # перший запис в історії: зберігаємо ПОПЕРЕДНІ курси як базові, щоб
+        # давніші операції лишились за старим курсом
+        old = {k: _positive_float(get_setting(db, f"rate_{k}", "")) for k in RATE_CURRENCIES}
+        if any(old.values()):
+            db.execute("INSERT OR IGNORE INTO rates_history (recorded_on, usd, eur, pln, source) VALUES ('1900-01-01',?,?,?,'baseline')",
+                       (old["usd"], old["eur"], old["pln"]))
+    today = today_str()
+    row = db.execute("SELECT usd, eur, pln FROM rates_history WHERE recorded_on=?", (today,)).fetchone()
+    merged = {k: (new[k] or (row[k] if row else None) or _positive_float(get_setting(db, f"rate_{k}", ""))) for k in RATE_CURRENCIES}
+    db.execute("INSERT OR REPLACE INTO rates_history (recorded_on, usd, eur, pln, source) VALUES (?,?,?,?,?)",
+               (today, merged["usd"], merged["eur"], merged["pln"], source))
+    for k in accepted:
+        set_setting(db, f"rate_{k}", str(new[k]))
+    set_setting(db, "rates_updated_on", today)
+    set_setting(db, "rates_source", source)
+    db.commit()
+    return accepted
+
+
+def fetch_nbu_rates(timeout=8):
+    """Офіційні курси НБУ (відкритий API). Повертає {'usd','eur','pln'}."""
+    import urllib.request
+    import json as _json
+    url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    out = {}
+    for row in data:
+        cc = str(row.get("cc", "")).lower()
+        if cc in RATE_CURRENCIES and row.get("rate"):
+            out[cc] = float(row["rate"])
+    if not out:
+        raise ValueError("НБУ не повернув жодного курсу")
+    return out
+
+
+def update_rates_from_nbu(db):
+    rates = fetch_nbu_rates()
+    return save_rates(db, rates.get("usd"), rates.get("eur"), rates.get("pln"), source="НБУ")
+
+
+def rates_warning():
+    """Текст попередження про курси або None: немає курсу для валюти, або він
+    давно не оновлювався."""
+    try:
+        db = get_db()
+        missing = [c.upper() for c in RATE_CURRENCIES if _positive_float(get_setting(db, f"rate_{c}", "")) is None]
+        if missing:
+            return "Не задано курс для " + ", ".join(missing) + ": суми в цій валюті рахуються некоректно."
+        updated = get_setting(db, "rates_updated_on", "")
+        if updated:
+            age = (datetime.date.today() - datetime.date.fromisoformat(updated)).days
+            if age >= 7:
+                return f"Курси валют не оновлювались {age} дн. Оновіть їх у «Налаштуваннях»."
+    except Exception:
+        return None
+    return None
+
+
+app.jinja_env.globals["rates_warning"] = rates_warning
 
 
 # ---------------------------------------------------------------------------
@@ -2749,6 +3031,36 @@ a{color:inherit;text-decoration:none;}
 .grid-3{grid-template-columns:repeat(3,1fr);}
 .grid-2{grid-template-columns:2fr 1fr;}
 @media(max-width:1100px){.grid-4{grid-template-columns:repeat(2,1fr);} .grid-2{grid-template-columns:1fr;}}
+.nav-toggle,.nav-overlay{display:none;}
+/* Телефон/вузький екран: меню ховається в висувну шухляду (кнопка ☰), а контент
+   займає всю ширину - замість 230px сайдбару, що з'їдав би пів екрана. */
+@media(max-width:820px){
+  .sidebar{position:fixed; left:0; top:0; height:100vh; width:260px; z-index:40;
+    transform:translateX(-105%); transition:transform .2s ease; overflow-y:auto;}
+  body.nav-open .sidebar{transform:none;}
+  .nav-overlay{position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:35;}
+  body.nav-open .nav-overlay{display:block;}
+  .nav-toggle{display:inline-flex; align-items:center; justify-content:center; width:38px; height:38px;
+    flex:0 0 38px; font-size:20px; background:var(--panel); border:1px solid var(--border);
+    color:var(--text); border-radius:8px; cursor:pointer; margin-right:10px;}
+  .nav a{padding:13px 12px; font-size:14.5px;}
+  .topbar{padding:10px 12px; gap:8px; flex-wrap:wrap;}
+  .topbar h1{font-size:17px;}
+  .topbar .sub{display:none;}
+  .topbar-right{flex:1 1 100%;}
+  .search-box{flex:1; min-width:0;}
+  .search-box input{width:100%; box-sizing:border-box;}
+  .content{padding:14px 12px 60px;}
+  .grid-4,.grid-3,.grid-2,.form-grid{grid-template-columns:1fr;}
+  .grid[style*="repeat(5"]{grid-template-columns:repeat(2,1fr) !important;}
+  .card-pad{padding:14px;}
+  .filters,.filters form{width:100%; flex-wrap:wrap;}
+  .filters select,.filters input{min-width:0 !important; flex:1 1 140px;}
+  .toolbar .btn{flex:1 1 auto; justify-content:center;}
+  .reminders-dropdown{position:fixed; top:56px; left:8px; right:8px; width:auto;}
+  .kanban-col{min-width:78vw; max-width:78vw;}
+  .content table{font-size:12.5px;}
+}
 .kpi{padding:18px 20px;}
 .kpi .label{color:var(--text-dim); font-size:12.5px; text-transform:uppercase; letter-spacing:.5px;}
 .kpi-value{font-size:28px; font-weight:700; margin-top:4px;}
@@ -2804,6 +3116,13 @@ input:focus,select:focus,textarea:focus{outline:none; border-color:var(--accent-
 .deal-card .amount{font-weight:700; color:var(--accent-2);}
 .kanban-col.dragover{outline:2px dashed var(--accent); outline-offset:-4px;}
 .timeline{border-left:2px solid var(--border); margin-left:8px; padding-left:18px;}
+.ops-list{display:flex; flex-direction:column; gap:10px;}
+.ops-step{display:flex; gap:12px; align-items:flex-start; padding:10px 12px; border:1px solid var(--border); border-radius:10px; background:rgba(255,255,255,.02);}
+.ops-num{flex:0 0 26px; height:26px; border-radius:50%; background:var(--accent, #e2650a); color:#fff; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center;}
+.ops-text{flex:1; min-width:0;}
+.ops-title{font-weight:700; font-size:13px; line-height:1.35;}
+.ops-body{font-size:12.5px; line-height:1.55; color:var(--text-dim); margin-top:3px;}
+.ops-note{font-size:12px; line-height:1.5; padding:8px 12px; border-left:3px solid var(--accent-2); background:rgba(255,255,255,.03); border-radius:4px;}
 .timeline-item{position:relative; padding-bottom:18px;}
 .timeline-item::before{content:""; position:absolute; left:-24px; top:4px; width:10px; height:10px; border-radius:50%; background:var(--accent-2); border:2px solid var(--bg-soft);}
 .timeline-item .when{font-size:11.5px; color:var(--text-dim);}
@@ -2818,7 +3137,7 @@ input:focus,select:focus,textarea:focus{outline:none; border-color:var(--accent-
 .checkline{display:flex; align-items:center; gap:8px;}
 .task-row.done .task-title{text-decoration:line-through; color:var(--text-dim);}
 .login-wrap{min-height:100vh; display:flex; align-items:center; justify-content:center; background:radial-gradient(circle at 50% 20%, #2a2e35, #101216);}
-.login-card{width:340px; padding:34px 30px; background:var(--metal); border:1px solid var(--border); border-radius:14px; box-shadow:0 20px 50px rgba(0,0,0,.5);}
+.login-card{width:340px; max-width:92vw; box-sizing:border-box; padding:34px 30px; background:var(--metal); border:1px solid var(--border); border-radius:14px; box-shadow:0 20px 50px rgba(0,0,0,.5);}
 .login-card h1{text-align:center; margin-bottom:4px; letter-spacing:1px;}
 .login-card .sub{text-align:center; color:var(--text-dim); font-size:12.5px; margin-bottom:22px;}
 .hint{font-size:11.5px; color:var(--text-dim); margin-top:14px; text-align:center;}
@@ -2833,6 +3152,7 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
 <body>
 {% if current_user %}
 <div class="layout">
+  <div class="nav-overlay" onclick="document.body.classList.remove('nav-open')"></div>
   <aside class="sidebar">
     <div class="brand"><span class="gear">⚙</span> Оснастка-Маркет</div>
     <nav class="nav">
@@ -2844,23 +3164,39 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       <a href="{{ url_for('tasks_list') }}" class="{{ 'active' if active=='tasks' }}"><span class="icon">☑</span> Задачі</a>
       <a href="{{ url_for('calendar_view') }}" class="{{ 'active' if active=='calendar' }}"><span class="icon">📅</span> Календар</a>
       {% endif %}
+      {% if current_user['role'] in ('admin','sales') %}
+      <a href="{{ url_for('clients_reorder') }}" class="{{ 'active' if active=='reorder' }}"><span class="icon">↻</span> Повторні замовлення{% if reorder_count() %} <span class="badge badge-high">{{ reorder_count() }}</span>{% endif %}</a>
+      {% endif %}
+      {% if current_user['role'] in ('admin','sales','production','viewer') %}
+      <a href="{{ url_for('parts_list') }}" class="{{ 'active' if active=='parts' }}"><span class="icon">⬡</span> Каталог деталей</a>
+      {% endif %}
       <a href="{{ url_for('machines_list') }}" class="{{ 'active' if active=='machines' }}"><span class="icon">⬢</span> Наше обладнання</a>
       {% if current_user['role'] in ('admin','production','sales','viewer') %}
       <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробництво' }}</a>
+      {% endif %}
+      {% if current_user['role'] in ('admin','production','sales','viewer') %}
+      <a href="{{ url_for('production_board') }}" class="{{ 'active' if active=='board' }}"><span class="icon">▦</span> Завантаження верстатів</a>
+      <a href="{{ url_for('quality_list') }}" class="{{ 'active' if active=='quality' }}"><span class="icon">✔</span> Контроль якості</a>
+      {% endif %}
+      {% if current_user['role'] in ('admin','accountant','sales') %}
+      <a href="{{ url_for('production_costs') }}" class="{{ 'active' if active=='costs' }}"><span class="icon">⚖</span> План / факт</a>
       {% endif %}
       {% if current_user['role'] in ('admin','production') %}
       <a href="{{ url_for('shift_log_list') }}" class="{{ 'active' if active=='shift_log' }}"><span class="icon">📋</span> Змінний журнал</a>
       {% endif %}
       {% if current_user['role'] in ('admin','warehouse','production','viewer') %}
       <a href="{{ url_for('warehouse_list') }}" class="{{ 'active' if active=='warehouse' }}"><span class="icon">▤</span> Склад</a>
+      <a href="{{ url_for('purchase_request') }}" class="{{ 'active' if active=='purchase' }}"><span class="icon">🛒</span> Заявка на закупівлю</a>
       {% endif %}
       {% if current_user['role'] in ('admin','service','viewer') %}
       <a href="{{ url_for('service_list') }}" class="{{ 'active' if active=='service' }}"><span class="icon">✚</span> Рекламації та доробки</a>
       {% endif %}
       {% if current_user['role'] in ('admin','accountant') %}
       <a href="{{ url_for('finance_view') }}" class="{{ 'active' if active=='finance' }}"><span class="icon">💰</span> Фінанси</a>
+      <a href="{{ url_for('payments_overdue') }}" class="{{ 'active' if active=='overdue' }}"><span class="icon">⏰</span> Прострочені оплати{% if overdue_summary().count %} <span class="badge badge-high">{{ overdue_summary().count }}</span>{% endif %}</a>
       {% endif %}
       {% if current_user['role']=='admin' %}
+      <a href="{{ url_for('audit_log_view') }}" class="{{ 'active' if active=='audit' }}"><span class="icon">☰</span> Журнал змін</a>
       <a href="{{ url_for('users_list') }}" class="{{ 'active' if active=='users' }}"><span class="icon">☺</span> Користувачі</a>
       <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' }}"><span class="icon">⚒</span> Налаштування</a>
       {% endif %}
@@ -2918,11 +3254,14 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
   </script>
   <div class="main">
     <div class="topbar">
-      <div>
-        <h1>{% block heading %}{% endblock %}</h1>
-        <div class="sub">{% block subheading %}{% endblock %}</div>
+      <div style="display:flex; align-items:center; min-width:0;">
+        <button type="button" class="nav-toggle" id="nav-toggle" aria-label="Меню" onclick="document.body.classList.toggle('nav-open')">☰</button>
+        <div>
+          <h1>{% block heading %}{% endblock %}</h1>
+          <div class="sub">{% block subheading %}{% endblock %}</div>
+        </div>
       </div>
-      <div style="display:flex; align-items:center; gap:14px;">
+      <div class="topbar-right" style="display:flex; align-items:center; gap:14px;">
         <div style="position:relative;">
           <button type="button" id="reminders-toggle-btn" onclick="document.getElementById('reminders-dropdown').classList.toggle('open')"
                   style="background:none; border:none; cursor:pointer; font-size:20px; color:var(--text); position:relative; padding:4px;">
@@ -2944,6 +3283,12 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       </div>
     </div>
     <div class="content">
+      {% if session.get('default_password') %}
+      <div class="flash flash-error" id="default-password-warning">
+        ⚠️ Ви користуєтесь типовим демо-паролем. Змініть його, поки CRM доступна з інших комп'ютерів:
+        <a href="{{ url_for('my_profile') }}" style="text-decoration:underline; font-weight:700;">змінити пароль</a>
+      </div>
+      {% endif %}
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% for category, msg in messages %}
           <div class="flash flash-{{ category }}">{{ msg }}</div>
@@ -2997,6 +3342,15 @@ DASHBOARD_HTML = """
 {% block heading %}Дашборд{% endblock %}
 {% block subheading %}Загальна картина по замовленнях на металообробку · зведені суми — в грн за курсом із «Налаштувань»{% endblock %}
 {% block content %}
+{% if current_user['role'] in ('admin','accountant') and rates_warning() %}
+<div id="rates-warning" class="card card-pad" style="border-left:4px solid var(--yellow); margin-bottom:14px; font-size:13px;">💱 {{ rates_warning() }} <a href="{{ url_for('settings_page') }}">Налаштування →</a></div>
+{% endif %}
+{% if current_user['role'] in ('admin','accountant') and overdue_summary().count %}
+<div id="overdue-card" class="card card-pad" style="border-left:4px solid var(--red); margin-bottom:14px; font-size:13px;">⏰ Прострочено оплат: <b>{{ overdue_summary().count }}</b> на {{ overdue_summary().total | money('UAH') }} <a href="{{ url_for('payments_overdue') }}">Переглянути →</a></div>
+{% endif %}
+{% if current_user['role'] in ('admin','sales') and reorder_count() %}
+<div id="reorder-card" class="card card-pad" style="border-left:4px solid var(--accent); margin-bottom:14px; font-size:13px;">↻ Клієнтів, що давно не замовляли: <b>{{ reorder_count() }}</b> <a href="{{ url_for('clients_reorder') }}">Нагадати →</a></div>
+{% endif %}
 {% if current_user['role'] in ('admin','sales','production','warehouse','service') %}
 <div class="toolbar" style="margin-bottom:18px;">
   <div class="filters" style="gap:8px; display:flex; flex-wrap:wrap;">
@@ -3656,7 +4010,7 @@ CALCULATOR_HTML = """
     {% if result.ai_operations_description %}
     <div class="card card-pad" style="margin-bottom:14px; border-color:var(--accent-2);">
       <div style="font-size:11px; color:var(--accent-2); font-weight:700; margin-bottom:6px;">🤖 ОЦІНКА ШІ — ПЕРЕВІР ПЕРЕД ВИКОРИСТАННЯМ</div>
-      <p style="font-size:12.5px; margin:0 0 10px;">{{ result.ai_operations_description }}</p>
+      <div style="margin:0 0 12px;">{{ result.ai_operations_description | ops_html }}</div>
       <div style="font-size:11px; color:var(--text-dim);">
         Заготовка: {{ result.ai_inputs.weight_kg }} кг · Метал: {{ result.ai_inputs.material_price_per_kg }} грн/кг ·
         Токарна: {{ result.ai_inputs.turning_hours }} год · Фрезерна: {{ result.ai_inputs.milling_hours }} год ·
@@ -3970,7 +4324,7 @@ CALCULATOR_HISTORY_DETAIL_HTML = """
 <div class="section-title"><span class="accent-dot"></span> Технологічний опис / маршрут виготовлення</div>
 <div class="card card-pad">
   {% if r['operations_description'] %}
-  <div style="white-space:pre-wrap; font-size:13px; line-height:1.6;">{{ r['operations_description'] }}</div>
+  {{ r['operations_description'] | ops_html }}
   {% else %}
   <div class="empty">Опис техпроцесу не збережено для цього розрахунку</div>
   {% endif %}
@@ -4501,6 +4855,7 @@ PRODUCTION_DETAIL_HTML = """
     <div class="stat">Плановий термін<b>{{ order['due_date'] or '—' }}</b></div>
   </div>
   <div style="display:flex; gap:8px;">
+    {% if current_user['role'] in ('admin','sales','accountant') %}<a class="btn btn-sm" href="{{ url_for('production_costs') }}#order-{{ order['id'] }}">⚖ План/факт</a>{% endif %}
     <a class="btn btn-sm" href="{{ url_for('production_route_sheet_pdf', order_id=order['id']) }}" target="_blank">📋 Маршрутний лист (PDF)</a>
     <form method="post" action="{{ url_for('production_reschedule', order_id=order['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       <button class="btn btn-sm" type="submit">↻ Перерахувати розклад</button>
@@ -4679,6 +5034,20 @@ WORK_CENTERS_HTML = """
     <div class="section-title" style="font-size:12px; margin:14px 0 6px;">Планове завантаження, %</div>
     <div class="progress-bar"><div style="width:{{ utilization.get(wc['id'], 0) }}%;"></div></div>
     <div style="font-size:11px; color:var(--text-dim); margin-top:4px;">{{ utilization.get(wc['id'], 0) }}% на найближчі 14 днів (за виробничим планом)</div>
+    {% if can_connect %}
+    <details class="mtc-connect" style="margin-top:12px;" {{ 'open' if not wc['mtc_enabled'] and not t }}>
+      <summary style="cursor:pointer; font-size:12px; color:var(--accent-2);">🔌 {{ 'Підключено: ' ~ wc['mtc_host'] ~ ':' ~ (wc['mtc_port'] or 8082) if wc['mtc_enabled'] else 'Підключити верстат (MTConnect)' }}</summary>
+      <form method="post" action="{{ url_for('work_center_connect', wc_id=wc['id']) }}" style="margin-top:8px;">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <div class="field"><label>IP-адреса верстата</label>
+          <input type="text" name="mtc_host" value="{{ wc['mtc_host'] or '' }}" placeholder="напр. 192.168.1.50" autocomplete="off"></div>
+        <div class="field"><label>Порт (Haas — 8082)</label>
+          <input type="text" name="mtc_port" value="{{ wc['mtc_port'] or 8082 }}"></div>
+        <button class="btn btn-sm" type="submit">Зберегти й перевірити зв'язок</button>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Порожня адреса — вимкнути. На Haas має бути увімкнено налаштування 143.</div>
+      </form>
+    </details>
+    {% endif %}
     <a class="btn btn-primary btn-sm" href="{{ url_for('work_center_terminal', wc_id=wc['id']) }}" style="margin-top:12px; width:100%; justify-content:center;">🖥 Відкрити термінал цеху</a>
   </div>
   {% endfor %}
@@ -5216,10 +5585,34 @@ SETTINGS_HTML = """
     <code style="font-size:16px; padding:8px 14px; background:var(--bg-2, rgba(255,255,255,.04)); border-radius:8px;" id="network-url-text">{{ network_url }}</code>
     <button type="button" class="btn btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('network-url-text').textContent).then(()=>{this.textContent='Скопійовано ✓'; setTimeout(()=>this.textContent='Копіювати',1500);})">Копіювати</button>
   </div>
-  <p style="font-size:11.5px; color:var(--text-dim); margin-bottom:0;">
-    Той самий адрес можна побачити й через значок у системному треї (біля годинника Windows) →
-    «Адреса для інших комп'ютерів». Цей комп'ютер має лишатись увімкненим, щоб інші мали доступ.
+  {% if network_qr_svg %}
+  <div style="display:flex; gap:14px; align-items:center; margin-top:14px; flex-wrap:wrap;">
+    <div id="network-qr" style="width:132px; height:132px; background:#fff; border-radius:8px; padding:4px;">{{ network_qr_svg }}</div>
+    <div style="font-size:12px; color:var(--text-dim); max-width:360px;">
+      📱 Навіть простіше з телефону: наведи камеру на QR-код (телефон має бути в тій самій Wi-Fi мережі) і CRM відкриється одразу.
+    </div>
+  </div>
+  {% endif %}
+  {% if network_host_url %}
+  <p style="font-size:12px; color:var(--text-dim); margin:14px 0 0;">
+    Те саме за назвою комп'ютера (не змінюється після перезавантаження роутера, зручно для закладок):
+    <code id="network-host-url">{{ network_host_url }}</code>
+    <br><span style="font-size:11px;">У Windows-мережі зазвичай працює; на деяких телефонах — ні, тоді користуйся IP-адресою вище.</span>
   </p>
+  {% endif %}
+  <p style="font-size:11.5px; color:var(--text-dim); margin-bottom:0;">
+    Ця ж адреса є в системному треї (біля годинника Windows) → «Адреса для інших комп'ютерів».
+    Цей комп'ютер має лишатись увімкненим, щоб інші мали доступ.
+  </p>
+  <details style="margin-top:12px;">
+    <summary style="cursor:pointer; font-size:12.5px; color:var(--accent-2);">Потрібен доступ з іншого Wi-Fi, з дому чи з мобільного інтернету?</summary>
+    <ol style="font-size:12px; color:var(--text-dim); margin:8px 0 0; padding-left:18px;">
+      <li>Встанови безкоштовну програму <b style="color:var(--text);">Tailscale</b> (tailscale.com) на цей комп'ютер і на пристрій, з якого хочеш зайти, та увійди в обох в один акаунт.</li>
+      <li>У Tailscale подивись адресу цього комп'ютера (вигляду <code>100.x.y.z</code>).</li>
+      <li>З будь-якої мережі відкрий у браузері <code>http://100.x.y.z:{{ network_url.rsplit(':',1)[-1] }}</code>. Дані ті самі, трафік шифрується.</li>
+    </ol>
+    <p style="font-size:11.5px; color:var(--text-dim); margin:8px 0 0;">Перед цим обов'язково заміни типові паролі користувачів на свої («Мій профіль»).</p>
+  </details>
   {% else %}
   <p style="font-size:12.5px; color:var(--text-dim); margin-top:0; margin-bottom:0;">
     Не вдалося визначити адресу цього комп'ютера в мережі (можливо, немає підключення до
@@ -5327,9 +5720,26 @@ SETTINGS_HTML = """
       <div class="form-grid">
         <div class="field"><label>USD → UAH</label><input type="number" step="0.01" name="rate_usd" value="{{ settings.get('rate_usd','41.5') }}"></div>
         <div class="field"><label>EUR → UAH</label><input type="number" step="0.01" name="rate_eur" value="{{ settings.get('rate_eur','45.0') }}"></div>
+        <div class="field"><label>PLN → UAH</label><input type="number" step="0.01" name="rate_pln" value="{{ settings.get('rate_pln','10.5') }}"></div>
       </div>
-      <p style="font-size:12px; color:var(--text-dim);">Використовується для зведеної аналітики на дашборді у гривні.</p>
+      <p style="font-size:12px; color:var(--text-dim);">Використовується для зведеної аналітики у гривні. Історія курсів зберігається, тому минулі місяці не змінюються при новому курсі.
+        Оновлено: {{ settings.get('rates_updated_on') or 'ще не оновлювались' }}{% if settings.get('rates_source') %} ({{ settings.get('rates_source') }}){% endif %}.</p>
+      <label style="font-size:12.5px; display:flex; gap:8px; align-items:center; margin-bottom:10px;"><input type="checkbox" name="rates_auto" value="1" {{ 'checked' if settings.get('rates_auto')=='1' }}> Оновлювати курс з НБУ щодня автоматично</label>
       <button class="btn btn-primary btn-sm" type="submit">Зберегти курси</button>
+    </form>
+    <form method="post" action="{{ url_for('settings_rates_nbu') }}" style="margin-top:8px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-sm" type="submit">Оновити зараз з НБУ</button>
+    </form>
+
+    <div class="section-title"><span class="accent-dot"></span> 🔔 Сповіщення про події</div>
+    <form method="post" action="{{ url_for('settings_save') }}" class="card card-pad" id="events-form"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="form" value="events">
+      <label style="font-size:12.5px; display:flex; gap:8px; align-items:center; margin-bottom:8px;"><input type="checkbox" name="notify_events" value="1" {{ 'checked' if settings.get('notify_events','1')=='1' }}> Повідомляти в Telegram/вебхук про нові угоди та зміну етапу</label>
+      <label style="font-size:12.5px; display:flex; gap:8px; align-items:center; margin-bottom:8px;"><input type="checkbox" name="notify_overdue" value="1" {{ 'checked' if settings.get('notify_overdue','1')=='1' }}> Щодня нагадувати про прострочені оплати</label>
+      <div class="field"><label>Повторні замовлення: нагадувати, якщо клієнт мовчить, днів</label>
+        <input type="number" min="7" name="reorder_days" value="{{ settings.get('reorder_days','60') }}"></div>
+      <p style="font-size:12px; color:var(--text-dim);">Аварії верстатів і низькі залишки надсилаються завжди (якщо налаштовано Telegram чи вебхук).</p>
+      <button class="btn btn-sm" type="submit">Зберегти</button>
     </form>
 
     <div class="section-title"><span class="accent-dot"></span> 💾 Резервне копіювання</div>
@@ -5341,10 +5751,15 @@ SETTINGS_HTML = """
       <form method="post" action="{{ url_for('settings_backup_now') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         <button class="btn btn-sm btn-primary" type="submit">Створити резервну копію зараз</button>
       </form>
-      <details style="margin-top:10px;">
-        <summary style="cursor:pointer; font-size:12px; color:var(--accent-2);">Автоматично щоночі (cron, Linux/macOS)</summary>
-        <pre style="background:var(--bg-soft); padding:12px; border-radius:8px; font-size:11px; overflow-x:auto; white-space:pre-wrap; margin-top:8px;">0 2 * * * cd /шлях/до/crm && python3 -c "import app; app.backup_database()"</pre>
-      </details>
+      <form method="post" action="{{ url_for('settings_save') }}" id="backup-auto-form" style="margin-top:14px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="form" value="backup">
+        <label style="font-size:12.5px; display:flex; gap:8px; align-items:center; margin-bottom:10px;"><input type="checkbox" name="backup_auto" value="1" {{ 'checked' if settings.get('backup_auto','1')=='1' }}> Робити копію автоматично раз на день</label>
+        <div class="field"><label>Додаткова тека для копій (флешка чи мережевий диск, необов'язково)</label>
+          <input type="text" name="backup_extra_dir" value="{{ settings.get('backup_extra_dir','') }}" placeholder="напр. E:/Backups"></div>
+        <p style="font-size:12px; color:var(--text-dim);">Остання автоматична копія: {{ settings.get('backup_last_on') or 'ще не було' }}.
+          {% if settings.get('backup_last_error') %}<span style="color:var(--red);">Помилка додаткової теки: {{ settings.get('backup_last_error') }}</span>{% endif %}</p>
+        <button class="btn btn-sm" type="submit">Зберегти</button>
+      </form>
     </div>
 
     <div class="section-title"><span class="accent-dot" style="background:var(--red, #c23b2f);"></span> ⚠️ Скинути до демо-даних</div>
@@ -5475,6 +5890,13 @@ app.jinja_env.globals["SCRAP_STATUSES"] = SCRAP_STATUSES
 # Маршрути: авторизація
 # ---------------------------------------------------------------------------
 
+# Типові паролі демо-користувачів із seed_data() - лише для нагадування змінити їх.
+DEFAULT_PASSWORDS = {
+    "admin": "admin123", "oleh": "manager123", "maister": "prod123", "tokar": "tokar123", "frezer": "frezer123",
+    "sklad": "sklad123", "servis": "servis123", "buh": "buh12345",
+}
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -5489,6 +5911,13 @@ def login():
             session.clear()
             session.permanent = True
             session["user_id"] = user["id"]
+            # Якщо людина зайшла з типовим демо-паролем - показуємо на всіх
+            # сторінках помітне нагадування змінити його (особливо важливо,
+            # коли CRM доступна з інших комп'ютерів чи через VPN). Прапорець
+            # виставляється тут, де відомий відкритий пароль, - так не треба
+            # щоразу перераховувати хеші на кожному запиті.
+            if DEFAULT_PASSWORDS.get(user["username"]) == request.form.get("password", ""):
+                session["default_password"] = True
             return redirect(request.args.get("next") or url_for("dashboard"))
         register_failed_login(throttle_key)
         flash("Невірний логін або пароль", "error")
@@ -5601,13 +6030,13 @@ def dashboard():
 
     # Виручка по місяцях (останні 6 місяців) за виграними угодами, у гривні
     revenue_rows = db.execute(
-        f"""SELECT strftime('%Y-%m', closed_at) as ym, amount, currency
+        f"""SELECT strftime('%Y-%m', closed_at) as ym, amount, currency, closed_at
             FROM deals WHERE stage='won' AND closed_at IS NOT NULL {scope}""",
         scope_params,
     ).fetchall()
     rev_map = {}
     for r in revenue_rows:
-        rev_map[r["ym"]] = rev_map.get(r["ym"], 0.0) + to_uah(db, r["amount"], r["currency"])
+        rev_map[r["ym"]] = rev_map.get(r["ym"], 0.0) + to_uah(db, r["amount"], r["currency"], r["closed_at"])
     cursor_dt = datetime.date.today().replace(day=1)
     tmp = []
     for i in range(6):
@@ -5624,7 +6053,7 @@ def dashboard():
     if is_admin():
         mgr_rows = db.execute(
             """SELECT u.id, u.full_name,
-                      d.stage, d.amount, d.currency
+                      d.stage, d.amount, d.currency, d.closed_at
                FROM users u LEFT JOIN deals d ON d.manager_id=u.id
                WHERE u.active=1"""
         ).fetchall()
@@ -5635,7 +6064,7 @@ def dashboard():
             st = mgr_stats[r["id"]]
             if r["stage"] == "won":
                 st["won_cnt"] += 1
-                st["won_sum"] += to_uah(db, r["amount"], r["currency"])
+                st["won_sum"] += to_uah(db, r["amount"], r["currency"], r["closed_at"])
             elif r["stage"] == "lost":
                 st["lost_cnt"] += 1
             elif r["stage"] is not None:
@@ -6351,22 +6780,22 @@ def _render_quote_pdf(part_description, operations_description, weight_kg, mater
         c.setFillColor(steel)
         c.rect(0, height - 28 * mm, width, 28 * mm, fill=1, stroke=0)
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 18)
+        c.setFont(PDF_FONT_BOLD, 18)
         c.drawString(20 * mm, height - 15 * mm, "Оснастка-Маркет")
-        c.setFont("Helvetica", 10)
+        c.setFont(PDF_FONT, 10)
         c.drawString(20 * mm, height - 22 * mm, "Розрахунок вартості токарно-фрезерної механообробки")
         c.setFillColor(colors.black)
 
     draw_header()
     y = height - 40 * mm
-    c.setFont("Helvetica-Bold", 13)
+    c.setFont(PDF_FONT_BOLD, 13)
     c.drawString(20 * mm, y, f"Розрахунок від {datetime.date.today().strftime('%d.%m.%Y')}")
     y -= 10 * mm
 
-    c.setFont("Helvetica-Bold", 11)
+    c.setFont(PDF_FONT_BOLD, 11)
     c.drawString(20 * mm, y, "Деталь / замовлення:")
     y -= 6 * mm
-    c.setFont("Helvetica", 10)
+    c.setFont(PDF_FONT, 10)
     text_obj = c.beginText(20 * mm, y)
     text_obj.setLeading(4.5 * mm)
     wrap_text(text_obj, part_description, 95)
@@ -6374,13 +6803,24 @@ def _render_quote_pdf(part_description, operations_description, weight_kg, mater
     y = text_obj.getY() - 8 * mm
 
     if operations_description:
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont(PDF_FONT_BOLD, 11)
         c.drawString(20 * mm, y, "Технологічний процес:")
         y -= 6 * mm
-        c.setFont("Helvetica", 9)
+        c.setFont(PDF_FONT, 9)
         text_obj = c.beginText(20 * mm, y)
         text_obj.setLeading(4.2 * mm)
-        wrap_text(text_obj, operations_description, 100)
+        # Той самий розбір на етапи, що й на екрані: заголовок етапу, під ним
+        # пояснення з відступом, між етапами порожній рядок - а не суцільний текст.
+        pdf_lines = []
+        for it in split_operations_text(operations_description):
+            if it["kind"] == "step":
+                pdf_lines.append(f'{it["num"]}. {it["title"]}')
+                if it["body"]:
+                    pdf_lines.append("    " + it["body"])
+                pdf_lines.append("")
+            else:
+                pdf_lines.append(it["body"])
+        wrap_text(text_obj, "\n".join(pdf_lines), 100)
         c.drawText(text_obj)
         y = text_obj.getY() - 8 * mm
 
@@ -6407,10 +6847,10 @@ def _render_quote_pdf(part_description, operations_description, weight_kg, mater
         draw_header()
         y = height - 40 * mm
 
-    c.setFont("Helvetica-Bold", 11)
+    c.setFont(PDF_FONT_BOLD, 11)
     c.drawString(20 * mm, y, "Розрахунок вартості:")
     y -= 8 * mm
-    c.setFont("Helvetica", 10)
+    c.setFont(PDF_FONT, 10)
     for label, value in rows:
         c.drawString(24 * mm, y, label)
         c.drawRightString(width - 20 * mm, y, "{:,.2f} грн".format(value).replace(",", " "))
@@ -6419,7 +6859,7 @@ def _render_quote_pdf(part_description, operations_description, weight_kg, mater
     c.setStrokeColor(colors.HexColor("#dddddd"))
     c.line(20 * mm, y, width - 20 * mm, y)
     y -= 7 * mm
-    c.setFont("Helvetica-Bold", 10)
+    c.setFont(PDF_FONT_BOLD, 10)
     c.drawString(24 * mm, y, "Собівартість за од.")
     c.drawRightString(width - 20 * mm, y, "{:,.2f} грн".format(cost_per_unit).replace(",", " "))
     y -= 6 * mm
@@ -6432,12 +6872,12 @@ def _render_quote_pdf(part_description, operations_description, weight_kg, mater
     c.setFillColor(steel)
     c.rect(20 * mm, y - 12 * mm, width - 40 * mm, 12 * mm, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 13)
+    c.setFont(PDF_FONT_BOLD, 13)
     c.drawString(24 * mm, y - 8.5 * mm, "Разом за {} шт.:".format(int(quantity)))
     c.drawRightString(width - 24 * mm, y - 8.5 * mm, "{:,.2f} грн".format(total_price).replace(",", " "))
 
     c.setFillColor(text_dim)
-    c.setFont("Helvetica", 8)
+    c.setFont(PDF_FONT, 8)
     c.drawString(20 * mm, 15 * mm, "Документ згенеровано автоматично в Оснастка-Маркет. Ціни орієнтовні та можуть уточнюватись за результатами технічного огляду.")
     c.showPage()
     c.save()
@@ -6584,6 +7024,7 @@ def deal_new():
         new_deal_id = db.execute("SELECT last_insert_rowid() id").fetchone()["id"]
         log_activity(db, new_deal_id, client_id, "note", f"Угоду «{title}» створено")
         db.commit()
+        notify_event(f"🆕 Нова угода: «{title}» на {amount:,.0f} {f.get('currency', 'USD')}".replace(",", " "))
         flash("Угоду створено", "success")
         return redirect(url_for("deal_detail", deal_id=new_deal_id))
     clients = db.execute("SELECT * FROM clients ORDER BY name").fetchall()
@@ -6688,24 +7129,24 @@ def deal_proposal_pdf(deal_id):
     c.setFillColor(steel)
     c.rect(0, height - 28 * mm, width, 28 * mm, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 18)
+    c.setFont(PDF_FONT_BOLD, 18)
     c.drawString(20 * mm, height - 15 * mm, "Оснастка-Маркет")
-    c.setFont("Helvetica", 10)
+    c.setFont(PDF_FONT, 10)
     c.drawString(20 * mm, height - 22 * mm, "Комерційна пропозиція на виготовлення деталей / металоконструкцій")
 
     y = height - 40 * mm
     c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 13)
+    c.setFont(PDF_FONT_BOLD, 13)
     c.drawString(20 * mm, y, f"КП № {deal['id']:04d}  від  {datetime.date.today().strftime('%d.%m.%Y')}")
     y -= 10 * mm
 
-    c.setFont("Helvetica-Bold", 11)
+    c.setFont(PDF_FONT_BOLD, 11)
     c.drawString(20 * mm, y, "Клієнт:")
-    c.setFont("Helvetica", 11)
+    c.setFont(PDF_FONT, 11)
     c.drawString(45 * mm, y, client["name"] if client else "—")
     y -= 6 * mm
     if client and client["edrpou"]:
-        c.setFont("Helvetica", 9)
+        c.setFont(PDF_FONT, 9)
         c.setFillColor(text_dim)
         c.drawString(45 * mm, y, f"ЄДРПОУ: {client['edrpou']}   Місто: {client['city'] or '—'}")
         c.setFillColor(colors.black)
@@ -6713,24 +7154,24 @@ def deal_proposal_pdf(deal_id):
     else:
         y -= 4 * mm
 
-    c.setFont("Helvetica-Bold", 11)
+    c.setFont(PDF_FONT_BOLD, 11)
     c.drawString(20 * mm, y, "Об'єкт пропозиції:")
     y -= 7 * mm
-    c.setFont("Helvetica", 11)
+    c.setFont(PDF_FONT, 11)
     c.drawString(20 * mm, y, deal["title"])
     y -= 10 * mm
 
     if machine:
         c.setFillColor(steel)
         c.rect(20 * mm, y - 42 * mm, width - 40 * mm, 40 * mm, fill=0, stroke=1)
-        c.setFont("Helvetica-Bold", 12)
+        c.setFont(PDF_FONT_BOLD, 12)
         c.setFillColor(colors.black)
         c.drawString(24 * mm, y - 8 * mm, f"Обробка виконується на: {machine['category']}")
-        c.setFont("Helvetica-Bold", 14)
+        c.setFont(PDF_FONT_BOLD, 14)
         c.setFillColor(accent)
         c.drawString(24 * mm, y - 16 * mm, machine["model"])
         c.setFillColor(colors.black)
-        c.setFont("Helvetica", 10)
+        c.setFont(PDF_FONT, 10)
         specs = [
             f"Потужність обладнання: {machine['spindle_power'] or '—'}",
             f"Робоча зона: {machine['work_area'] or '—'}",
@@ -6746,10 +7187,10 @@ def deal_proposal_pdf(deal_id):
         y -= 4 * mm
 
     if deal["tech_requirements"]:
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont(PDF_FONT_BOLD, 11)
         c.drawString(20 * mm, y, "Технічні вимоги:")
         y -= 6 * mm
-        c.setFont("Helvetica", 9)
+        c.setFont(PDF_FONT, 9)
         text_obj = c.beginText(20 * mm, y)
         text_obj.setLeading(4.5 * mm)
         for line in str(deal["tech_requirements"]).splitlines() or [""]:
@@ -6768,18 +7209,18 @@ def deal_proposal_pdf(deal_id):
     c.setFillColor(steel)
     c.rect(20 * mm, y - 30 * mm, width - 40 * mm, 28 * mm, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 11)
+    c.setFont(PDF_FONT_BOLD, 11)
     c.drawString(24 * mm, y - 10 * mm, "Вартість:")
-    c.setFont("Helvetica-Bold", 16)
+    c.setFont(PDF_FONT_BOLD, 16)
     c.drawString(24 * mm, y - 18 * mm, fmt_money(deal["amount"], deal["currency"]))
-    c.setFont("Helvetica", 10)
+    c.setFont(PDF_FONT, 10)
     c.drawString(90 * mm, y - 10 * mm, f"Умови передоплати: {deal['prepayment_percent']}%")
     c.drawString(90 * mm, y - 16 * mm, f"Термін дії пропозиції: 14 днів")
     if deal["expected_close"]:
         c.drawString(90 * mm, y - 22 * mm, f"Орієнтовний термін закриття: {deal['expected_close']}")
 
     c.setFillColor(text_dim)
-    c.setFont("Helvetica", 8)
+    c.setFont(PDF_FONT, 8)
     c.drawString(20 * mm, 15 * mm, "Документ згенеровано автоматично в Оснастка-Маркет. Ціни можуть уточнюватись за результатами технічного огляду.")
     c.showPage()
     c.save()
@@ -6833,6 +7274,7 @@ def _apply_deal_stage_move(db, deal, stage):
                (stage, now_iso(), closed_at, deal["id"]))
     label = STAGE_LABEL.get(stage, stage)
     log_activity(db, deal["id"], deal["client_id"], "stage", f"Стадію угоди змінено на «{label}»")
+    notify_event(f"📌 Угода «{deal['title']}»: тепер «{label}»")
     auto = AUTO_TASKS_ON_STAGE.get(stage)
     if auto:
         title, ttype, offset = auto
@@ -7482,6 +7924,7 @@ def my_profile():
             db.execute("UPDATE users SET password_hash=? WHERE id=?",
                        (generate_password_hash(new_password), user["id"]))
             db.commit()
+            session.pop("default_password", None)
             flash("Пароль успішно змінено", "success")
             return redirect(url_for("my_profile"))
     return render_template("my_profile.html", active="profile")
@@ -7660,17 +8103,17 @@ def production_route_sheet_pdf(order_id):
     c.setFillColor(steel)
     c.rect(0, height - 26 * mm, width, 26 * mm, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 16)
+    c.setFont(PDF_FONT_BOLD, 16)
     c.drawString(20 * mm, height - 12 * mm, "МАРШРУТНИЙ ЛИСТ")
-    c.setFont("Helvetica", 10)
+    c.setFont(PDF_FONT, 10)
     c.drawString(20 * mm, height - 19 * mm, f"Виробниче замовлення №{order['id']:04d} · {order['client_name'] or '—'}")
 
     y = height - 34 * mm
     c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 11)
+    c.setFont(PDF_FONT_BOLD, 11)
     c.drawString(20 * mm, y, f"Виріб: {order['deal_title'] or '—'}")
     y -= 6 * mm
-    c.setFont("Helvetica", 10)
+    c.setFont(PDF_FONT, 10)
     c.drawString(20 * mm, y, f"Обладнання/техпроцес: {order['machine_category'] or '—'} — {order['machine_name'] or '—'}")
     y -= 6 * mm
     c.drawString(20 * mm, y, f"Кількість: {order['quantity']} шт.  ·  Дата видачі листа: {datetime.date.today().strftime('%d.%m.%Y')}")
@@ -7681,13 +8124,13 @@ def production_route_sheet_pdf(order_id):
     c.setFillColor(steel)
     c.rect(20 * mm, y - 6 * mm, width - 40 * mm, 6 * mm, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 8)
+    c.setFont(PDF_FONT_BOLD, 8)
     for x, h in zip(col_x, headers):
         c.drawString(x * mm, y - 4.5 * mm, h)
     y -= 6 * mm
 
     c.setFillColor(colors.black)
-    c.setFont("Helvetica", 8)
+    c.setFont(PDF_FONT, 8)
     row_h = 11 * mm
     for op in ops:
         if y - row_h < 25 * mm:
@@ -7701,7 +8144,7 @@ def production_route_sheet_pdf(order_id):
         y -= row_h
 
     y -= 8 * mm
-    c.setFont("Helvetica", 8)
+    c.setFont(PDF_FONT, 8)
     c.setFillColor(colors.HexColor("#555555"))
     c.drawString(20 * mm, y, "Цей документ супроводжує партію фізично через усі цехи. Кожен майстер підписує при прийманні у роботу.")
 
@@ -7838,6 +8281,7 @@ def work_centers_list():
         utilization[wc["id"]] = min(round(hours / capacity * 100) if capacity else 0, 100)
     return render_template("work_centers.html", active="production", work_centers=work_centers,
                             telemetry=telemetry, utilization=utilization, runtime_stats=runtime_stats,
+                            can_connect=is_admin(),
                             foreman_own_wc=foreman_work_center_id(get_current_user()))
 
 
@@ -8067,9 +8511,9 @@ def shift_log_report_pdf():
         c.setFillColor(steel)
         c.rect(0, height - 26 * mm, width, 26 * mm, fill=1, stroke=0)
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 16)
+        c.setFont(PDF_FONT_BOLD, 16)
         c.drawString(20 * mm, height - 12 * mm, f"Змінний журнал — {worker_name}")
-        c.setFont("Helvetica", 10)
+        c.setFont(PDF_FONT, 10)
         c.drawString(20 * mm, height - 19 * mm,
                      f"Місяць: {month}   Виготовлено: {totals['made']} шт   "
                      f"Брак: {totals['scrap']} шт   Годин: {totals['hours']:.1f}")
@@ -8080,15 +8524,15 @@ def shift_log_report_pdf():
         c.setFillColor(steel)
         c.rect(20 * mm, y - 6 * mm, width - 40 * mm, 6 * mm, fill=1, stroke=0)
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 8)
+        c.setFont(PDF_FONT_BOLD, 8)
         for x, h in zip(col_x, headers):
             c.drawString(x * mm, y - 4.5 * mm, h)
         c.setFillColor(colors.black)
-        c.setFont("Helvetica", 8)
+        c.setFont(PDF_FONT, 8)
         return col_x, y - 6 * mm
 
     if not by_worker:
-        c.setFont("Helvetica-Bold", 14)
+        c.setFont(PDF_FONT_BOLD, 14)
         c.drawString(20 * mm, height - 30 * mm, f"Змінний журнал за {month} — записів немає")
         c.showPage()
     else:
@@ -8332,6 +8776,23 @@ def warehouse_transaction_add(item_id):
 # Налаштування та інтеграції
 # ---------------------------------------------------------------------------
 
+def make_qr_svg(url):
+    """QR-код адреси як inline-SVG (Markup) - щоб відкрити CRM з телефону,
+    просто навівши камеру. Бібліотека segno чисто-пітонівська; якщо її
+    раптом немає - просто повертаємо None, і сторінка працює без QR."""
+    if not url:
+        return None
+    try:
+        import segno
+        from markupsafe import Markup
+        from io import BytesIO
+        buf = BytesIO()
+        segno.make(url, error="m").save(buf, kind="svg", scale=4, border=2, dark="#000000", light="#ffffff", xmldecl=False)
+        return Markup(buf.getvalue().decode("utf-8"))
+    except Exception:
+        return None
+
+
 def get_lan_ip():
     """Локальна IP-адреса цього комп'ютера в мережі - показуємо її в
     «Налаштуваннях», щоб адмін міг назвати/скопіювати адресу колегам,
@@ -8361,8 +8822,19 @@ def settings_page():
     lan_ip = get_lan_ip()
     network_port = os.environ.get("CRM_PORT", "5000")
     network_url = f"http://{lan_ip}:{network_port}" if lan_ip else None
+    # Адреса за ім'ям комп'ютера не "пливе" після перезавантаження роутера
+    # (на відміну від IP) - зручніша для закладок у браузері колег.
+    network_host_url = None
+    try:
+        import socket as _socket
+        hostname = _socket.gethostname()
+        if hostname:
+            network_host_url = f"http://{hostname}:{network_port}"
+    except Exception:
+        pass
     return render_template("settings.html", active="settings", settings=get_all_settings(db), detected_chats=None,
-                            network_url=network_url)
+                            network_url=network_url, network_host_url=network_host_url,
+                            network_qr_svg=make_qr_svg(network_url))
 
 
 @app.route("/settings/custom-fields", methods=["GET", "POST"])
@@ -8437,14 +8909,56 @@ def settings_save():
         else:
             flash("Налаштування Telegram збережено", "success")
     elif f.get("form") == "rates":
-        set_setting(db, "rate_usd", f.get("rate_usd", "41.5"))
-        set_setting(db, "rate_eur", f.get("rate_eur", "45.0"))
+        accepted = save_rates(db, f.get("rate_usd"), f.get("rate_eur"), f.get("rate_pln"), source="вручну")
+        if accepted:
+            set_setting(db, "rates_auto", "1" if f.get("rates_auto") else "0")
+            db.commit()
+            flash("Курси валют оновлено", "success")
+        else:
+            flash("Курс має бути додатним числом", "error")
+    elif f.get("form") == "backup":
+        set_setting(db, "backup_auto", "1" if f.get("backup_auto") else "0")
+        extra = f.get("backup_extra_dir", "").strip()
+        if extra and not os.path.isdir(extra):
+            try:
+                os.makedirs(extra, exist_ok=True)
+            except OSError as e:
+                flash(f"Теку «{extra}» неможливо створити: {e}", "error")
+                return redirect(url_for("settings_page"))
+        set_setting(db, "backup_extra_dir", extra)
         db.commit()
-        flash("Курси валют оновлено", "success")
+        flash("Налаштування копіювання збережено", "success")
+    elif f.get("form") == "events":
+        set_setting(db, "notify_events", "1" if f.get("notify_events") else "0")
+        set_setting(db, "notify_overdue", "1" if f.get("notify_overdue") else "0")
+        try:
+            days = int(f.get("reorder_days") or 60)
+        except ValueError:
+            days = 0
+        if days < 7:
+            flash("Кількість днів має бути не менше 7", "error")
+            return redirect(url_for("settings_page"))
+        set_setting(db, "reorder_days", str(days))
+        db.commit()
+        flash("Налаштування сповіщень збережено", "success")
     elif f.get("form") == "anthropic":
         set_setting(db, "anthropic_api_key", f.get("anthropic_api_key", "").strip())
         db.commit()
         flash("API-ключ Anthropic збережено", "success")
+    return redirect(url_for("settings_page"))
+
+
+@app.route("/settings/rates/nbu", methods=["POST"])
+@login_required
+def settings_rates_nbu():
+    if not is_admin():
+        abort(403)
+    db = get_db()
+    try:
+        accepted = update_rates_from_nbu(db)
+        flash("Курси оновлено з НБУ: " + ", ".join(c.upper() for c in accepted), "success")
+    except Exception as e:
+        flash(f"Не вдалось отримати курси НБУ: {e}", "error")
     return redirect(url_for("settings_page"))
 
 
@@ -8557,6 +9071,13 @@ def api_telemetry(work_center_id):
     if not api_key or request.headers.get("X-API-Key") != api_key:
         return jsonify(error="unauthorized"), 401
     data = request.get_json(silent=True) or {}
+    record_telemetry(db, work_center_id, data)
+    return jsonify(ok=True)
+
+
+def record_telemetry(db, work_center_id, data):
+    """Записує один знімок телеметрії (спільна логіка для HTTP API та
+    вбудованого опитування MTConnect)."""
     status = data.get("status", "offline")
     spindle_load = data.get("spindle_load_pct")
     cycle_count = data.get("cycle_count")
@@ -8586,7 +9107,178 @@ def api_telemetry(work_center_id):
     if status == "alarm":
         notify_all(f"🚨 Аварійний сигнал з робочого центру #{work_center_id} (джерело: {source})!")
     db.commit()
-    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Вбудоване опитування верстатів по MTConnect (без окремих скриптів)
+# ---------------------------------------------------------------------------
+
+MTC_HOST_RE = _re.compile(r"^[A-Za-z0-9._-]{1,253}$")
+
+
+def _xml_local(tag):
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def parse_mtconnect_current(xml_text):
+    """Розбирає відповідь MTConnect /current незалежно від версії/namespace.
+    Повертає словник для record_telemetry (без source)."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_text)
+    execution = mode = program = None
+    part_count = spindle_load = None
+    fault = False
+    found = 0
+    for el in root.iter():
+        tag = _xml_local(el.tag)
+        text = (el.text or "").strip()
+        if text.upper() in ("UNAVAILABLE", ""):
+            text_val = None
+        else:
+            text_val = text
+        ident = ((el.get("name") or "") + " " + (el.get("dataItemId") or "")).lower()
+        if tag == "Execution":
+            execution = text_val or execution
+            found += 1
+        elif tag == "ControllerMode":
+            mode = text_val or mode
+            found += 1
+        elif tag == "Program":
+            program = text_val or program
+            found += 1
+        elif tag in ("PartCount", "PartCountAct"):
+            if text_val is not None:
+                try:
+                    part_count = int(float(text_val))
+                except ValueError:
+                    pass
+            found += 1
+        elif tag == "Load" and "spindle" in ident or (tag == "Load" and ident.strip().startswith("sload")):
+            if text_val is not None:
+                try:
+                    spindle_load = float(text_val)
+                except ValueError:
+                    pass
+        elif tag == "Fault":
+            fault = True
+            found += 1
+    if not found:
+        raise ValueError("У відповіді немає жодного відомого MTConnect-елемента (Execution, Program, PartCount)")
+    exe = (execution or "").upper()
+    if fault:
+        status = "alarm"
+    elif exe == "ACTIVE":
+        status = "running"
+    elif exe:
+        status = "idle"
+    else:
+        status = "offline"
+    return {"status": status, "program_name": program, "mode": mode,
+            "part_count": part_count, "spindle_load_pct": spindle_load}
+
+
+def fetch_mtconnect(host, port, timeout=4):
+    if not MTC_HOST_RE.match(host or ""):
+        raise ValueError("Некоректна адреса верстата")
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError("Некоректний порт")
+    import urllib.request
+    with urllib.request.urlopen(f"http://{host}:{port}/current", timeout=timeout) as resp:
+        body = resp.read(3_000_000)
+    return parse_mtconnect_current(body.decode("utf-8", errors="replace").encode("utf-8"))
+
+
+def poll_machines_once():
+    """Опитує всі робочі центри з увімкненим MTConnect. Повертає {wc_id: помилка|None}."""
+    results = {}
+    with app.app_context():
+        db = get_db()
+        rows = db.execute("SELECT id, mtc_host, mtc_port FROM work_centers "
+                          "WHERE mtc_enabled=1 AND mtc_host IS NOT NULL AND mtc_host!=''").fetchall()
+        for wc in rows:
+            try:
+                data = fetch_mtconnect(wc["mtc_host"], wc["mtc_port"] or 8082)
+                data["source"] = "mtconnect"
+                record_telemetry(db, wc["id"], data)
+                results[wc["id"]] = None
+            except Exception as e:
+                results[wc["id"]] = str(e)
+                prev = db.execute("SELECT status FROM machine_telemetry WHERE work_center_id=?", (wc["id"],)).fetchone()
+                if prev and prev["status"] != "offline":
+                    record_telemetry(db, wc["id"], {"status": "offline", "source": "mtconnect"})
+    return results
+
+
+import threading as _threading
+_poller_stop = _threading.Event()
+_poller_started = False
+
+
+def start_machine_poller(interval=None):
+    """Запускає фоновий потік опитування (викликається з launcher.py)."""
+    global _poller_started
+    if _poller_started:
+        return False
+    _poller_started = True
+    import threading
+    secs = interval or int(os.environ.get("CRM_MTC_INTERVAL", "15"))
+    _poller_stop.clear()
+
+    def loop():
+        while not _poller_stop.is_set():
+            try:
+                poll_machines_once()
+            except Exception:
+                pass
+            try:
+                run_daily_tasks()
+            except Exception:
+                pass
+            _poller_stop.wait(secs)
+
+    threading.Thread(target=loop, daemon=True, name="mtconnect-poller").start()
+    return True
+
+
+def stop_machine_poller():
+    _poller_stop.set()
+
+
+@app.route("/work-centers/<int:wc_id>/connect", methods=["POST"])
+@login_required
+def work_center_connect(wc_id):
+    if not is_admin():
+        abort(403)
+    db = get_db()
+    wc = db.execute("SELECT id, name FROM work_centers WHERE id=?", (wc_id,)).fetchone()
+    if not wc:
+        abort(404)
+    host = request.form.get("mtc_host", "").strip()
+    if not host:
+        db.execute("UPDATE work_centers SET mtc_host=NULL, mtc_enabled=0 WHERE id=?", (wc_id,))
+        db.commit()
+        flash(f"Підключення «{wc['name']}» вимкнено", "success")
+        return redirect(url_for("work_centers_list"))
+    try:
+        port = int(request.form.get("mtc_port") or 8082)
+    except ValueError:
+        port = 0
+    if not MTC_HOST_RE.match(host) or not 1 <= port <= 65535:
+        flash("Перевірте адресу (лише IP або ім'я без http://) і порт", "error")
+        return redirect(url_for("work_centers_list"))
+    db.execute("UPDATE work_centers SET mtc_host=?, mtc_port=?, mtc_enabled=1 WHERE id=?", (host, port, wc_id))
+    db.commit()
+    try:
+        data = fetch_mtconnect(host, port)
+        data["source"] = "mtconnect"
+        record_telemetry(db, wc_id, data)
+        flash(f"Зв'язок є: «{wc['name']}» — статус {data['status']}, програма {data.get('program_name') or '—'}. "
+              "Далі дані оновлюються автоматично.", "success")
+    except Exception as e:
+        flash(f"Адресу збережено, але верстат не відповів: {e}. Перевірте IP, мережу та налаштування 143 на Haas. "
+              "CRM пробуватиме знову автоматично.", "error")
+    return redirect(url_for("work_centers_list"))
 
 
 # ---------------------------------------------------------------------------
@@ -8762,6 +9454,64 @@ def backup_database():
     return dest_path
 
 
+def run_scheduled_backup(db=None):
+    """Раз на день робить копію бази (+ копію в додаткову теку, якщо задана).
+    Повертає шлях до копії або None, якщо сьогодні вже робили/вимкнено."""
+    own = db is None
+    if own:
+        db = sqlite3.connect(DB_PATH, timeout=10)
+        db.row_factory = sqlite3.Row
+    try:
+        if get_setting(db, "backup_auto", "1") != "1" or get_setting(db, "backup_last_on", "") == today_str():
+            return None
+        path = backup_database()
+        error = ""
+        extra = get_setting(db, "backup_extra_dir", "").strip()
+        if extra:
+            try:
+                import shutil
+                os.makedirs(extra, exist_ok=True)
+                shutil.copy2(path, os.path.join(extra, os.path.basename(path)))
+                names = sorted(f for f in os.listdir(extra) if f.startswith("crm_backup_") and f.endswith(".db"))
+                for old in names[:-30]:
+                    try:
+                        os.remove(os.path.join(extra, old))
+                    except OSError:
+                        pass
+            except Exception as e:
+                error = str(e)
+        set_setting(db, "backup_last_on", today_str())
+        set_setting(db, "backup_last_error", error)
+        db.commit()
+        return path
+    finally:
+        if own:
+            db.close()
+
+
+def run_daily_tasks():
+    """Щоденні фонові завдання: курс НБУ (якщо ввімкнено) і резервна копія."""
+    db = sqlite3.connect(DB_PATH, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        if get_setting(db, "rates_auto", "0") == "1" and get_setting(db, "rates_updated_on", "") != today_str():
+            last_try = float(get_setting(db, "rates_last_try", "0") or 0)
+            if time.time() - last_try > 3600:  # при збої НБУ повторюємо не частіше разу на годину
+                set_setting(db, "rates_last_try", str(time.time()))
+                db.commit()
+                try:
+                    update_rates_from_nbu(db)
+                except Exception:
+                    pass
+        run_scheduled_backup(db)
+    finally:
+        db.close()
+    try:
+        send_overdue_reminder()
+    except Exception:
+        pass
+
+
 @app.route("/settings/backup", methods=["POST"])
 @login_required
 def settings_backup_now():
@@ -8821,6 +9571,10 @@ def settings_reset_demo_data():
     return redirect(url_for("settings_page"))
 
 
+send_overdue_reminder = lambda: False
+import features_ext  # noqa: E402  (додаткові розділи: деталі, якість, план/факт, дошка, аудит)
+features_ext.register(sys.modules[__name__])
+
 init_db()  # ІНІЦІАЛІЗАЦІЯ БАЗИ ДАНИХ (виконується один раз при старті процесу)
 
 if __name__ == "__main__":
@@ -8832,4 +9586,5 @@ if __name__ == "__main__":
     # надійний CRM_SECRET_KEY через змінну середовища.
     debug_mode = os.environ.get("CRM_DEBUG", "0") == "1"
     host = os.environ.get("CRM_HOST", "127.0.0.1")
+    start_machine_poller()
     app.run(debug=debug_mode, host=host, port=int(os.environ.get("CRM_PORT", "5000")))
