@@ -100,14 +100,12 @@ jobs:
         run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
         shell: pwsh
 
-      - name: Завантажити OsnastkaMarket.exe як артефакт
-        uses: actions/upload-artifact@v4
-        with:
-          name: OsnastkaMarket-exe-only
-          path: dist/OsnastkaMarket.exe
-
-      - name: Завантажити повний інсталятор як артефакт
+      # Один артефакт замість двох і з коротким терміном зберігання:
+      # безкоштовна квота GitHub на артефакти швидко закінчується
+      # (помилка "Artifact storage quota has been hit").
+      - name: Завантажити інсталятор як артефакт
         uses: actions/upload-artifact@v4
         with:
           name: OsnastkaMarket-Setup-installer
           path: Output/OsnastkaMarket-Setup.exe
+          retention-days: 3
