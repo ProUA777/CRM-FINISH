@@ -126,6 +126,28 @@ def register(A):
                                page=page, q=q, user=user, users=users)
 
     # ------------------------------------------------------------------ parts catalog
+    A.ATTACHMENT_ENTITY_TABLES["part"] = "parts"       # креслення деталей — через спільні вкладення
+    PART_EDIT_ROLES = ("admin", "sales", "production")
+
+    @app.before_request
+    def guard_part_attachments():
+        """Креслення деталей змінюють лише admin/sales/production (решта — тільки завантаження)."""
+        if request.method != "POST" or request.endpoint not in ("attachment_upload", "attachment_delete"):
+            return None
+        user = A.get_current_user()
+        if not user or user["role"] in PART_EDIT_ROLES:
+            return None
+        et = (request.view_args or {}).get("entity_type")
+        if request.endpoint == "attachment_delete":
+            row = get_db().execute("SELECT entity_type FROM attachments WHERE id=?",
+                                   ((request.view_args or {}).get("attachment_id"),)).fetchone()
+            et = row["entity_type"] if row else None
+        if et == "part":
+            abort(403)
+        return None
+
+    def _part_files(db, part_id):
+        return A.get_attachments("part", part_id)
     @app.route("/parts")
     @login_required
     @role_required("sales", "production", "viewer")
@@ -138,10 +160,14 @@ def register(A):
             sql += " AND (p.name LIKE ? OR p.drawing_no LIKE ? OR p.material LIKE ? OR c.name LIKE ?)"
             params = [f"%{q}%"] * 4
         parts = db.execute(sql + " ORDER BY p.name", params).fetchall()
+        counts = {r["entity_id"]: r["c"] for r in db.execute(
+            "SELECT entity_id, COUNT(*) c FROM attachments WHERE entity_type='part' GROUP BY entity_id")}
+        parts = [dict(p, files=counts.get(p["id"], 0)) for p in parts]
         return render_template("parts_list.html", active="parts", parts=parts, q=q)
 
     def _part_form_context(db, part):
         return dict(active="parts", part=part, CURRENCIES=A.CURRENCIES,
+                    files=_part_files(db, part["id"]) if part else [],
                     clients=db.execute("SELECT id, name FROM clients ORDER BY name").fetchall())
 
     @app.route("/parts/new", methods=["GET", "POST"])
@@ -183,6 +209,13 @@ def register(A):
                     db.execute("""INSERT INTO parts (name, drawing_no, client_id, material, routing_text, last_price,
                                   currency, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?)""", values + (A.now_iso(),))
                 db.commit()
+                pid = part["id"] if part else db.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+                upload = request.files.get("drawing")
+                if upload and upload.filename:
+                    ok, err = A.save_uploaded_file(upload, "part", pid)
+                    if not ok:
+                        flash(f"Деталь збережено, але креслення не додано: {err}", "error")
+                        return redirect(url_for("parts_edit", part_id=pid))
                 flash("Деталь збережено", "success")
                 return redirect(url_for("parts_list"))
         return render_template("parts_form.html", **_part_form_context(db, part))
@@ -219,6 +252,21 @@ def register(A):
              session.get("user_id"), tech, A.now_iso(), A.now_iso()))
         deal_id = db.execute("SELECT last_insert_rowid() id").fetchone()["id"]
         A.log_activity(db, deal_id, part["client_id"], "note", f"Угоду створено з каталогу деталей: «{part['name']}»")
+        import os
+        import shutil
+        import uuid
+        for att in A.get_attachments("part", part_id):
+            src = os.path.join(A.UPLOAD_DIR, "part", str(part_id), att["stored_name"])
+            if not os.path.exists(src):
+                continue
+            ddir = os.path.join(A.UPLOAD_DIR, "deal", str(deal_id))
+            os.makedirs(ddir, exist_ok=True)
+            ext = att["stored_name"].rsplit(".", 1)[-1]
+            new_name = f"{uuid.uuid4().hex}.{ext}"
+            shutil.copyfile(src, os.path.join(ddir, new_name))
+            db.execute("""INSERT INTO attachments (entity_type, entity_id, original_name, stored_name, size_bytes,
+                          uploaded_by, uploaded_at) VALUES ('deal',?,?,?,?,?,?)""",
+                       (deal_id, att["original_name"], new_name, att["size_bytes"], session.get("user_id"), A.now_iso()))
         db.commit()
         A.notify_event(f"🆕 Нова угода з каталогу: «{part['name']}»")
         flash("Угоду створено з даних деталі. Перевірте суму й терміни.", "success")
