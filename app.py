@@ -2972,7 +2972,7 @@ h1,h2,h3,.brand,.stage-title,.kpi-value{font-family:'Rajdhani',sans-serif;}
 a{color:inherit;text-decoration:none;}
 .layout{display:flex; min-height:100vh;}
 .sidebar{
-  width:230px; background:var(--metal); border-right:1px solid var(--border);
+  width:240px; overflow:hidden; background:var(--metal); border-right:1px solid var(--border);
   display:flex; flex-direction:column; position:sticky; top:0; height:100vh;
   box-shadow: inset -1px 0 0 rgba(255,255,255,.03);
 }
@@ -2982,7 +2982,19 @@ a{color:inherit;text-decoration:none;}
   display:flex; align-items:center; gap:10px;
 }
 .brand .gear{color:var(--accent); font-size:22px;}
-.nav{padding:14px 10px; flex:1;}
+.nav{padding:12px 10px; flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain;}
+.nav::-webkit-scrollbar{width:6px;} .nav::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12); border-radius:3px;}
+.nav-group{margin:6px 0 2px;}
+.nav-group > summary{
+  list-style:none; cursor:pointer; user-select:none; padding:8px 12px; font-size:11px; font-weight:700;
+  letter-spacing:1.2px; text-transform:uppercase; color:var(--text-dim); display:flex; align-items:center;
+  justify-content:space-between; border-radius:6px;
+}
+.nav-group > summary::-webkit-details-marker{display:none;}
+.nav-group > summary::after{content:'▸'; font-size:11px; transition:transform .15s;}
+.nav-group[open] > summary::after{transform:rotate(90deg);}
+.nav-group > summary:hover{color:var(--text); background:rgba(255,255,255,.03);}
+.nav-group > a{margin-left:6px; padding:8px 10px; font-size:13px; margin-bottom:2px;}
 .nav a{
   display:flex; align-items:center; gap:10px; padding:10px 12px; margin-bottom:4px;
   border-radius:8px; color:var(--text-dim); font-weight:500; font-size:13.5px;
@@ -3156,51 +3168,88 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
   <aside class="sidebar">
     <div class="brand"><span class="gear">⚙</span> Оснастка-Маркет</div>
     <nav class="nav">
+      {% set role = current_user['role'] %}
       <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active=='dashboard' }}"><span class="icon">▣</span> Дашборд</a>
-      {% if current_user['role'] in ('admin','sales','viewer') %}
-      <a href="{{ url_for('deals_board') }}" class="{{ 'active' if active=='deals' }}"><span class="icon">◧</span> Угоди (воронка)</a>
-      <a href="{{ url_for('cost_calculator') }}" class="{{ 'active' if active=='calculator' }}"><span class="icon">🧮</span> Калькулятор вартості</a>
-      <a href="{{ url_for('clients_list') }}" class="{{ 'active' if active=='clients' }}"><span class="icon">◈</span> Клієнти</a>
-      <a href="{{ url_for('tasks_list') }}" class="{{ 'active' if active=='tasks' }}"><span class="icon">☑</span> Задачі</a>
-      <a href="{{ url_for('calendar_view') }}" class="{{ 'active' if active=='calendar' }}"><span class="icon">📅</span> Календар</a>
+
+      {% if role in ('admin','sales','viewer','production') %}
+      <details class="nav-group" data-g="sales" {{ 'open' if active in ('deals','calculator','clients','tasks','calendar','reorder','parts') }}>
+        <summary>Продажі</summary>
+        {% if role in ('admin','sales','viewer') %}
+        <a href="{{ url_for('deals_board') }}" class="{{ 'active' if active=='deals' }}"><span class="icon">◧</span> Угоди (воронка)</a>
+        <a href="{{ url_for('cost_calculator') }}" class="{{ 'active' if active=='calculator' }}"><span class="icon">🧮</span> Калькулятор вартості</a>
+        <a href="{{ url_for('clients_list') }}" class="{{ 'active' if active=='clients' }}"><span class="icon">◈</span> Клієнти</a>
+        <a href="{{ url_for('tasks_list') }}" class="{{ 'active' if active=='tasks' }}"><span class="icon">☑</span> Задачі</a>
+        <a href="{{ url_for('calendar_view') }}" class="{{ 'active' if active=='calendar' }}"><span class="icon">📅</span> Календар</a>
+        {% endif %}
+        {% if role in ('admin','sales') %}
+        <a href="{{ url_for('clients_reorder') }}" class="{{ 'active' if active=='reorder' }}"><span class="icon">↻</span> Повторні замовлення{% if reorder_count() %} <span class="badge badge-high">{{ reorder_count() }}</span>{% endif %}</a>
+        {% endif %}
+        <a href="{{ url_for('parts_list') }}" class="{{ 'active' if active=='parts' }}"><span class="icon">⬡</span> Каталог деталей</a>
+      </details>
       {% endif %}
-      {% if current_user['role'] in ('admin','sales') %}
-      <a href="{{ url_for('clients_reorder') }}" class="{{ 'active' if active=='reorder' }}"><span class="icon">↻</span> Повторні замовлення{% if reorder_count() %} <span class="badge badge-high">{{ reorder_count() }}</span>{% endif %}</a>
+
+      <details class="nav-group" data-g="prod" {{ 'open' if active in ('machines','production','board','quality','shift_log') }}>
+        <summary>Виробництво</summary>
+        <a href="{{ url_for('machines_list') }}" class="{{ 'active' if active=='machines' }}"><span class="icon">⬢</span> Наше обладнання</a>
+        {% if role in ('admin','production','sales','viewer') %}
+        <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробничі замовлення' }}</a>
+        <a href="{{ url_for('production_board') }}" class="{{ 'active' if active=='board' }}"><span class="icon">▦</span> Завантаження верстатів</a>
+        <a href="{{ url_for('quality_list') }}" class="{{ 'active' if active=='quality' }}"><span class="icon">✔</span> Контроль якості</a>
+        {% endif %}
+        {% if role in ('admin','production') %}
+        <a href="{{ url_for('shift_log_list') }}" class="{{ 'active' if active=='shift_log' }}"><span class="icon">📋</span> Змінний журнал</a>
+        {% endif %}
+      </details>
+
+      {% if role in ('admin','warehouse','production','viewer','service') %}
+      <details class="nav-group" data-g="stock" {{ 'open' if active in ('warehouse','purchase','service') }}>
+        <summary>Склад і сервіс</summary>
+        {% if role in ('admin','warehouse','production','viewer') %}
+        <a href="{{ url_for('warehouse_list') }}" class="{{ 'active' if active=='warehouse' }}"><span class="icon">▤</span> Склад</a>
+        <a href="{{ url_for('purchase_request') }}" class="{{ 'active' if active=='purchase' }}"><span class="icon">🛒</span> Заявка на закупівлю</a>
+        {% endif %}
+        {% if role in ('admin','service','viewer') %}
+        <a href="{{ url_for('service_list') }}" class="{{ 'active' if active=='service' }}"><span class="icon">✚</span> Рекламації та доробки</a>
+        {% endif %}
+      </details>
       {% endif %}
-      {% if current_user['role'] in ('admin','sales','production','viewer') %}
-      <a href="{{ url_for('parts_list') }}" class="{{ 'active' if active=='parts' }}"><span class="icon">⬡</span> Каталог деталей</a>
+
+      {% if role in ('admin','accountant','sales') %}
+      <details class="nav-group" data-g="fin" {{ 'open' if active in ('finance','overdue','costs') }}>
+        <summary>Фінанси</summary>
+        {% if role in ('admin','accountant') %}
+        <a href="{{ url_for('finance_view') }}" class="{{ 'active' if active=='finance' }}"><span class="icon">💰</span> Фінанси</a>
+        <a href="{{ url_for('payments_overdue') }}" class="{{ 'active' if active=='overdue' }}"><span class="icon">⏰</span> Прострочені оплати{% if overdue_summary().count %} <span class="badge badge-high">{{ overdue_summary().count }}</span>{% endif %}</a>
+        {% endif %}
+        <a href="{{ url_for('production_costs') }}" class="{{ 'active' if active=='costs' }}"><span class="icon">⚖</span> План / факт</a>
+      </details>
       {% endif %}
-      <a href="{{ url_for('machines_list') }}" class="{{ 'active' if active=='machines' }}"><span class="icon">⬢</span> Наше обладнання</a>
-      {% if current_user['role'] in ('admin','production','sales','viewer') %}
-      <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробництво' }}</a>
-      {% endif %}
-      {% if current_user['role'] in ('admin','production','sales','viewer') %}
-      <a href="{{ url_for('production_board') }}" class="{{ 'active' if active=='board' }}"><span class="icon">▦</span> Завантаження верстатів</a>
-      <a href="{{ url_for('quality_list') }}" class="{{ 'active' if active=='quality' }}"><span class="icon">✔</span> Контроль якості</a>
-      {% endif %}
-      {% if current_user['role'] in ('admin','accountant','sales') %}
-      <a href="{{ url_for('production_costs') }}" class="{{ 'active' if active=='costs' }}"><span class="icon">⚖</span> План / факт</a>
-      {% endif %}
-      {% if current_user['role'] in ('admin','production') %}
-      <a href="{{ url_for('shift_log_list') }}" class="{{ 'active' if active=='shift_log' }}"><span class="icon">📋</span> Змінний журнал</a>
-      {% endif %}
-      {% if current_user['role'] in ('admin','warehouse','production','viewer') %}
-      <a href="{{ url_for('warehouse_list') }}" class="{{ 'active' if active=='warehouse' }}"><span class="icon">▤</span> Склад</a>
-      <a href="{{ url_for('purchase_request') }}" class="{{ 'active' if active=='purchase' }}"><span class="icon">🛒</span> Заявка на закупівлю</a>
-      {% endif %}
-      {% if current_user['role'] in ('admin','service','viewer') %}
-      <a href="{{ url_for('service_list') }}" class="{{ 'active' if active=='service' }}"><span class="icon">✚</span> Рекламації та доробки</a>
-      {% endif %}
-      {% if current_user['role'] in ('admin','accountant') %}
-      <a href="{{ url_for('finance_view') }}" class="{{ 'active' if active=='finance' }}"><span class="icon">💰</span> Фінанси</a>
-      <a href="{{ url_for('payments_overdue') }}" class="{{ 'active' if active=='overdue' }}"><span class="icon">⏰</span> Прострочені оплати{% if overdue_summary().count %} <span class="badge badge-high">{{ overdue_summary().count }}</span>{% endif %}</a>
-      {% endif %}
-      {% if current_user['role']=='admin' %}
-      <a href="{{ url_for('audit_log_view') }}" class="{{ 'active' if active=='audit' }}"><span class="icon">☰</span> Журнал змін</a>
-      <a href="{{ url_for('users_list') }}" class="{{ 'active' if active=='users' }}"><span class="icon">☺</span> Користувачі</a>
-      <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' }}"><span class="icon">⚒</span> Налаштування</a>
+
+      {% if role=='admin' %}
+      <details class="nav-group" data-g="admin" {{ 'open' if active in ('users','settings','audit') }}>
+        <summary>Адміністрування</summary>
+        <a href="{{ url_for('users_list') }}" class="{{ 'active' if active=='users' }}"><span class="icon">☺</span> Користувачі</a>
+        <a href="{{ url_for('audit_log_view') }}" class="{{ 'active' if active=='audit' }}"><span class="icon">☰</span> Журнал змін</a>
+        <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' }}"><span class="icon">⚒</span> Налаштування</a>
+      </details>
       {% endif %}
     </nav>
+    <script>
+    (function(){
+      try{
+        var saved = JSON.parse(localStorage.getItem('crm_nav_groups') || '{}');
+        document.querySelectorAll('.nav-group').forEach(function(d){
+          var g = d.dataset.g;
+          if (saved[g] === 1) d.open = true;            // користувач розгорнув раніше
+          if (saved[g] === 0 && !d.querySelector('a.active')) d.open = false;
+          d.addEventListener('toggle', function(){
+            saved[g] = d.open ? 1 : 0;
+            localStorage.setItem('crm_nav_groups', JSON.stringify(saved));
+          });
+        });
+      }catch(e){}
+    })();
+    </script>
     <div class="sidebar-footer">
       <a href="{{ url_for('my_profile') }}" style="color:var(--text);">{{ current_user['full_name'] }}</a><br>
       <span style="color:var(--accent-2); font-size:11px;">{{ ROLE_LABEL.get(current_user['role'], current_user['role']) }}</span><br>
