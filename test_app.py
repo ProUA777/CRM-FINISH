@@ -4671,3 +4671,58 @@ def test_milling_operator_has_own_mobile_terminal(client):
         assert db.execute("SELECT status FROM production_operations WHERE id=?", (op["id"],)).fetchone()[0] == "waiting"
     # термінал адаптований під телефон: переглядова область і великі кнопки
     assert 'name="viewport"' in own
+
+
+def test_parts_drawings_upload_download_copy_to_deal_and_permissions(client):
+    import io
+    login(client)
+    db = _raw_db(client)
+    cid = db.execute("SELECT id FROM clients ORDER BY id").fetchone()["id"]
+    tok = get_csrf_token(client)
+    # креслення прямо при створенні деталі
+    r = client.post("/parts/new", data={"_csrf_token": tok, "name": "Фланець", "client_id": cid, "currency": "UAH",
+                                        "drawing": (io.BytesIO(b"%PDF-1.4 test"), "flange.pdf")},
+                    content_type="multipart/form-data")
+    assert r.status_code == 302
+    pid = db.execute("SELECT id FROM parts WHERE name='Фланець'").fetchone()["id"]
+    att = db.execute("SELECT * FROM attachments WHERE entity_type='part' AND entity_id=?", (pid,)).fetchone()
+    assert att and att["original_name"] == "flange.pdf"
+    assert "flange.pdf" in client.get(f"/parts/{pid}/edit").get_data(as_text=True)
+    assert "📎 1" in client.get("/parts").get_data(as_text=True)
+    d = client.get(f"/attachments/{att['id']}/download")
+    assert d.status_code == 200 and d.data.startswith(b"%PDF")
+    # ще один файл і заборонене розширення
+    ok = client.post(f"/attachments/part/{pid}/upload", data={"_csrf_token": tok, "file": (io.BytesIO(b"x"), "a.dxf")},
+                     content_type="multipart/form-data")
+    assert ok.status_code == 302
+    client.post(f"/attachments/part/{pid}/upload", data={"_csrf_token": tok, "file": (io.BytesIO(b"x"), "evil.exe")},
+                content_type="multipart/form-data")
+    assert db.execute("SELECT COUNT(*) c FROM attachments WHERE entity_type='part'").fetchone()["c"] == 2
+    # угода з каталогу отримує копії креслень
+    post(client, f"/parts/{pid}/new-deal")
+    deal = db.execute("SELECT id FROM deals ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    names = [r["original_name"] for r in db.execute("SELECT original_name FROM attachments WHERE entity_type='deal' AND entity_id=?", (deal,))]
+    assert sorted(names) == ["a.dxf", "flange.pdf"]
+    # склад не може змінювати креслення
+    client.get("/logout")
+    login(client, "sklad", "sklad123")
+    tok2 = get_csrf_token(client)
+    assert client.post(f"/attachments/part/{pid}/upload", data={"_csrf_token": tok2, "file": (io.BytesIO(b"x"), "b.pdf")},
+                       content_type="multipart/form-data").status_code == 403
+    assert client.post(f"/attachments/{att['id']}/delete", data={"_csrf_token": tok2}).status_code == 403
+    assert db.execute("SELECT COUNT(*) c FROM attachments WHERE entity_type='part'").fetchone()["c"] == 2
+
+
+def test_sidebar_groups_follow_roles(client):
+    login(client)
+    html = client.get("/").get_data(as_text=True)
+    for g in ("Продажі", "Виробництво", "Склад і сервіс", "Фінанси", "Адміністрування"):
+        assert g in html
+    client.get("/logout")
+    login(client, "sklad", "sklad123")
+    h = client.get("/").get_data(as_text=True)
+    assert "Склад і сервіс" in h and "Адміністрування" not in h and "Журнал змін" not in h and "План / факт" not in h
+    client.get("/logout")
+    login(client, "buh", "buh12345")
+    h = client.get("/").get_data(as_text=True)
+    assert "Прострочені оплати" in h and "Каталог деталей" not in h
