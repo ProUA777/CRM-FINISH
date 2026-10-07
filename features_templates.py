@@ -7,7 +7,7 @@ def _page(title, heading, sub, body):
 
 AUDIT = _page("Журнал змін", "Журнал змін", "Хто і що змінював у системі", """
 <form class="toolbar" method="get" style="display:flex;gap:8px;margin-bottom:12px">
-  <input name="q" value="{{ q }}" placeholder="Пошук за дією чи змістом" style="max-width:280px">
+  <input name="q" value="{{ q }}" placeholder="Пошук за дією чи змістом" style="max-width:280px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px">
   <select name="user" style="max-width:180px"><option value="">Усі користувачі</option>
   {% for u in users %}<option value="{{ u }}" {{ 'selected' if u==user }}>{{ u }}</option>{% endfor %}</select>
   <button class="btn btn-primary btn-sm">Фільтр</button></form>
@@ -22,18 +22,18 @@ AUDIT = _page("Журнал змін", "Журнал змін", "Хто і що 
 
 PARTS_LIST = _page("Каталог деталей", "Каталог деталей", "Креслення, матеріал, техпроцес і остання ціна", """
 <div class="toolbar" style="display:flex;gap:8px;margin-bottom:12px">
-<form method="get" style="display:flex;gap:8px"><input name="q" value="{{ q }}" placeholder="Назва, креслення, матеріал, клієнт"><button class="btn btn-sm">Знайти</button></form>
+<form method="get" style="display:flex;gap:8px"><input name="q" value="{{ q }}" placeholder="Назва, креслення, матеріал, клієнт" style="min-width:300px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px"><button class="btn btn-sm">Знайти</button></form>
 {% if current_user['role'] in ('admin','sales','production') %}<a class="btn btn-primary" href="{{ url_for('parts_new') }}">+ Нова деталь</a>{% endif %}</div>
 <div class="card table-wrap"><table id="parts-table">
-<tr><th>Назва</th><th>Креслення</th><th>Клієнт</th><th>Матеріал</th><th>Остання ціна</th><th></th></tr>
-{% for p in parts %}<tr><td>{{ p['name'] }}</td><td>{{ p['drawing_no'] or '—' }}</td><td>{{ p['client_name'] or '—' }}</td>
+<tr><th>Назва</th><th>Креслення</th><th>Файли</th><th>Клієнт</th><th>Матеріал</th><th>Остання ціна</th><th></th></tr>
+{% for p in parts %}<tr><td>{{ p['name'] }}</td><td>{{ p['drawing_no'] or '—' }}</td><td>{% if p['files'] %}📎 {{ p['files'] }}{% else %}—{% endif %}</td><td>{{ p['client_name'] or '—' }}</td>
 <td>{{ p['material'] or '—' }}</td><td>{% if p['last_price'] %}{{ p['last_price'] | money(p['currency']) }}{% else %}—{% endif %}</td>
 <td style="white-space:nowrap">{% if current_user['role'] in ('admin','sales','production') %}<a class="btn btn-sm" href="{{ url_for('parts_edit', part_id=p['id']) }}">Редагувати</a>{% endif %}
 {% if current_user['role'] in ('admin','sales') %}<form method="post" action="{{ url_for('parts_new_deal', part_id=p['id']) }}" style="display:inline"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-primary">→ Угода</button></form>{% endif %}</td></tr>
-{% else %}<tr><td colspan="6" class="empty">Каталог порожній</td></tr>{% endfor %}</table></div>""")
+{% else %}<tr><td colspan="7" class="empty">Каталог порожній</td></tr>{% endfor %}</table></div>""")
 
 PARTS_FORM = _page("Деталь", "Деталь", "Картка деталі в каталозі", """
-<form method="post" class="card" style="padding:20px;display:grid;gap:12px;max-width:720px">
+<form method="post" enctype="multipart/form-data" class="card" style="padding:20px;display:grid;gap:12px;max-width:720px">
 <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <div class="field"><label>Назва деталі *</label><input name="name" value="{{ part['name'] if part }}" required></div>
 <div class="field"><label>Номер креслення</label><input name="drawing_no" value="{{ part['drawing_no'] or '' if part }}"></div>
@@ -44,7 +44,17 @@ PARTS_FORM = _page("Деталь", "Деталь", "Картка деталі в
 <div class="field"><label>Остання ціна</label><div style="display:flex;gap:8px"><input name="last_price" value="{{ part['last_price'] if part and part['last_price'] is not none }}"><select name="currency" style="max-width:100px">
 {% for c in CURRENCIES %}<option {{ 'selected' if part and part['currency']==c }}>{{ c }}</option>{% endfor %}</select></div></div>
 <div class="field"><label>Примітки</label><textarea name="notes" rows="2">{{ part['notes'] or '' if part }}</textarea></div>
+<div class="field"><label>Креслення / файл (PDF, DXF, STEP, зображення…)</label><input type="file" name="drawing"></div>
 <div style="display:flex;gap:8px"><button class="btn btn-primary">Зберегти</button><a class="btn btn-ghost" href="{{ url_for('parts_list') }}">Скасувати</a></div></form>
+{% if part %}<div class="card" id="part-files" style="padding:16px;margin-top:16px;max-width:720px"><h3 style="margin-bottom:10px">Креслення та файли</h3>
+<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+{% for a in files %}<div style="border:1px solid var(--border);border-radius:8px;padding:10px;width:220px">
+<div style="font-size:12.5px;word-break:break-all;margin-bottom:6px">📎 {{ a['original_name'] }}</div>
+<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">{{ (a['size_bytes']/1024)|round(1) }} КБ · {{ a['uploader_name'] or '' }}</div>
+<div style="display:flex;gap:6px"><a class="btn btn-sm" href="{{ url_for('attachment_download', attachment_id=a['id']) }}">Завантажити</a>
+{% if current_user['role'] in ('admin','sales','production') %}<form method="post" action="{{ url_for('attachment_delete', attachment_id=a['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-danger">✕</button></form>{% endif %}</div></div>
+{% else %}<div class="empty">Файлів ще немає</div>{% endfor %}</div>
+{% if current_user['role'] in ('admin','sales','production') %}<form method="post" enctype="multipart/form-data" action="{{ url_for('attachment_upload', entity_type='part', entity_id=part['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><input type="file" name="file" required> <button class="btn btn-sm btn-primary">+ Додати файл</button></form>{% endif %}</div>{% endif %}
 {% if part and current_user['role'] in ('admin','sales','production') %}<form method="post" action="{{ url_for('parts_delete', part_id=part['id']) }}" style="margin-top:12px" onsubmit="return confirm('Видалити деталь з каталогу?')"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm">Видалити</button></form>{% endif %}""")
 
 COSTS = _page("План/факт", "План / факт по замовленнях", "Години, матеріали та маржа (за ціною угоди)", """
