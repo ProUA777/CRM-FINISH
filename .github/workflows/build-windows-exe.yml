@@ -1,7 +1,7 @@
 name: Build Windows Installer
 
 # Збирає OsnastkaMarket.exe та повноцінний Setup.exe-інсталятор на СПРАВЖНЬОМУ
-# Windows-раннері GitHub (безкоштовно для публічних репозіиторіїв,
+# Windows-раннері GitHub (безкоштовно для публічних репозиторіїв,
 # і в межах безкоштовного ліміту для приватних). Не потребує Windows-ПК
 # у розробника — усе відбувається в хмарі GitHub.
 #
@@ -18,6 +18,9 @@ on:
   push:
     branches: [ main, master ]
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -100,12 +103,15 @@ jobs:
         run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
         shell: pwsh
 
-      # Один артефакт замість двох і з коротким терміном зберігання:
-      # безкоштовна квота GitHub на артефакти швидко закінчується
-      # (помилка "Artifact storage quota has been hit").
-      - name: Завантажити інсталятор як артефакт
-        uses: actions/upload-artifact@v4
+      # Публікуємо у Releases, а не в Actions-артефакти: безкоштовна квота
+      # артефактів швидко закінчується ("Artifact storage quota has been hit"),
+      # а файли релізів у цю квоту не входять.
+      - name: Опублікувати у Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: OsnastkaMarket-Setup-installer
-          path: Output/OsnastkaMarket-Setup.exe
-          retention-days: 3
+          tag_name: build-${{ github.run_number }}
+          name: Оснастка-Маркет, збірка ${{ github.run_number }}
+          body: "Автоматична збірка з commit ${{ github.sha }}. Завантажте OsnastkaMarket-Setup.exe (інсталятор) або OsnastkaMarket.exe (без встановлення)."
+          files: |
+            Output/OsnastkaMarket-Setup.exe
+            dist/OsnastkaMarket.exe
