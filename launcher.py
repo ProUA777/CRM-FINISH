@@ -129,6 +129,26 @@ def _setup_logging():
 
 log = _setup_logging()
 
+# Діагностика для --noconsole exe: якщо запуск «зависне», через 60 с у
+# launcher.log з'явиться стек усіх потоків (де саме застрягли), а винятки
+# в потоках більше не губляться безслідно.
+try:
+    import faulthandler
+    _fh_file = open(os.path.join(DATA_DIR, "logs", "faulthandler.log"), "a", encoding="utf-8")
+    faulthandler.enable(file=_fh_file)
+    faulthandler.dump_traceback_later(60, repeat=False, file=_fh_file)
+except Exception:
+    pass
+
+
+def _thread_excepthook(args):
+    log.error("Необроблений виняток у потоці %s", getattr(args.thread, "name", "?"),
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+threading.excepthook = _thread_excepthook
+log.info("Launcher стартував (frozen=%s, python=%s)", getattr(sys, "frozen", False), sys.version.split()[0])
+
 
 def start_server():
     """Запускає CRM через waitress у поточному потоці (викликається з окремого
@@ -139,6 +159,17 @@ def start_server():
     # у самій CRM показувала правильну адресу для інших комп'ютерів, а не
     # завжди 5000.
     os.environ["CRM_PORT"] = str(PORT)
+    try:
+        _start_server_inner()
+    except BaseException:
+        # exe збирається з --noconsole: stderr відсутній, і виняток у потоці
+        # зникав безслідно (сервер не стартував, а причини ніхто не бачив).
+        log.exception("Сервер не запустився")
+        raise
+
+
+def _start_server_inner():
+    log.info("Запуск сервера Оснастка-Маркет (порт %s)...", PORT)
     import app as crm_app  # імпорт тут, а не на верху файлу: тільки в цей момент
                             # DATA_DIR/DB_PATH з app.py вже коректно визначені
                             # для frozen-режиму (див. app.py: _default_data_dir)
