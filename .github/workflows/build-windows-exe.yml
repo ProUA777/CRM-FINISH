@@ -46,6 +46,14 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller pystray pillow
 
+      - name: Перевірка імпорту на Windows (до збірки exe)
+        run: |
+          $env:CRM_DATA_DIR = Join-Path $env:RUNNER_TEMP "crm_import_check"
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          python -c "import app; print('import app OK')"
+          Write-Host "імпорт зайняв $($sw.Elapsed.TotalSeconds) с"
+        shell: pwsh
+
       - name: Згенерувати іконку
         run: python make_icon.py
 
@@ -90,6 +98,10 @@ jobs:
             Write-Host "=== exited: $($proc.HasExited) ==="
             if (Test-Path $log) { Write-Host "=== launcher.log ==="; Get-Content $log -Tail 80 }
             else { Write-Host "launcher.log не знайдено: $log" }
+            $fh = Join-Path $env:LOCALAPPDATA "OsnastkaMarket\logs\faulthandler.log"
+            if (Test-Path $fh) { Write-Host "=== faulthandler.log ==="; Get-Content $fh -Tail 80 }
+            Write-Host "=== файли в OsnastkaMarket ==="; Get-ChildItem -Recurse (Join-Path $env:LOCALAPPDATA "OsnastkaMarket") -ErrorAction SilentlyContinue | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host "=== процеси ==="; Get-Process OsnastkaMarket -ErrorAction SilentlyContinue | Select-Object Id,CPU,WorkingSet | Format-Table | Out-String | Write-Host
             throw "CRM не відповідає на /login"
           }
           Write-Host "OK: OsnastkaMarket.exe відповідає на порту 5000"
