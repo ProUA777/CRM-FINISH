@@ -13,8 +13,8 @@ AUDIT = _page("Журнал змін", "Журнал змін", "Хто і що 
   <button class="btn btn-primary btn-sm">Фільтр</button></form>
 <div class="card table-wrap"><table id="audit-table">
 <tr><th>Час</th><th>Користувач</th><th>Дія</th><th>Деталі</th><th>Результат</th></tr>
-{% for r in rows %}<tr><td>{{ r['at'] }}</td><td>{{ r['username'] }}</td><td>{{ r['label'] }}</td>
-<td style="color:var(--text-dim);font-size:12px">{{ r['detail'] }}</td><td>{{ r['result'] }}</td></tr>
+{% for r in rows %}<tr><td style="white-space:nowrap">{{ r['at'] }}</td><td>{{ r['username'] }}</td><td style="min-width:150px">{{ r['label'] }}</td>
+<td style="color:var(--text-dim);font-size:12.5px;min-width:200px;line-height:1.5">{{ r['detail'] }}</td><td>{{ r['result'] }}</td></tr>
 {% else %}<tr><td colspan="5" class="empty">Записів ще немає</td></tr>{% endfor %}</table></div>
 <div style="margin-top:12px;display:flex;gap:8px">
 {% if page>1 %}<a class="btn btn-sm" href="?page={{ page-1 }}&q={{ q }}&user={{ user }}">← Назад</a>{% endif %}
@@ -80,8 +80,8 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 {% else %}<div class="card empty" style="padding:24px">Усі залишки в нормі 👍</div>{% endif %}""")
 
 QUALITY_LIST = _page("Контроль якості", "Контроль якості", "Перевірки та облік браку за 30 днів", """
-<div style="display:flex;gap:12px;margin-bottom:12px"><div class="card stat" style="padding:14px">Перевірено<b>{{ checked }}</b></div>
-<div class="card stat" style="padding:14px">Брак<b>{{ defects }}</b></div><div class="card stat" style="padding:14px">% браку<b id="defect-pct">{{ pct }}%</b></div>
+<div style="display:flex;gap:12px;margin-bottom:12px"><div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">Перевірено<b>{{ checked }}</b></div>
+<div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">Брак<b>{{ defects }}</b></div><div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">% браку<b id="defect-pct">{{ pct }}%</b></div>
 {% if current_user['role'] in ('admin','production') %}<a class="btn btn-primary" style="margin-left:auto;align-self:center" href="{{ url_for('quality_new') }}">+ Перевірка</a>{% endif %}</div>
 {% if by_wc %}<div class="card" style="padding:12px;margin-bottom:12px">{% for w in by_wc %}<span class="tag">{{ w['name'] }}: брак {{ w['d'] }} з {{ w['c'] }}</span> {% endfor %}</div>{% endif %}
 <div class="card table-wrap"><table id="quality-table"><tr><th>Дата</th><th>Замовлення</th><th>Верстат</th><th>Перевірено</th><th>Брак</th><th>Причина</th><th>Інспектор</th></tr>

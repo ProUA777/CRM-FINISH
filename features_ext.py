@@ -30,15 +30,49 @@ QUALITY_CHECKLIST = [
 ]
 
 AUDIT_LABELS = {
+    "client_new": "Створено клієнта", "client_edit": "Змінено клієнта", "client_delete": "Видалено клієнта",
+    "contact_add": "Додано контакт", "clients_import": "Імпорт клієнтів",
     "deal_new": "Створено угоду", "deal_edit": "Змінено угоду", "deal_delete": "Видалено угоду",
-    "deal_move": "Змінено етап угоди", "payment_add": "Додано платіж", "payment_toggle": "Змінено статус платежу",
-    "payment_delete": "Видалено платіж", "client_new": "Створено клієнта", "client_edit": "Змінено клієнта",
-    "client_delete": "Видалено клієнта", "settings_save": "Змінено налаштування",
-    "settings_rates_nbu": "Курси з НБУ", "work_center_connect": "Підключення верстата",
-    "warehouse_item_new": "Нова позиція складу", "warehouse_transaction": "Рух по складу",
-    "parts_save": "Збережено деталь", "parts_delete": "Видалено деталь",
-    "quality_new": "Перевірка якості", "operation_move": "Перенесено операцію",
-    "operation_advance": "Статус операції", "users_toggle": "Користувача змінено",
+    "deal_move": "Змінено етап угоди", "deal_select_machine": "Обрано верстат для угоди",
+    "payment_add": "Додано платіж", "payment_toggle": "Змінено статус платежу", "payment_delete": "Видалено платіж",
+    "activity_add": "Додано нотатку до угоди", "task_add": "Додано задачу", "task_toggle": "Задачу виконано/відновлено",
+    "task_delete": "Видалено задачу", "calculator_history_delete": "Видалено розрахунок",
+    "machine_new": "Додано верстат", "machine_edit": "Змінено верстат", "machine_delete": "Видалено верстат",
+    "service_add": "Нова рекламація", "service_update_status": "Змінено статус рекламації",
+    "service_delete": "Видалено рекламацію", "my_profile": "Змінено власний профіль",
+    "users_list": "Створено користувача", "user_toggle": "Змінено доступ користувача",
+    "production_reschedule": "Змінено термін замовлення", "operation_advance": "Просунуто операцію",
+    "operation_move": "Перенесено операцію на дошці", "shift_log_new": "Запис у змінному журналі", "work_day_start": "Розпочато робочий день", "work_day_end": "Завершено робочий день",
+    "shift_log_edit": "Змінено запис журналу", "shift_log_delete": "Видалено запис журналу",
+    "scrap_add": "Додано обрізок", "scrap_mark_used": "Обрізок використано", "scrap_delete": "Видалено обрізок",
+    "warehouse_item_new": "Нова позиція складу", "warehouse_transaction_add": "Рух по складу",
+    "material_lot_add": "Додано партію матеріалу", "material_lot_delete": "Видалено партію матеріалу",
+    "settings_save": "Змінено налаштування", "settings_rates_nbu": "Курси з НБУ",
+    "settings_backup_now": "Створено резервну копію", "settings_reset_demo_data": "Скинуто на демо-дані",
+    "settings_regenerate_key": "Змінено ключ інтеграції", "custom_fields_manage": "Користувацьке поле",
+    "custom_field_delete": "Видалено користувацьке поле", "work_center_connect": "Підключення верстата",
+    "attachment_upload": "Завантажено файл", "attachment_delete": "Видалено файл",
+    "parts_new": "Нова деталь у каталозі", "parts_edit": "Змінено деталь", "parts_delete": "Видалено деталь",
+    "parts_new_deal": "Угоду створено з деталі", "quality_new": "Перевірка якості",
+    "production_costs_rate": "Змінено вартість машино-години", "purchase_export": "Заявка на закупівлю (Excel)",
+    "purchase_telegram": "Заявка на закупівлю (Telegram)", "clients_reorder_task": "Задача на повторне замовлення",
+}
+FIELD_LABELS = {
+    "name": "назва", "title": "назва", "full_name": "ПІБ", "username": "логін", "role": "роль", "form": "розділ",
+    "amount": "сума", "currency": "валюта", "stage": "етап", "client_id": "клієнт №", "deal_id": "угода №",
+    "kind": "тип", "status": "статус", "due_date": "строк", "date": "дата", "qty_checked": "перевірено",
+    "qty_defect": "брак", "defect_reason": "причина", "production_order_id": "замовлення №",
+    "work_center_id": "дільниця №", "drawing_no": "креслення", "material": "матеріал", "last_price": "ціна",
+    "part_id": "деталь №", "op_id": "операція №", "order_id": "замовлення №", "attachment_id": "файл №",
+    "entity_type": "до", "entity_id": "№", "item_id": "позиція №", "wc_id": "дільниця №",
+    "mtc_host": "адреса верстата", "machine_hour_rate": "вартість години", "phone": "телефон", "email": "пошта",
+    "work_date": "дата", "shift": "зміна", "worker_user_id": "працівник №", "part_description": "деталь",
+    "quantity_made": "виготовлено", "quantity_scrap": "брак", "scrap_reason": "причина браку",
+    "shift_hours": "годин", "downtime_minutes": "простій, хв", "comment": "коментар", "pick": "обрано",
+    "ck_dim": "розміри ✓", "ck_surf": "поверхня ✓", "ck_thread": "різьба ✓", "ck_mark": "маркування ✓",
+    "ck_pack": "упаковка ✓", "backup_auto": "автокопії", "backup_extra_dir": "тека копій",
+    "rates_auto": "автокурс НБУ", "rate_usd": "USD", "rate_eur": "EUR", "rate_pln": "PLN",
+    "description": "опис", "note": "примітка", "notes": "примітка", "type": "тип", "qty": "кількість",
 }
 SENSITIVE_MARKS = ("pass", "token", "key", "secret", "csrf")
 
@@ -84,16 +118,18 @@ def register(A):
                 if any(m in key.lower() for m in SENSITIVE_MARKS):
                     continue
                 val = request.form.get(key, "")
-                if val:
-                    parts.append(f"{key}={val[:60]}")
+                if val and key != "_csrf_token":
+                    if key in ("ck_dim", "ck_surf", "ck_thread", "ck_mark", "ck_pack") and val == "1":
+                        val = "так"
+                    parts.append(f"{FIELD_LABELS.get(key, key)}: {val[:60]}")
             for key, val in (request.view_args or {}).items():
-                parts.insert(0, f"{key}={val}")
+                parts.insert(0, f"{FIELD_LABELS.get(key, key)}: {val}")
             db = get_db()
             db.execute(
                 """INSERT INTO audit_log (at, user_id, username, method, endpoint, path, label, detail, result)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (A.now_iso(), user["id"], user["username"], request.method, request.endpoint, request.path,
-                 AUDIT_LABELS.get(request.endpoint, request.endpoint), "; ".join(parts)[:500],
+                 AUDIT_LABELS.get(request.endpoint, request.endpoint), " · ".join(parts)[:500],
                  "відхилено" if rejected else "ok"),
             )
             db.execute("DELETE FROM audit_log WHERE id < (SELECT MAX(id) - 20000 FROM audit_log)")
@@ -128,6 +164,16 @@ def register(A):
     # ------------------------------------------------------------------ parts catalog
     A.ATTACHMENT_ENTITY_TABLES["part"] = "parts"       # креслення деталей — через спільні вкладення
     PART_EDIT_ROLES = ("admin", "sales", "production")
+
+    @app.before_request
+    def guard_bound_operator():
+        """Верстатник, закріплений за дільницею, не працює з контролем якості, закупівлями й планом/фактом (лише термінал)."""
+        if request.endpoint not in ("quality_list", "quality_new", "purchase_request", "production_costs", "production_board"):
+            return None
+        user = A.get_current_user()
+        if user and A.foreman_work_center_id(user):
+            return redirect(A.url_for("production_list"))
+        return None
 
     @app.before_request
     def guard_part_attachments():

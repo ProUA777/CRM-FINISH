@@ -1,0 +1,28 @@
+# Приклад systemd-сервісу для STANOK CRM (Linux).
+#
+# Встановлення:
+#   sudo cp deploy/stanok-crm.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now stanok-crm
+#   sudo systemctl status stanok-crm
+#
+# Перед цим постав власні значення нижче:
+#   - User/WorkingDirectory — під яким користувачем і з якої теки запускати
+#   - Environment=CRM_SECRET_KEY=... — обов'язково згенерований секрет,
+#     не типовий з коду:  python3 -c "import secrets; print(secrets.token_hex(32))"
+
+[Unit]
+Description=STANOK CRM (Flask + gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=crmapp
+WorkingDirectory=/opt/stanok-crm
+Environment=CRM_SECRET_KEY=ЗАМІНИ_НА_ЗГЕНЕРОВАНИЙ_СЕКРЕТ
+ExecStart=/opt/stanok-crm/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:5000 --access-logfile /opt/stanok-crm/logs/access.log wsgi:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

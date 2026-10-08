@@ -8,6 +8,8 @@ CRM для металообробного підприємства (токарн
     python app.py
 Відкрити: http://127.0.0.1:5000
 Логін за замовчуванням: admin / admin123
+
+© 2026 Greater Koreec Project Group. Усі права захищено.
 """
 
 import os
@@ -257,14 +259,27 @@ PAYMENT_STATUSES = [("pending", "Очікується"), ("paid", "Оплаче�
 
 ROLES = [
     ("admin", "Адміністратор"),
-    ("sales", "Менеджер продажів"),
-    ("production", "Виробництво"),
+    ("sales", "Менеджер"),
+    ("production", "Виробництво (майстер / верстатник)"),
     ("warehouse", "Склад"),
     ("service", "Сервіс"),
     ("accountant", "Бухгалтер"),
     ("viewer", "Перегляд"),
 ]
 ROLE_LABEL = dict(ROLES)
+
+
+def role_title(u):
+    """Зрозуміла посада: роль 'production' розділена на Майстра (усі дільниці)
+    і Верстатника/фрезерувальника (закріплений за своєю дільницею)."""
+    try:
+        role = u["role"]
+        wc = u["work_center_id"] if "work_center_id" in u.keys() else None
+    except Exception:
+        return ""
+    if role == "production":
+        return "Верстатник" if wc else "Майстер"
+    return ROLE_LABEL.get(role, role)
 
 PRODUCTION_ORDER_STATUSES = [("planned", "Заплановано"), ("in_progress", "У виробництві"),
                               ("done", "Завершено"), ("cancelled", "Скасовано")]
@@ -507,6 +522,17 @@ CREATE TABLE IF NOT EXISTS shift_logs (
     FOREIGN KEY(work_center_id) REFERENCES work_centers(id),
     FOREIGN KEY(worker_user_id) REFERENCES users(id),
     FOREIGN KEY(created_by_user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS work_days (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    work_center_id INTEGER,
+    work_date TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    shift_log_id INTEGER,
+    FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS routing_templates (
@@ -1954,9 +1980,12 @@ def ai_calc_known_fields_from_form(form):
         if not raw:
             continue
         try:
-            known[name] = float(raw)
+            v = float(raw)
         except ValueError:
             continue
+        if v != v or abs(v) > 1e12:
+            continue
+        known[name] = v
     return known
 
 
@@ -2751,6 +2780,8 @@ def parse_number(form, field, default=0.0, min_value=None, max_value=None, requi
         value = float(raw)
     except (TypeError, ValueError):
         raise ValidationError(f"Поле «{label}» має містити число")
+    if value != value or value in (float("inf"), float("-inf")) or abs(value) > 1e12:
+        raise ValidationError(f"Поле «{label}» має некоректне значення")
     if min_value is not None and value < min_value:
         raise ValidationError(f"Поле «{label}» не може бути меншим за {min_value}")
     if max_value is not None and value > max_value:
@@ -3063,7 +3094,10 @@ a{color:inherit;text-decoration:none;}
   .search-box{flex:1; min-width:0;}
   .search-box input{width:100%; box-sizing:border-box;}
   .content{padding:14px 12px 60px;}
-  .grid-4,.grid-3,.grid-2,.form-grid{grid-template-columns:1fr;}
+  .grid-3,.grid-2,.form-grid{grid-template-columns:1fr;}
+  .grid-4{grid-template-columns:repeat(2,1fr);gap:10px;}
+  .grid-4 .kpi{padding:12px;}
+  .grid-4 .kpi-value{font-size:22px;}
   .grid[style*="repeat(5"]{grid-template-columns:repeat(2,1fr) !important;}
   .card-pad{padding:14px;}
   .filters,.filters form{width:100%; flex-wrap:wrap;}
@@ -3171,30 +3205,19 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       {% set role = current_user['role'] %}
       <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active=='dashboard' }}"><span class="icon">▣</span> Дашборд</a>
 
-      {% if role in ('admin','sales','viewer','production') %}
-      <details class="nav-group" data-g="sales" {{ 'open' if active in ('deals','calculator','clients','tasks','calendar','reorder','parts') }}>
-        <summary>Продажі</summary>
-        {% if role in ('admin','sales','viewer') %}
-        <a href="{{ url_for('deals_board') }}" class="{{ 'active' if active=='deals' }}"><span class="icon">◧</span> Угоди (воронка)</a>
-        <a href="{{ url_for('cost_calculator') }}" class="{{ 'active' if active=='calculator' }}"><span class="icon">🧮</span> Калькулятор вартості</a>
-        <a href="{{ url_for('clients_list') }}" class="{{ 'active' if active=='clients' }}"><span class="icon">◈</span> Клієнти</a>
-        <a href="{{ url_for('tasks_list') }}" class="{{ 'active' if active=='tasks' }}"><span class="icon">☑</span> Задачі</a>
-        <a href="{{ url_for('calendar_view') }}" class="{{ 'active' if active=='calendar' }}"><span class="icon">📅</span> Календар</a>
-        {% endif %}
-        {% if role in ('admin','sales') %}
-        <a href="{{ url_for('clients_reorder') }}" class="{{ 'active' if active=='reorder' }}"><span class="icon">↻</span> Повторні замовлення{% if reorder_count() %} <span class="badge badge-high">{{ reorder_count() }}</span>{% endif %}</a>
-        {% endif %}
-        <a href="{{ url_for('parts_list') }}" class="{{ 'active' if active=='parts' }}"><span class="icon">⬡</span> Каталог деталей</a>
-      </details>
-      {% endif %}
-
       <details class="nav-group" data-g="prod" {{ 'open' if active in ('machines','production','board','quality','shift_log') }}>
         <summary>Виробництво</summary>
+        {% if not foreman_wc_id %}
         <a href="{{ url_for('machines_list') }}" class="{{ 'active' if active=='machines' }}"><span class="icon">⬢</span> Наше обладнання</a>
+        {% endif %}
         {% if role in ('admin','production','sales','viewer') %}
         <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробничі замовлення' }}</a>
+        {% if not foreman_wc_id %}
         <a href="{{ url_for('production_board') }}" class="{{ 'active' if active=='board' }}"><span class="icon">▦</span> Завантаження верстатів</a>
+        {% endif %}
+        {% if not foreman_wc_id %}
         <a href="{{ url_for('quality_list') }}" class="{{ 'active' if active=='quality' }}"><span class="icon">✔</span> Контроль якості</a>
+        {% endif %}
         {% endif %}
         {% if role in ('admin','production') %}
         <a href="{{ url_for('shift_log_list') }}" class="{{ 'active' if active=='shift_log' }}"><span class="icon">📋</span> Змінний журнал</a>
@@ -3211,6 +3234,23 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
         {% if role in ('admin','service','viewer') %}
         <a href="{{ url_for('service_list') }}" class="{{ 'active' if active=='service' }}"><span class="icon">✚</span> Рекламації та доробки</a>
         {% endif %}
+      </details>
+      {% endif %}
+
+      {% if role in ('admin','sales','viewer','production') %}
+      <details class="nav-group" data-g="sales" {{ 'open' if active in ('deals','calculator','clients','tasks','calendar','reorder','parts') }}>
+        <summary>Клієнти й угоди</summary>
+        {% if role in ('admin','sales','viewer') %}
+        <a href="{{ url_for('deals_board') }}" class="{{ 'active' if active=='deals' }}"><span class="icon">◧</span> Угоди</a>
+        <a href="{{ url_for('cost_calculator') }}" class="{{ 'active' if active=='calculator' }}"><span class="icon">🧮</span> Калькулятор вартості</a>
+        <a href="{{ url_for('clients_list') }}" class="{{ 'active' if active=='clients' }}"><span class="icon">◈</span> Клієнти</a>
+        <a href="{{ url_for('tasks_list') }}" class="{{ 'active' if active=='tasks' }}"><span class="icon">☑</span> Задачі</a>
+        <a href="{{ url_for('calendar_view') }}" class="{{ 'active' if active=='calendar' }}"><span class="icon">📅</span> Календар</a>
+        {% endif %}
+        {% if role in ('admin','sales') %}
+        <a href="{{ url_for('clients_reorder') }}" class="{{ 'active' if active=='reorder' }}"><span class="icon">↻</span> Повторні замовлення{% if reorder_count() %} <span class="badge badge-high">{{ reorder_count() }}</span>{% endif %}</a>
+        {% endif %}
+        <a href="{{ url_for('parts_list') }}" class="{{ 'active' if active=='parts' }}"><span class="icon">⬡</span> Каталог деталей</a>
       </details>
       {% endif %}
 
@@ -3251,8 +3291,9 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
     })();
     </script>
     <div class="sidebar-footer">
+      <div class="copyright" style="font-size:10.5px; color:var(--text-dim); margin-bottom:8px; line-height:1.35;">© 2026 by Greater Koreec Project Group</div>
       <a href="{{ url_for('my_profile') }}" style="color:var(--text);">{{ current_user['full_name'] }}</a><br>
-      <span style="color:var(--accent-2); font-size:11px;">{{ ROLE_LABEL.get(current_user['role'], current_user['role']) }}</span><br>
+      {% if role_title(current_user) != current_user['full_name'] %}<span style="color:var(--accent-2); font-size:11px;">{{ role_title(current_user) }}</span><br>{% endif %}
       <a href="{{ url_for('my_profile') }}">Мій профіль</a> · <a href="{{ url_for('logout') }}">Вийти</a>
       <div style="margin-top:10px; display:flex; align-items:center; gap:6px;">
         <span style="font-size:11px; color:var(--text-dim);">Масштаб:</span>
@@ -3380,6 +3421,7 @@ LOGIN_HTML = """
       </div>
     </form>
     <div class="hint">Демо-доступ: admin / admin123</div>
+    <div class="copyright" style="margin-top:14px;text-align:center;font-size:11.5px;color:var(--text-dim)">© 2026 by Greater Koreec Project Group</div>
   </div>
 </div>
 {% endblock %}
@@ -3444,24 +3486,6 @@ DASHBOARD_HTML = """
   </div>
 </div>
 
-<div class="section-title"><span class="accent-dot"></span> Воронка продажів</div>
-<div class="card card-pad">
-  <div style="display:flex; align-items:flex-end; gap:6px; height:150px;">
-    {% for key,label,color in STAGES %}
-    {% set cnt = funnel.get(key,0) %}
-    <div style="flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%;">
-      <div style="font-size:11px; margin-bottom:4px;">{{ cnt }}</div>
-      <div style="width:100%; background:{{ color }}; border-radius:4px 4px 0 0; height:{{ (cnt / max_funnel * 100) if max_funnel else 0 }}%; min-height:2px;"></div>
-    </div>
-    {% endfor %}
-  </div>
-  <div style="display:flex; gap:6px; margin-top:8px;">
-    {% for key,label,color in STAGES %}
-    <div style="flex:1; font-size:10px; color:var(--text-dim); text-align:center; line-height:1.2;">{{ label }}</div>
-    {% endfor %}
-  </div>
-</div>
-
 {% if shift_today is not none %}
 <div class="section-title"><span class="accent-dot"></span> Виробництво сьогодні (змінний журнал)</div>
 <div class="grid grid-2">
@@ -3497,6 +3521,25 @@ DASHBOARD_HTML = """
   </div>
 </div>
 {% endif %}
+
+<div class="section-title"><span class="accent-dot"></span> Угоди за етапами</div>
+<div class="card card-pad">
+  <div style="display:flex; align-items:flex-end; gap:6px; height:150px;">
+    {% for key,label,color in STAGES %}
+    {% set cnt = funnel.get(key,0) %}
+    <div style="flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%;">
+      <div style="font-size:11px; margin-bottom:4px;">{{ cnt }}</div>
+      <div style="width:100%; background:{{ color }}; border-radius:4px 4px 0 0; height:{{ (cnt / max_funnel * 100) if max_funnel else 0 }}%; min-height:2px;"></div>
+    </div>
+    {% endfor %}
+  </div>
+  <div style="display:flex; gap:6px; margin-top:8px;">
+    {% for key,label,color in STAGES %}
+    <div style="flex:1; font-size:10px; color:var(--text-dim); text-align:center; line-height:1.2;">{{ label }}</div>
+    {% endfor %}
+  </div>
+</div>
+
 
 <div class="grid grid-2" style="margin-top:22px;">
   <div class="card card-pad">
@@ -3962,7 +4005,7 @@ CALCULATOR_HTML = """
 {% extends "base.html" %}
 {% block title %}Калькулятор вартості{% endblock %}
 {% block heading %}Калькулятор вартості механообробки{% endblock %}
-{% block subheading %}Заповни відомі поля вручну і/або додай опис чи фото/DXF/PDF — решту порахує ШІ{% endblock %}
+{% block subheading %}Опиши деталь словами або додай фото/креслення — порахує ШІ. Або заповни поля вручну (тоді опис залиш порожнім){% endblock %}
 {% block content %}
 
 <div style="text-align:right; margin-bottom:10px;">
@@ -3989,14 +4032,15 @@ CALCULATOR_HTML = """
   <form method="post" action="{{ url_for('calculator_ai_estimate') }}" enctype="multipart/form-data" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
     <div class="section-title" style="margin-top:0;">🤖 Опис і/або файл (необов'язково)</div>
     <div class="field" style="margin-bottom:10px;">
-      <label>Опиши деталь та операції звичайною мовою (необов'язково, якщо заповниш поля нижче або додаси фото)</label>
-      <textarea name="ai_description" placeholder="напр.: Вал зі сталі 40Х, пруток Ø30мм, довжина 250мм, точіння + фрезерування шпонкового паза, партія 50 шт" style="min-height:60px;">{{ ai_description or '' }}</textarea>
+      <label>Опиши деталь звичайною мовою — і все. Якщо опис або фото заповнені, ручні поля нижче ІГНОРУЮТЬСЯ (рахує ШІ)</label>
+      <textarea name="ai_description" oninput="document.querySelectorAll('.manual-fields').forEach(function(e){e.style.opacity=this.value.trim()?0.4:1}.bind(this))" placeholder="напр.: Вал зі сталі 40Х, пруток Ø30мм, довжина 250мм, точіння + фрезерування шпонкового паза, партія 50 шт" style="min-height:60px;">{{ ai_description or '' }}</textarea>
     </div>
     <div class="field" style="margin-bottom:14px;">
       <label>Фото деталі, скан/фото креслення, DXF- або PDF-файл (до 3 файлів або сторінок, до 5 МБ кожне)</label>
       <input type="file" name="ai_images" accept="image/png,image/jpeg,image/webp,image/gif,.dxf,.pdf,application/pdf" multiple>
     </div>
 
+    <div class="manual-fields">
     <div class="section-title">Матеріал заготовки</div>
     <div class="form-grid" style="margin-bottom:14px;">
       <div class="field"><label>Вага заготовки, кг</label><input type="number" step="0.01" name="weight_kg" value="{{ request.form.get('weight_kg','') }}" placeholder="заповни або лиши ШІ"></div>
@@ -4022,6 +4066,7 @@ CALCULATOR_HTML = """
       <div class="field"><label>Наладка верстата на партію, грн</label><input type="number" step="0.01" name="setup_cost_total" value="{{ request.form.get('setup_cost_total','') }}"></div>
       <div class="field"><label>Кількість деталей</label><input type="number" step="1" name="quantity" value="{{ request.form.get('quantity','1') }}"></div>
       <div class="field"><label>Націнка, %</label><input type="number" step="1" name="margin_pct" value="{{ request.form.get('margin_pct','20') }}"></div>
+      <div class="field"><label>Бюджет замовника, грн за од. (необов'язково)</label><input type="number" step="0.01" name="target_price_per_unit" value="{{ request.form.get('target_price_per_unit','') }}" placeholder="напр. 430"></div>
     </div>
     <div class="section-title">Матеріал на партію (для плоских деталей під фрезерування)</div>
     <div class="form-grid" style="margin-bottom:14px;">
@@ -4029,6 +4074,7 @@ CALCULATOR_HTML = """
       <div class="field"><label>Коефіцієнт розкрою, %</label><input type="number" step="1" name="nesting_pct" value="{{ request.form.get('nesting_pct','75') }}"></div>
       <div class="field"><label>Ширина заготовки, мм</label><input type="number" step="1" name="sheet_width_mm" value="{{ request.form.get('sheet_width_mm','1250') }}"></div>
       <div class="field"><label>Довжина заготовки, мм</label><input type="number" step="1" name="sheet_length_mm" value="{{ request.form.get('sheet_length_mm','2500') }}"></div>
+    </div>
     </div>
     <div class="field" style="margin-bottom:14px;">
       <label>Звірити з позицією на складі (необов'язково)</label>
@@ -4091,6 +4137,20 @@ CALCULATOR_HTML = """
         <tr><td>Ціна за од. (+{{ result.margin_pct }}%)</td><td style="text-align:right; color:var(--accent-2);"><b>{{ result.price_per_unit }} грн</b></td></tr>
         <tr style="border-top:1px solid var(--border);"><td><b>Разом за {{ result.quantity }} шт.</b></td><td style="text-align:right; font-size:18px; color:var(--accent);"><b>{{ result.total_price }} грн</b></td></tr>
       </table>
+      {% if result.target_advice %}{% set ta = result.target_advice %}
+      <div style="margin-top:12px; padding:10px 12px; border-radius:8px; border:1px solid var(--border);">
+        <b>🎯 Бюджет замовника: {{ ta.target }} грн/од.</b>
+        {% if ta.fits %}
+          <div style="color:var(--accent-2); margin-top:4px;">Вкладаємось: наша ціна {{ ta.price }} грн, запас {{ ta.headroom }} грн/од.</div>
+        {% else %}
+          <div style="margin-top:4px;">Наша ціна {{ ta.price }} грн — вище бюджету на <b>{{ ta.gap }} грн/од.</b>. Варіанти, як вкластись:</div>
+          <ul style="margin:6px 0 0 18px; font-size:13px;">
+            {% for s in ta.scenarios %}<li><b>{{ s.title }}</b>: {{ s.detail }} → ціна {{ s.new_price }} грн, націнка {{ s.new_margin }}%</li>{% endfor %}
+            {% if not ta.scenarios %}<li>За цих вхідних даних вкластись у бюджет без збитку не вдається.</li>{% endif %}
+          </ul>
+        {% endif %}
+      </div>
+      {% endif %}
       {% if result.material_calc %}
       <div class="section-title" style="font-size:13px;">Матеріал на партію</div>
       {% if result.material_calc.error %}
@@ -4965,6 +5025,30 @@ TERMINAL_HTML = """
     <a class="btn" href="{{ url_for('work_centers_list') }}">{{ 'Інші дільниці' if foreman_own_wc else '← Всі робочі центри' }}</a>
   </div>
 </div>
+{% if foreman_own_wc and can_act %}
+<div class="card card-pad" style="margin-bottom:14px;">
+  {% if not work_day %}
+  <form method="post" action="{{ url_for('work_day_start') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-primary" type="submit" style="font-size:18px; padding:16px 28px;">▶ ПОЧАТИ ДЕНЬ</button>
+  </form>
+  {% elif not work_day['ended_at'] %}
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+    <div><b>День розпочато о {{ work_day['started_at'][11:16] }}</b></div>
+    <form method="post" action="{{ url_for('work_day_end') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <button class="btn" type="submit" style="font-size:16px; padding:12px 24px;">■ ЗАВЕРШИТИ ДЕНЬ</button>
+    </form>
+  </div>
+  {% else %}
+  <div><b>День завершено ({{ work_day['started_at'][11:16] }}–{{ work_day['ended_at'][11:16] }})</b></div>
+  {% endif %}
+  {% if work_day %}
+  <div style="margin-top:10px; font-size:13px;"><b>Операції за день:</b>
+    {% for o in day_ops %}<div>• {{ o['deal_title'] or ('Замовлення №' ~ o['production_order_id']) }} — {{ o['operation_name'] }} ({{ o['quantity'] }} шт.) {{ '✔' if o['status']=='done' else '⏳ у роботі' }}</div>
+    {% else %}<div style="color:var(--text-dim);">Поки що немає — натисніть «ПОЧАТИ» біля потрібної операції нижче.</div>{% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
 <div style="display:flex; flex-direction:column; gap:14px;">
   {% for op in ops %}
   <div class="card card-pad" style="{{ 'opacity:0.55;' if not op.ready }}">
@@ -5450,7 +5534,7 @@ MY_PROFILE_HTML = """
 {% extends "base.html" %}
 {% block title %}Мій профіль{% endblock %}
 {% block heading %}Мій профіль{% endblock %}
-{% block subheading %}{{ current_user['full_name'] }} · {{ ROLE_LABEL.get(current_user['role'], current_user['role']) }}{% endblock %}
+{% block subheading %}{{ current_user['full_name'] }} · {{ role_title(current_user) }}{% endblock %}
 {% block content %}
 <div class="grid grid-2">
   <form method="post" class="card card-pad">
@@ -5465,7 +5549,7 @@ MY_PROFILE_HTML = """
     <div class="stat-row">
       <div class="stat">ПІБ<b>{{ current_user['full_name'] }}</b></div>
       <div class="stat">Логін<b>{{ current_user['username'] }}</b></div>
-      <div class="stat">Роль<b>{{ ROLE_LABEL.get(current_user['role'], current_user['role']) }}</b></div>
+      <div class="stat">Роль<b>{{ role_title(current_user) }}</b></div>
     </div>
   </div>
 </div>
@@ -5488,7 +5572,7 @@ USERS_HTML = """
         <tr>
           <td>{{ u['full_name'] }}</td>
           <td>{{ u['username'] }}</td>
-          <td><span class="tag">{{ ROLE_LABEL.get(u['role'], u['role']) }}</span></td>
+          <td><span class="tag">{{ role_title(u) }}</span></td>
           <td>{{ u['work_center_name'] or ('всі' if u['role']=='production' else '—') }}</td>
           <td>{% if u['active'] %}<span class="badge badge-low">активний</span>{% else %}<span class="badge badge-high">вимкнено</span>{% endif %}</td>
           <td>
@@ -5514,7 +5598,7 @@ USERS_HTML = """
         </select>
       </div>
       <div class="field" id="wc-field" style="margin-bottom:10px; display:none;">
-        <label>Дільниця (майстер конкретного цеху)</label>
+        <label>Дільниця (для верстатника/фрезерувальника; порожньо = майстер)</label>
         <select name="work_center_id">
           <option value="">— всі дільниці (загальний виробничник) —</option>
           {% for wc in work_centers %}<option value="{{ wc['id'] }}">{{ wc['name'] }}</option>{% endfor %}
@@ -5525,9 +5609,9 @@ USERS_HTML = """
     <div class="section-title"><span class="accent-dot"></span> Опис ролей</div>
     <div class="card card-pad" style="font-size:12.5px; color:var(--text-dim);">
       <p><b style="color:var(--text);">Адміністратор</b> — повний доступ до всіх модулів, налаштувань та інтеграцій.</p>
-      <p><b style="color:var(--text);">Менеджер продажів</b> — клієнти, угоди, задачі, КП. Бачить лише свої угоди.</p>
-      <p><b style="color:var(--text);">Виробництво</b> — якщо прив'язаний до дільниці, бачить тільки термінал своєї
-      дільниці; без прив'язки — все виробництво (планування, всі дільниці).</p>
+      <p><b style="color:var(--text);">Менеджер</b> — (необов'язкова роль: продажами займається керівник) клієнти, угоди, задачі, КП. Бачить лише свої угоди.</p>
+      <p><b style="color:var(--text);">Майстер</b> — виробництво без прив'язки до дільниці: планування, усі дільниці.</p>
+      <p><b style="color:var(--text);">Верстатник / фрезерувальник</b> — виробництво з прив'язкою до дільниці: бачить лише термінал своєї дільниці, натискає «Почати день», запускає операції; при завершенні дня змінний журнал заповнюється сам.</p>
       <p><b style="color:var(--text);">Склад</b> — залишки, прихід/видача, списання матеріалів.</p>
       <p><b style="color:var(--text);">Сервіс</b> — рекламації клієнтів, доробки та повторні звернення.</p>
       <p><b style="color:var(--text);">Перегляд</b> — тільки перегляд даних, без редагування.</p>
@@ -5929,6 +6013,7 @@ app.jinja_env.globals["LEAD_SOURCES"] = LEAD_SOURCES
 app.jinja_env.globals["CURRENCIES"] = CURRENCIES
 app.jinja_env.globals["ROLES"] = ROLES
 app.jinja_env.globals["ROLE_LABEL"] = ROLE_LABEL
+app.jinja_env.globals["role_title"] = role_title
 app.jinja_env.globals["PRODUCTION_ORDER_STATUSES"] = PRODUCTION_ORDER_STATUSES
 app.jinja_env.globals["OPERATION_STATUSES"] = OPERATION_STATUSES
 app.jinja_env.globals["WAREHOUSE_TX_TYPES"] = WAREHOUSE_TX_TYPES
@@ -6444,6 +6529,7 @@ def cost_calculator():
             else:
                 material_calc = {"error": "Деталь не вміщується на лист із заданим коефіцієнтом розкрою"}
         result["material_calc"] = material_calc
+        result["target_advice"] = target_price_advice(result, f.get("target_price_per_unit"))
 
         # Звірка з залишками матеріалу на складі (за назвою позиції, якщо вказано)
         stock_check = None
@@ -6478,6 +6564,79 @@ def cost_calculator():
                             warehouse_items=warehouse_items)
 
 
+def target_price_advice(result, target, min_margin_pct=10.0):
+    """Підказки, як вкластись у бюджет замовника (грн за одиницю).
+    Чисті обчислення над готовим result: нічого не пише в БД. Повертає None,
+    якщо цільова ціна не задана."""
+    try:
+        target = float(target or 0)
+    except (TypeError, ValueError):
+        return None
+    if target <= 0:
+        return None
+    cost = float(result.get("cost_per_unit") or 0)
+    price = float(result.get("price_per_unit") or 0)
+    margin = float(result.get("margin_pct") or 0)
+    qty = max(int(result.get("quantity") or 1), 1)
+    setup_total = float(result.get("setup_cost_total") or 0)
+    labor = float(result.get("turning_cost") or 0) + float(result.get("milling_cost") or 0) + float(result.get("machine_cost") or 0)
+    material = float(result.get("material_cost") or 0)
+    out = {"target": round(target, 2), "price": round(price, 2), "fits": price <= target + 0.005,
+           "gap": round(max(price - target, 0), 2), "scenarios": []}
+    if cost <= 0:
+        return out
+    out["real_margin_at_target"] = round((target / cost - 1) * 100, 1)
+    if out["fits"]:
+        out["headroom"] = round(target - price, 2)
+        return out
+    sc = out["scenarios"]
+
+    def mk(title, detail, new_price, new_cost):
+        sc.append({"title": title, "detail": detail, "new_price": round(new_price, 2),
+                   "new_margin": round((new_price / new_cost - 1) * 100, 1) if new_cost > 0 else 0})
+
+    # 1. Зменшити націнку
+    need_m = (target / cost - 1) * 100
+    if need_m >= 0:
+        mk("Зменшити націнку", f"Націнка {margin:g}% → {need_m:.1f}%" + (" (нижче безпечного мінімуму " + f"{min_margin_pct:g}%)" if need_m < min_margin_pct else ""), target, cost)
+    # 2. Більша партія (розкласти наладку)
+    if setup_total > 0:
+        base = cost - setup_total / qty
+        found = None
+        for q in range(qty + 1, 100001):
+            c = base + setup_total / q
+            if c * (1 + margin / 100) <= target:
+                found = (q, c)
+                break
+            if q > max(qty * 50, 2000):
+                break
+        if found:
+            mk("Збільшити партію", f"З {qty} до {found[0]} шт. — наладка {setup_total:g} грн розкладається на більше деталей",
+               found[1] * (1 + margin / 100), found[1])
+    # 3. Дешевші верстати / менше годин
+    c_target = target / (1 + margin / 100)
+    if labor > 0 and cost - c_target > 0:
+        pct = (cost - c_target) / labor * 100
+        if pct <= 100:
+            mk("Знизити вартість обробки (дешевший верстат/ставка або менше годин)",
+               f"Потрібно зменшити токарну+фрезерну+додаткову обробку на {pct:.0f}%" + (" — малореально" if pct > 35 else ""),
+               target, c_target)
+    # 4. Дешевший матеріал
+    if material > 0 and cost - c_target > 0 and cost - c_target <= material:
+        pct = (cost - c_target) / material * 100
+        mk("Дешевший матеріал або менша заготовка", f"Вартість матеріалу потрібно зменшити на {pct:.0f}%", target, c_target)
+    # 5. Комбінація: мінімальна націнка + більша партія
+    if margin > min_margin_pct and setup_total > 0:
+        base = cost - setup_total / qty
+        for q in range(qty, max(qty * 50, 2000) + 1):
+            c = base + setup_total / q
+            if c * (1 + min_margin_pct / 100) <= target:
+                mk("Комбінація: мінімальна націнка + партія", f"Націнка {min_margin_pct:g}% і партія {q} шт.",
+                   c * (1 + min_margin_pct / 100), c)
+                break
+    return out
+
+
 def _calculator_history_filters():
     """Будує WHERE-умову й параметри для списку історії розрахунків із
     query-параметрів ?source=&q= - спільне для сторінки /calculator/history
@@ -6509,7 +6668,7 @@ def calculator_history():
     як і сам калькулятор."""
     db = get_db()
     where, params, source, q = _calculator_history_filters()
-    page = max(int(request.args.get("page", 1) or 1), 1)
+    page = max(request.args.get("page", 1, type=int) or 1, 1)
     per_page = 50
 
     total = db.execute(f"SELECT COUNT(*) c FROM cost_calculations cc {where}", params).fetchone()["c"]
@@ -6701,6 +6860,9 @@ def calculator_ai_estimate():
         description = request.form.get("ai_description", "")
         images = [f for f in request.files.getlist("ai_images") if f and f.filename]
         known_fields = ai_calc_known_fields_from_form(request.form)
+        # Якщо є опис або фото - ручні поля повністю ігноруємо, рахує лише ШІ.
+        if description.strip() or images:
+            known_fields = {}
         if not description.strip() and not images and known_fields:
             description = ai_calc_synthesize_description_from_known_fields(known_fields)
         try:
@@ -6764,6 +6926,7 @@ def calculator_ai_estimate():
             "quantity": quantity, "margin_pct": margin_pct,
         },
     }
+    result["target_advice"] = target_price_advice(result, request.form.get("target_price_per_unit"))
     # Якщо розмову можна продовжити (є валідний tool_use/tool_result для
     # cost_estimate - немає лише у рідкісному текстовому фолбеку), даємо
     # мінічат правок: новий одноразовий токен, під яким чекає ТА САМА
@@ -7493,6 +7656,7 @@ def calendar_view():
         month, year = 12, year - 1
     elif month > 12:
         month, year = 1, year + 1
+    year = min(max(year, 2000), 2100)
 
     first_day = datetime.date(year, month, 1)
     days_in_month = (datetime.date(year + (month == 12), (month % 12) + 1, 1) - datetime.timedelta(days=1)).day
@@ -7539,23 +7703,25 @@ def calendar_view():
 def task_add():
     db = get_db()
     f = request.form
+    deal_id = f.get("deal_id", type=int)
+    client_id = f.get("client_id", type=int)
     try:
         title = validate_required(f, "title", "Назва задачі")
     except ValidationError as e:
         flash(str(e), "error")
-        if f.get("deal_id"):
-            return redirect(url_for("deal_detail", deal_id=f.get("deal_id")))
+        if deal_id:
+            return redirect(url_for("deal_detail", deal_id=deal_id))
         return redirect(url_for("tasks_list"))
     db.execute(
         """INSERT INTO tasks (deal_id, client_id, title, description, type, due_date, done,
            manager_id, created_at) VALUES (?,?,?,?,?,?,0,?,?)""",
-        (f.get("deal_id") or None, f.get("client_id") or None, title, f.get("description"),
+        (deal_id or None, client_id or None, title, f.get("description"),
          f.get("type", "call"), f.get("due_date") or None, session.get("user_id"), now_iso()),
     )
     db.commit()
     flash("Задачу додано", "success")
-    if f.get("deal_id"):
-        return redirect(url_for("deal_detail", deal_id=f.get("deal_id")))
+    if deal_id:
+        return redirect(url_for("deal_detail", deal_id=deal_id))
     return redirect(url_for("tasks_list"))
 
 
@@ -8305,8 +8471,97 @@ def work_center_terminal(wc_id):
         d = dict(op)
         d["ready"] = (prev is None) or (prev["status"] == "done")
         ops_enriched.append(d)
+    user = get_current_user()
+    work_day = None
+    day_ops = []
+    if fw and fw == wc_id:
+        work_day = db.execute(
+            "SELECT * FROM work_days WHERE user_id=? AND work_date=? ORDER BY id DESC LIMIT 1",
+            (user["id"], today_str())).fetchone()
+        if work_day:
+            day_ops = _work_day_ops(db, work_day)
     return render_template("terminal.html", active="production", wc=wc, ops=ops_enriched,
-                            can_act=can_act, foreman_own_wc=fw)
+                            can_act=can_act, foreman_own_wc=fw, work_day=work_day, day_ops=day_ops)
+
+
+def _work_day_ops(db, work_day):
+    """Операції цієї дільниці, розпочаті або завершені після старту дня."""
+    end = work_day["ended_at"] or "9999-12-31 23:59:59"
+    return db.execute(
+        """SELECT op.*, po.quantity, d.title as deal_title
+           FROM production_operations op
+           JOIN production_orders po ON po.id=op.production_order_id
+           LEFT JOIN deals d ON d.id=po.deal_id
+           WHERE op.work_center_id=? AND (
+                 (op.actual_end IS NOT NULL AND op.actual_end>=? AND op.actual_end<=?)
+              OR (op.status='in_progress' AND op.actual_start>=? AND op.actual_start<=?))
+           ORDER BY op.actual_start""",
+        (work_day["work_center_id"], work_day["started_at"], end, work_day["started_at"], end)).fetchall()
+
+
+@app.route("/work-day/start", methods=["POST"])
+@login_required
+@role_required("production")
+def work_day_start():
+    user = get_current_user()
+    fw = foreman_work_center_id(user)
+    if not fw:
+        flash("«Почати день» доступно верстатнику, закріпленому за дільницею", "error")
+        return redirect(url_for("production_list"))
+    db = get_db()
+    for stale in db.execute("SELECT * FROM work_days WHERE user_id=? AND work_date<? AND ended_at IS NULL",
+                            (user["id"], today_str())).fetchall():
+        _finalize_work_day(db, stale, stale["work_date"] + " 23:59:59", auto=True)
+    db.commit()
+    open_day = db.execute("SELECT id FROM work_days WHERE user_id=? AND work_date=? AND ended_at IS NULL",
+                          (user["id"], today_str())).fetchone()
+    if not open_day:
+        db.execute("INSERT INTO work_days (user_id, work_center_id, work_date, started_at) VALUES (?,?,?,?)",
+                   (user["id"], fw, today_str(), now_iso()))
+        db.commit()
+        flash("Робочий день розпочато", "success")
+    return redirect(url_for("work_center_terminal", wc_id=fw))
+
+
+def _finalize_work_day(db, wd, ended, auto=False):
+    """Закриває робочий день і створює запис змінного журналу з операцій дня."""
+    db.execute("UPDATE work_days SET ended_at=? WHERE id=?", (ended, wd["id"]))
+    wd = db.execute("SELECT * FROM work_days WHERE id=?", (wd["id"],)).fetchone()
+    ops = _work_day_ops(db, wd)
+    done = [o for o in ops if o["status"] == "done"]
+    lines = [f"{o['deal_title'] or ('Замовлення №' + str(o['production_order_id']))} — {o['operation_name']}"
+             f" ({o['quantity']} шт.){'' if o['status'] == 'done' else ' [не завершено]'}" for o in ops]
+    hours = round((datetime.datetime.strptime(ended, "%Y-%m-%d %H:%M:%S")
+                   - datetime.datetime.strptime(wd["started_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600, 2)
+    cur = db.execute(
+        """INSERT INTO shift_logs (work_date, shift, work_center_id, worker_user_id, part_description,
+           quantity_made, quantity_scrap, shift_hours, notes, created_by_user_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (wd["work_date"], "day", wd["work_center_id"], wd["user_id"],
+         "; ".join(lines) if lines else "Операцій за день не зафіксовано",
+         sum(int(o["quantity"] or 0) for o in done), 0, hours,
+         "Автоматично закрито наступного дня (не натиснуто «Завершити день»)" if auto
+         else "Створено автоматично при завершенні робочого дня", wd["user_id"], ended))
+    db.execute("UPDATE work_days SET shift_log_id=? WHERE id=?", (cur.lastrowid, wd["id"]))
+    return cur.lastrowid
+
+
+@app.route("/work-day/end", methods=["POST"])
+@login_required
+@role_required("production")
+def work_day_end():
+    user = get_current_user()
+    fw = foreman_work_center_id(user)
+    db = get_db()
+    wd = db.execute("SELECT * FROM work_days WHERE user_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+                    (user["id"],)).fetchone() if fw else None
+    if not wd:
+        flash("Немає розпочатого робочого дня", "error")
+        return redirect(url_for("production_list"))
+    log_id = _finalize_work_day(db, wd, now_iso())
+    db.commit()
+    flash("День завершено — запис у змінному журналі створено. Перевірте брак і за потреби відредагуйте.", "success")
+    return redirect(url_for("shift_log_edit", log_id=log_id))
 
 
 @app.route("/work-centers")
@@ -9464,6 +9719,20 @@ def not_found(e):
 @app.errorhandler(403)
 def forbidden(e):
     return render_template("error.html", code=403, message="Доступ заборонено"), 403
+
+
+@app.errorhandler(sqlite3.IntegrityError)
+@app.errorhandler(OverflowError)
+def bad_data_error(e):
+    """Некоректні дані форми (неіснуючий зв'язок, завелике число) - це помилка
+    користувача, а не збій сервера: відкочуємо транзакцію й повертаємо назад."""
+    try:
+        get_db().rollback()
+    except Exception:
+        pass
+    app.logger.warning("Некоректні дані форми: %s", e)
+    flash("Не вдалося зберегти: перевірте дані (неіснуючий запис або завелике число)", "error")
+    return redirect(request.referrer or url_for("dashboard"))
 
 
 @app.errorhandler(500)

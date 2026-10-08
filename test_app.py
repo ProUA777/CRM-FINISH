@@ -3509,7 +3509,7 @@ def test_dashboard_shows_production_block_for_production_role(client):
     html = r.get_data(as_text=True)
     assert "Виробництво сьогодні" in html
     assert "Угоди (воронка)" not in html  # maister не бачить меню продажів
-    assert "Воронка продажів" in html  # але сам блок воронки на дашборді лишається для всіх
+    assert "Угоди за етапами" in html  # але сам блок воронки на дашборді лишається для всіх
 
 
 def test_dashboard_hides_production_block_for_sales_role(client):
@@ -3527,7 +3527,7 @@ def test_dashboard_still_shows_sales_funnel_alongside_production_block(client):
         "work_date": today_str(), "part_description": "Деталь для адміна", "quantity_made": "6",
     }, follow_redirects=True)
     html = client.get("/").get_data(as_text=True)
-    assert "Воронка продажів" in html
+    assert "Угоди за етапами" in html
     assert "Виробництво сьогодні" in html
 
 
@@ -4716,7 +4716,7 @@ def test_parts_drawings_upload_download_copy_to_deal_and_permissions(client):
 def test_sidebar_groups_follow_roles(client):
     login(client)
     html = client.get("/").get_data(as_text=True)
-    for g in ("Продажі", "Виробництво", "Склад і сервіс", "Фінанси", "Адміністрування"):
+    for g in ("Клієнти й угоди", "Виробництво", "Склад і сервіс", "Фінанси", "Адміністрування"):
         assert g in html
     client.get("/logout")
     login(client, "sklad", "sklad123")
@@ -4726,3 +4726,157 @@ def test_sidebar_groups_follow_roles(client):
     login(client, "buh", "buh12345")
     h = client.get("/").get_data(as_text=True)
     assert "Прострочені оплати" in h and "Каталог деталей" not in h
+
+
+def test_machine_operator_sees_trimmed_menu(client):
+    """Токар/фрезерувальник (виробництво + дільниця) бачить лише потрібне: свою дільницю,
+    змінний журнал і каталог деталей (ВТК — справа окремого контролера). Загальний майстер бачить усе виробниче."""
+    login(client, "frezer", "frezer123")
+    h = client.get("/").get_data(as_text=True)
+    for want in ("Моя дільниця", "Змінний журнал", "Каталог деталей"):
+        assert want in h
+    assert 'href="/quality"' not in h
+    for hide in ("Завантаження верстатів", "Наше обладнання", "План / факт", "Адміністрування"):
+        assert hide not in h
+    client.get("/logout")
+    login(client, "maister", "prod123")
+    h = client.get("/").get_data(as_text=True)
+    assert "Завантаження верстатів" in h and "Наше обладнання" in h and 'href="/quality"' in h
+
+
+def test_audit_log_is_human_readable(client):
+    login(client)
+    post(client, "/shift-log/new", {"work_date": "2026-10-07", "shift": "day", "work_center_id": "1",
+                                    "part_description": "Втулка", "quantity_made": "5", "quantity_scrap": "0",
+                                    "shift_hours": "8"})
+    post(client, "/quality/new", {"qty_checked": "10", "qty_defect": "0", "ck_dim": "1"})
+    html = client.get("/audit").get_data(as_text=True)
+    assert "Запис у змінному журналі" in html and "Перевірка якості" in html
+    assert "shift_log_new" not in html and "qty_checked=" not in html
+    assert "перевірено: 10" in html and "деталь: Втулка" in html
+
+
+def test_copyright_notice_on_login_and_in_app(client):
+    assert "by Greater Koreec Project Group" in client.get("/login").get_data(as_text=True)
+    login(client)
+    assert "by Greater Koreec Project Group" in client.get("/").get_data(as_text=True)
+
+
+# ---- Цільова ціна, ігнорування ручних полів при описі, робочий день верстатника ----
+def test_target_price_advice_math(client):
+    A = client._app_module
+    res = {"cost_per_unit": 400.0, "price_per_unit": 480.0, "margin_pct": 20, "quantity": 10,
+           "setup_cost_total": 1000.0, "turning_cost": 100.0, "milling_cost": 100.0, "machine_cost": 0.0,
+           "material_cost": 100.0}
+    adv = A.target_price_advice(res, 430)
+    assert not adv["fits"] and adv["gap"] == 50.0
+    titles = [s["title"] for s in adv["scenarios"]]
+    assert "Зменшити націнку" in titles and "Збільшити партію" in titles
+    m = next(s for s in adv["scenarios"] if s["title"] == "Зменшити націнку")
+    assert m["new_price"] == 430 and m["new_margin"] == 7.5
+    b = next(s for s in adv["scenarios"] if s["title"] == "Збільшити партію")
+    assert b["new_price"] <= 430
+    assert A.target_price_advice(res, 500)["fits"]
+    assert A.target_price_advice(res, 0) is None
+
+
+def test_calculator_manual_target_shown(client):
+    login(client, "admin", "admin123")
+    r = post(client, "/calculator", {"weight_kg": "1", "material_price_per_kg": "100", "turning_hours": "1",
+                                      "turning_rate_per_hour": "300", "quantity": "1", "margin_pct": "20",
+                                      "target_price_per_unit": "430"})
+    t = r.get_data(as_text=True)
+    assert "Бюджет замовника" in t and "Зменшити націнку" in t
+
+
+def test_ai_calc_ignores_manual_fields_when_description(client):
+    A = client._app_module
+    login(client, "admin", "admin123")
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake"})
+
+    def fake(description, api_key, images=None):
+        return {"status": "ok", "messages": [], "params": {"weight_kg": 2, "material_price_per_kg": 50,
+                "quantity": 5, "margin_pct": 20}}
+    A.ai_estimate_cost_params = fake
+    # є опис -> ручні 999 ігноруються: матеріал = 2*50 = 100
+    r = post(client, "/calculator/ai-estimate", {"ai_description": "Вал сталь", "weight_kg": "999",
+                                                    "material_price_per_kg": "999"})
+    t = r.get_data(as_text=True)
+    assert "100.0 грн" in t and "998001" not in t
+    # без опису ручні поля працюють як раніше (ШІ викликається з синтезованим описом, але ручні мають пріоритет)
+    r = post(client, "/calculator/ai-estimate", {"ai_description": "", "weight_kg": "3",
+                                                    "material_price_per_kg": "10"})
+    assert "30.0 грн" in r.get_data(as_text=True)
+
+
+def test_work_day_flow_creates_shift_log(client):
+    login(client, "frezer", "frezer123")
+    r = post(client, "/work-day/start", {})
+    assert r.status_code in (302, 200)
+    db = _raw_db(client)
+    wd = db.execute("SELECT * FROM work_days").fetchone()
+    assert wd and wd["ended_at"] is None and wd["work_center_id"] == 3
+    r = post(client, "/work-day/end", {})
+    db = _raw_db(client)
+    wd = db.execute("SELECT * FROM work_days").fetchone()
+    assert wd["ended_at"] and wd["shift_log_id"]
+    log = db.execute("SELECT * FROM shift_logs WHERE id=?", (wd["shift_log_id"],)).fetchone()
+    assert log["worker_user_id"] and log["work_center_id"] == 3
+
+
+def test_work_day_master_denied_and_titles(client):
+    login(client, "maister", "prod123")
+    post(client, "/work-day/start", {})
+    assert _raw_db(client).execute("SELECT COUNT(*) c FROM work_days").fetchone()["c"] == 0
+    t = client.get("/").get_data(as_text=True)
+    assert "Майстер" in t
+    client.get("/logout")
+    login(client, "frezer", "frezer123")
+    assert "Верстатник" in client.get("/").get_data(as_text=True)
+
+
+def test_bound_operator_blocked_from_quality_and_stale_day_autoclosed(client):
+    login(client, "frezer", "frezer123")
+    for p in ("/quality", "/warehouse/purchase", "/production/costs"):
+        r = client.get(p)
+        assert r.status_code == 302 and "/production" in r.headers["Location"]
+    db = _raw_db(client)
+    db.execute("INSERT INTO work_days (user_id, work_center_id, work_date, started_at) "
+               "SELECT id, 3, '2020-01-01', '2020-01-01 08:00:00' FROM users WHERE username='frezer'")
+    db.commit()
+    post(client, "/work-day/start", {})
+    db = _raw_db(client)
+    old = db.execute("SELECT * FROM work_days WHERE work_date='2020-01-01'").fetchone()
+    assert old["ended_at"] == "2020-01-01 23:59:59" and old["shift_log_id"]
+    assert db.execute("SELECT COUNT(*) c FROM work_days WHERE ended_at IS NULL").fetchone()["c"] == 1
+
+
+# ---- Регресії після фазингу (сміттєві дані не повинні давати 500) ----
+def test_garbage_numbers_never_500(client):
+    login(client, "admin", "admin123")
+    for bad in ("nan", "inf", "-inf", "1e999", "99999999999999999999"):
+        r = post(client, "/calculator", {"weight_kg": bad, "quantity": "1"})
+        assert r.status_code < 500, bad
+        assert "некоректне" in r.get_data(as_text=True) or "число" in r.get_data(as_text=True) or r.status_code == 200
+        r = post(client, "/calculator/ai-estimate", {"ai_description": "", "weight_kg": bad})
+        assert r.status_code < 500, bad
+        r = post(client, "/payments/add", {"amount": bad})
+        assert r.status_code < 500, bad
+
+
+def test_garbage_ids_and_dates_never_500(client):
+    login(client, "admin", "admin123")
+    for dv in ("abc", "999999999999", "-1", "<script>"):
+        r = post(client, "/tasks/add", {"title": "t", "deal_id": dv, "client_id": dv})
+        assert r.status_code in (200, 302), dv
+    assert client.get("/calendar?month=13&year=-5").status_code == 200
+    assert client.get("/calendar?month=0&year=99999").status_code == 200
+    assert client.get("/calculator/history?page=abc").status_code == 200
+
+
+def test_foreign_key_violation_is_friendly_redirect(client):
+    login(client, "admin", "admin123")
+    r = post(client, "/shift-log/new", {"part_description": "x", "work_date": "2026-01-01",
+                                         "quantity_made": "1", "worker_user_id": "999999"})
+    assert r.status_code == 302
+    assert _raw_db(client).execute("SELECT COUNT(*) c FROM shift_logs WHERE part_description='x'").fetchone()["c"] == 0
