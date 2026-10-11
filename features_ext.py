@@ -41,7 +41,7 @@ AUDIT_LABELS = {
     "service_add": "Нова рекламація", "service_update_status": "Змінено статус рекламації",
     "service_delete": "Видалено рекламацію", "my_profile": "Змінено власний профіль",
     "users_list": "Створено користувача", "user_toggle": "Змінено доступ користувача",
-    "production_reschedule": "Змінено термін замовлення", "operation_advance": "Просунуто операцію",
+    "production_reschedule": "Змінено термін замовлення", "operation_advance": "Просунуто операцію", "operation_revert": "Повернено етап операції",
     "operation_move": "Перенесено операцію на дошці", "shift_log_new": "Запис у змінному журналі", "work_day_start": "Розпочато робочий день", "work_day_end": "Завершено робочий день",
     "shift_log_edit": "Змінено запис журналу", "shift_log_delete": "Видалено запис журналу",
     "scrap_add": "Додано обрізок", "scrap_mark_used": "Обрізок використано", "scrap_delete": "Видалено обрізок",
