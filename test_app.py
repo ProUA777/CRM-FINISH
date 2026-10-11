@@ -4880,3 +4880,174 @@ def test_foreign_key_violation_is_friendly_redirect(client):
                                          "quantity_made": "1", "worker_user_id": "999999"})
     assert r.status_code == 302
     assert _raw_db(client).execute("SELECT COUNT(*) c FROM shift_logs WHERE part_description='x'").fetchone()["c"] == 0
+
+
+def test_ai_blank_check_weight_and_grade():
+    import importlib
+    A = importlib.import_module("app") if "app" in __import__("sys").modules else None
+    if A is None:
+        import app as A
+    ok = A.ai_calc_blank_check({"weight_kg": 2.65, "material_grade": "Сталь 45", "blank_type": "пруток круглий",
+                                "blank_size": "Ø60 × 120 мм", "material_source": "drawing"})
+    assert ok == []
+    bad = A.ai_calc_blank_check({"weight_kg": 9, "material_grade": "Сталь 45", "blank_type": "пруток круглий",
+                                 "blank_size": "Ø60 × 120 мм", "material_source": "drawing"})
+    assert any("не збігається" in w for w in bad)
+    assumed = A.ai_calc_blank_check({"weight_kg": 1, "material_grade": "Д16Т", "blank_type": "плита",
+                                     "blank_size": "100 × 50 × 20 мм", "material_source": "assumed"})
+    assert any("обрав сам" in w for w in assumed)
+    none = A.ai_calc_blank_check({"weight_kg": 1})
+    assert any("марку" in w for w in none) and any("Тип або розмір" in w for w in none)
+    garbage = A.ai_calc_blank_check({"weight_kg": "abc", "blank_size": "???"})
+    assert garbage == []
+
+
+def test_ai_calc_shows_material_and_warning(client):
+    A = client._app_module
+    login(client, "admin", "admin123")
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake"})
+
+    def fake(description, api_key, images=None):
+        return {"status": "ok", "messages": [], "params": {
+            "weight_kg": 9, "material_price_per_kg": 50, "quantity": 1, "margin_pct": 20,
+            "material_grade": "Сталь 45", "blank_type": "пруток круглий",
+            "blank_size": "Ø60 × 120 мм", "material_source": "assumed",
+            "operations_description": "1. Заготовка — пруток Ø60"}}
+    A.ai_estimate_cost_params = fake
+    t = post(client, "/calculator/ai-estimate", {"ai_description": "Вал"}).get_data(as_text=True)
+    assert "Сталь 45" in t and "пруток круглий" in t and "обрано ШІ" in t and "перераховано" in t
+
+
+def test_ai_prompt_demands_grade_and_blank():
+    import app as A
+    p = A.AI_CALC_SYSTEM_PROMPT
+    assert "material_grade" in p and "blank_size" in p and "режими" in p
+    props = A.AI_CALC_COST_ESTIMATE_TOOL["input_schema"]["properties"]
+    assert all(k in props for k in ("material_grade", "blank_type", "blank_size", "material_source"))
+    assert not any(k in A.AI_CALC_REQUIRED_PARAMS for k in ("material_grade", "blank_type"))
+
+
+def test_shift_log_pdf_columns_do_not_overlap(client):
+    login(client, "admin", "admin123")
+    r = client.get("/shift-log/report.pdf")
+    assert r.status_code == 200 and r.data[:4] == b"%PDF"
+    import subprocess, tempfile, os
+    d = tempfile.mkdtemp()
+    open(os.path.join(d, "a.pdf"), "wb").write(r.data)
+    out = subprocess.run(["pdftotext", "-layout", os.path.join(d, "a.pdf"), "-"], capture_output=True, text=True)
+    if out.returncode == 0:
+        for line in out.stdout.splitlines():
+            if "2026-" in line or "20" in line and "-" in line[:20]:
+                assert not any(len(tok) > 40 for tok in line.split())
+
+
+def test_ai_rules_weight_recomputed_from_size():
+    import app as A
+    p = {"weight_kg": 9, "material_grade": "Сталь 45", "blank_size": "Ø60 × 120 мм",
+         "turning_rate_per_hour": 100, "material_price_per_kg": 1}
+    notes = A.ai_calc_apply_shop_rules(p, {}, override=True)
+    assert abs(p["weight_kg"] - 2.66) < 0.02 and notes
+    # нержавійка визначається раніше за "сталь"
+    assert A.ai_material_class("Сталь 12Х18Н10Т") == "stainless"
+    assert A.ai_material_class("Д16Т") == "aluminium" and A.ai_material_class("невідомо") is None
+    # правка в чаті: нічого не перезаписуємо
+    q = {"weight_kg": 9, "material_grade": "Сталь 45", "blank_size": "Ø60 × 120 мм"}
+    assert A.ai_calc_apply_shop_rules(q, {}, override=False) == [] and q["weight_kg"] == 9
+
+
+def test_ai_rules_shop_prices_override_and_context(client):
+    A = client._app_module
+    login(client, "admin", "admin123")
+    post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-fake"})
+    r = post(client, "/settings/save", {"form": "ai_prices", "ai_rate_turning": "850", "ai_rate_milling": "950",
+                                         "ai_margin": "30", "ai_price_steel": "70"})
+    assert r.status_code in (200, 302)
+    seen = {}
+
+    def fake(description, api_key, images=None):
+        seen["d"] = description
+        return {"status": "ok", "messages": [], "params": {
+            "weight_kg": 2.66, "material_price_per_kg": 999, "turning_hours": 1, "turning_rate_per_hour": 1,
+            "milling_hours": 0, "milling_rate_per_hour": 0, "quantity": 1, "margin_pct": 5,
+            "material_grade": "Сталь 45", "blank_type": "пруток круглий", "blank_size": "Ø60 × 120 мм",
+            "material_source": "drawing", "operations_description": "1. Заготовка"}}
+    A.ai_estimate_cost_params = fake
+    t = post(client, "/calculator/ai-estimate", {"ai_description": "Вал сталь 45"}).get_data(as_text=True)
+    assert "ЦІНИ ЦЕХУ" in seen["d"] and "850" in seen["d"] and "Вал сталь 45" in seen["d"]
+    # ціна сталі 70 * 2.66 = 186.2 ; токарна 850 ; без ШІ-вигадок 999/1/5
+    assert "186.2" in t and "з налаштувань цеху" in t
+    inp = _raw_db(client).execute("SELECT turning_rate_per_hour, margin_pct, material_price_per_kg FROM cost_calculations ORDER BY id DESC LIMIT 1").fetchone()
+    assert inp["turning_rate_per_hour"] == 850 and inp["margin_pct"] == 30 and inp["material_price_per_kg"] == 70
+
+
+def test_ai_prices_form_rejects_garbage(client):
+    login(client, "admin", "admin123")
+    r = post(client, "/settings/save", {"form": "ai_prices", "ai_margin": "abc"})
+    assert r.status_code in (200, 302)
+    r = post(client, "/settings/save", {"form": "ai_prices", "ai_rate_turning": "-5"})
+    assert r.status_code in (200, 302)
+    assert _raw_db(client).execute("SELECT value FROM settings WHERE key='ai_rate_turning'").fetchone() is None
+
+
+def test_ai_check_flags_implausible_values():
+    import app as A
+    w = A.ai_calc_blank_check({"weight_kg": 1, "material_grade": "Сталь 45", "blank_type": "пруток", "blank_size": "Ø10 × 10 мм",
+                               "material_source": "drawing", "turning_hours": 90, "material_price_per_kg": 5,
+                               "turning_rate_per_hour": 20, "margin_pct": 300})
+    txt = " ".join(w)
+    assert "нереально" in txt and "Ціна металу" in txt and "Ставка" in txt and "Націнка" in txt
+
+
+def test_production_stepper_page_and_revert(client):
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    order = db.execute("SELECT id FROM production_orders ORDER BY id LIMIT 1").fetchone()
+    oid = order["id"]
+    db.execute("UPDATE production_operations SET status='waiting', actual_start=NULL, actual_end=NULL WHERE production_order_id=?", (oid,))
+    db.commit()
+    ops = db.execute("SELECT * FROM production_operations WHERE production_order_id=? ORDER BY step_order", (oid,)).fetchall()
+    assert len(ops) >= 2
+    t = client.get(f"/production/{oid}").get_data(as_text=True)
+    assert "Від заготовки до готової деталі" in t and "Маршрут по етапах" in t and "Готова деталь" in t
+    assert "чекає етапу" in t          # другий етап заблокований, без кнопки-помилки
+    first, second = ops[0]["id"], ops[1]["id"]
+    post(client, f"/production/operations/{first}/advance", {})            # старт
+    assert "Скасувати старт" in client.get(f"/production/{oid}").get_data(as_text=True)
+    post(client, f"/production/operations/{first}/revert", {})             # скасували
+    db = _raw_db(client)
+    assert db.execute("SELECT status, actual_start FROM production_operations WHERE id=?", (first,)).fetchone()["status"] == "waiting"
+    post(client, f"/production/operations/{first}/advance", {})
+    post(client, f"/production/operations/{first}/advance", {})            # завершили
+    assert "Відкрити знову" in client.get(f"/production/{oid}").get_data(as_text=True)
+    post(client, f"/production/operations/{second}/advance", {})           # наступний розпочато
+    post(client, f"/production/operations/{first}/revert", {})             # тепер відкрити перший не можна
+    db = _raw_db(client)
+    assert db.execute("SELECT status FROM production_operations WHERE id=?", (first,)).fetchone()["status"] == "done"
+    post(client, f"/production/operations/{second}/revert", {})
+    post(client, f"/production/operations/{first}/revert", {})             # тепер можна
+    db = _raw_db(client)
+    assert db.execute("SELECT status FROM production_operations WHERE id=?", (first,)).fetchone()["status"] == "in_progress"
+    assert db.execute("SELECT status FROM production_orders WHERE id=?", (oid,)).fetchone()["status"] == "in_progress"
+
+
+def test_production_revert_denied_for_bound_operator(client):
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    op = db.execute("SELECT id, production_order_id FROM production_operations ORDER BY id LIMIT 1").fetchone()
+    db.execute("UPDATE production_operations SET status='in_progress', actual_start='2026-10-10 08:00:00' WHERE id=?", (op["id"],))
+    db.commit()
+    client.get("/logout")
+    login(client, "tokar", "tokar123")
+    post(client, f"/production/operations/{op['id']}/revert", {})
+    db = _raw_db(client)
+    assert db.execute("SELECT status FROM production_operations WHERE id=?", (op["id"],)).fetchone()["status"] == "in_progress"
+    assert client.get(f"/production/{op['production_order_id']}").status_code in (200, 302)
+
+
+def test_terminal_groups_and_route_chain(client):
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    op = db.execute("SELECT * FROM production_operations WHERE work_center_id IS NOT NULL ORDER BY id LIMIT 1").fetchone()
+    t = client.get(f"/work-centers/{op['work_center_id']}/terminal").get_data(as_text=True)
+    assert "Маршрут:" in t and ("Етап " in t or "На цій дільниці зараз немає" in t)
+    assert "У роботі:" in t and "Чекають попередній етап" in t
