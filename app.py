@@ -1810,6 +1810,15 @@ AI_CALC_SYSTEM_PROMPT = """Ти - досвідчений технолог ток
 
 Але якщо опису мінімально НЕ вистачає для самого розрахунку - тобто ти не можеш визначити ні матеріал (з чого деталь - сталь, алюміній, нержавійка тощо), ні розмір/вагу заготовки (немає ні розмірів у тексті, ні зображення, з якого їх видно), ні які операції взагалі потрібні (просто "деталь" без жодного опису форми чи процесу) - НЕ вигадуй ці критичні дані з нуля і НЕ вважай типове значення прийнятним заміною. Замість цього виклич інструмент ask_clarifying_question і постав ОДНЕ конкретне, вузьке питання українською, яке справді закриє прогалину (напр. "З якого металу деталь і які її приблизні габарити (діаметр/довжина або довжина×ширина×висота)?"). Питай лише тоді, коли без відповіді оцінка була б беззмістовною - якщо є хоч якісь орієнтири (навіть неповні), користуйся ними та розумними припущеннями замість питання.
 
+МАТЕРІАЛ І ЗАГОТОВКА - ТОЧНІСТЬ ОБОВ'ЯЗКОВА. Заповнюй поля material_grade, blank_type, blank_size і material_source:
+- material_grade - КОНКРЕТНА марка, а не клас: «Сталь 45», «40Х», «12Х18Н10Т (AISI 304)», «Д16Т», «АМг6», «Латунь Л63», «Бронза БрАЖ9-4» тощо. Марку береремо з креслення чи опису дослівно. Якщо вказано лише клас («сталь», «алюміній», «нержавійка») і марки немає ні в тексті, ні на кресленні - візьми найпоширенішу для такої деталі, постав material_source = «assumed» і першим рядком «Припущення:» напиши, що марку не вказано та яку обрано. Якщо ж невідомий навіть клас матеріалу - викликай ask_clarifying_question.
+- blank_type - один із: пруток круглий, пруток шестигранний, пруток квадратний, труба, плита/пластина, смуга, поковка, відливка, напівфабрикат (вже частково оброблена). Правило: тіло обертання -> пруток круглий (або труба для втулок з великим отвором); призматична деталь -> плита чи смуга; складна/масивна форма з великим знімом -> поковка; зі скану чи фото - тип, що видно на кресленні.
+- blank_size - точні розміри заготовки з припуском: для прутка «Ø60 × 122 мм» (діаметр = найбільший Ø деталі + 3-5 мм на токарну обробку, округлити ВГОРУ до стандартного діаметра; довжина = довжина деталі + відрізання ~3 мм + підрізання торця), для плити «110 × 60 × 25 мм» (припуск 2-3 мм на сторону). Не пиши «приблизно» - дай число.
+- weight_kg - масу ЗАГОТОВКИ (не готової деталі), порахуй за формулою «об'єм × густина» і проговори її в рядку «Припущення:»: сталь 7,85 г/см³, нержавійка 7,9, алюміній 2,7, латунь 8,5, бронза 7,6, титан 4,5. Не пиши «~2 кг» з голови.
+- material_source - «drawing» (марка та розміри з креслення), «description» (з тексту користувача) або «assumed» (обрано самостійно).
+
+ТЕХПРОЦЕС - ТОЧНИЙ. Етапи йдуть у технологічній послідовності: заготовка -> установ А (чорнове, потім чистове) -> переустановлення/установ Б -> фрезерні/свердлильні -> термообробка (якщо потрібна, ПЕРЕД чистовими/шліфуванням) -> контроль -> пакування. Для КОЖНОЇ операції вкажи: верстат, базування (патрон/м'які кулачки/лещата/оснастка), інструмент (напр. «різець CNMG 120408, фреза Ø12 з 4 зубами»), режими (S, F або v, s), час у хвилинах, і які розміри перевіряються. Не називай операції, яких немає на кресленні, і не пропускай ті, що є (різьба, пази, отвори, фаски, допуски, шорсткість). Якщо на кресленні є допуск тіснішим за IT7 або шорсткість Ra <= 0,8 - додай чистове точіння/шліфування й окремий контроль.
+
 У полі operations_description дай РОЗГОРНУТИЙ, детальний опис технологічного процесу - це має читатись як справжня технологічна карта, а не коротка анотація. ФОРМАТ ВАЖЛИВИЙ: кожен етап пиши з НОВОГО РЯДКА (символ переносу рядка між етапами), у вигляді «N. Назва етапу — пояснення, верстат, орієнтовний час», без загального вступу і без суцільного абзацу. Приклад двох рядків:
 1. Заготовка — пруток Ø60 мм, сталь 45, довжина 120 мм; обрано пруток, бо деталь — тіло обертання. Час підготовки ~10 хв.
 2. Чорнове точіння — зовнішні поверхні з припуском 0,5 мм на токарному верстаті з ЧПУ; ~25 хв.
@@ -2027,6 +2036,10 @@ AI_CALC_COST_ESTIMATE_TOOL = {
             "machine_rate_per_hour": {"type": "number", "description": "Ставка іншого верстата, грн/год"},
             "quantity": {"type": "number", "description": "Кількість деталей у партії"},
             "margin_pct": {"type": "number", "description": "Рекомендована націнка, %"},
+            "material_grade": {"type": "string", "description": "Конкретна марка матеріалу, напр. «Сталь 45», «Д16Т», «12Х18Н10Т»"},
+            "blank_type": {"type": "string", "description": "Тип заготовки: пруток круглий / пруток шестигранний / пруток квадратний / труба / плита / смуга / поковка / відливка / напівфабрикат"},
+            "blank_size": {"type": "string", "description": "Точні розміри заготовки з припуском, напр. «Ø60 × 122 мм» або «110 × 60 × 25 мм»"},
+            "material_source": {"type": "string", "enum": ["drawing", "description", "assumed"], "description": "Звідки взято марку й розміри"},
             "operations_description": {
                 "type": "string",
                 "description": "РОЗГОРНУТИЙ технологічний маршрут українською: кожен етап з нового рядка у форматі «N. Назва етапу — пояснення, верстат, час», мінімум 10-15 речень загалом, з назвою конкретного верстата на кожній операції; припущення - окремим останнім рядком «Припущення: ...»",
@@ -2053,6 +2066,161 @@ AI_CALC_ASK_QUESTION_TOOL = {
         "required": ["question"],
     },
 }
+
+
+AI_MATERIAL_CLASSES = (
+    # (клас, ключові слова в марці, густина г/см3) - порядок важливий: нержавійка раніше за "сталь"
+    ("titanium", ("титан", "вт6", "вт1"), 4.5),
+    ("stainless", ("нерж", "12х18", "aisi", "304", "316", "08х18", "20х13"), 7.9),
+    ("aluminium", ("алюм", "д16", "амг", "ад31", "ад1", "аl", "al "), 2.7),
+    ("brass", ("латун", "л63", "лс59", "бронз", "браж", "мідь", "м1"), 8.5),
+    ("steel", ("сталь", "40х", "ст3", "ст.3", "45", "65г", "у8", "09г2с", "30хгса", "35", "20"), 7.85),
+)
+AI_PRICE_SETTING_KEYS = {
+    "steel": "ai_price_steel", "stainless": "ai_price_stainless", "aluminium": "ai_price_aluminium",
+    "brass": "ai_price_brass", "titanium": "ai_price_titanium",
+}
+AI_RATE_SETTING_KEYS = {
+    "turning_rate_per_hour": "ai_rate_turning", "milling_rate_per_hour": "ai_rate_milling",
+    "machine_rate_per_hour": "ai_rate_other",
+}
+
+
+def ai_material_class(grade):
+    g = (grade or "").lower()
+    for cls, keys, _d in AI_MATERIAL_CLASSES:
+        if any(k in g for k in keys):
+            return cls
+    return None
+
+
+def ai_material_density(grade):
+    cls = ai_material_class(grade)
+    for c, _k, d in AI_MATERIAL_CLASSES:
+        if c == cls:
+            return d
+    return None
+
+
+def ai_blank_expected_weight(params):
+    """Вага заготовки (кг) за її розмірами й густиною марки; None, якщо
+    розміри чи марку розпізнати неможливо."""
+    import re as _re
+    size = str(params.get("blank_size") or "")
+    nums = [float(x.replace(",", ".")) for x in _re.findall(r"\d+(?:[.,]\d+)?", size)]
+    low = size.lower().strip()
+    volume_cm3 = None
+    if (low.startswith(("ø", "d", "⌀", "ф")) or "ø" in low) and len(nums) >= 2:
+        d, l = nums[0] / 10.0, nums[1] / 10.0
+        volume_cm3 = 3.14159265 * (d / 2) ** 2 * l
+    elif len(nums) >= 3 and ("×" in size or "x" in low or "х" in low):
+        volume_cm3 = (nums[0] / 10.0) * (nums[1] / 10.0) * (nums[2] / 10.0)
+    density = ai_material_density(params.get("material_grade"))
+    if not volume_cm3 or not density or volume_cm3 <= 0:
+        return None
+    return volume_cm3 * density / 1000.0
+
+
+def ai_shop_prices(db):
+    """Ціни й ставки цеху з налаштувань (лише додатні числа)."""
+    out = {}
+    for key in list(AI_PRICE_SETTING_KEYS.values()) + list(AI_RATE_SETTING_KEYS.values()) + ["ai_margin"]:
+        try:
+            v = float(str(get_setting(db, key, "") or "").replace(",", "."))
+        except ValueError:
+            continue
+        if v > 0 and v < 1e7:
+            out[key] = v
+    return out
+
+
+def ai_shop_context_text(prices):
+    """Текстовий блок для ШІ: реальні ціни цеху, яких треба дотримуватись."""
+    if not prices:
+        return ""
+    names = {"ai_rate_turning": "ставка токарної обробки, грн/год", "ai_rate_milling": "ставка фрезерної, грн/год",
+             "ai_rate_other": "ставка додаткової обробки, грн/год", "ai_margin": "типова націнка, %",
+             "ai_price_steel": "сталь, грн/кг", "ai_price_stainless": "нержавіюча сталь, грн/кг",
+             "ai_price_aluminium": "алюміній, грн/кг", "ai_price_brass": "латунь/бронза, грн/кг",
+             "ai_price_titanium": "титан, грн/кг"}
+    lines = [f"- {names[k]}: {v:g}" for k, v in prices.items() if k in names]
+    return ("ЦІНИ ЦЕХУ (реальні, використовуй САМЕ ЇХ у відповідних полях, а не власні припущення):\n"
+            + "\n".join(lines) + "\n\nОПИС ДЕТАЛІ:\n")
+
+
+def ai_calc_apply_shop_rules(params, prices, override=True):
+    """Детермінована підстраховка: вага з розмірів, ставки/ціни/націнка з
+    налаштувань цеху. Змінює params, повертає список інформаційних приміток."""
+    notes = []
+    if not override:
+        return notes
+    expected = ai_blank_expected_weight(params)
+    try:
+        w = float(params.get("weight_kg") or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if expected and (w <= 0 or abs(w - expected) > expected * 0.10):
+        params["weight_kg"] = round(expected, 3)
+        notes.append(f"Вагу заготовки перераховано за розмірами «{params.get('blank_size')}»: {expected:.2f} кг" + (f" (ШІ вказав {w:g})." if w > 0 else "."))
+    changed = []
+    for pk, sk in AI_RATE_SETTING_KEYS.items():
+        if prices.get(sk) and float(params.get(pk) or 0) != prices[sk]:
+            if float(params.get(pk.replace("_rate_per_hour", "_hours")) or 0) > 0 or pk != "machine_rate_per_hour":
+                params[pk] = prices[sk]
+                changed.append(pk)
+    cls = ai_material_class(params.get("material_grade"))
+    if cls and prices.get(AI_PRICE_SETTING_KEYS[cls]):
+        if float(params.get("material_price_per_kg") or 0) != prices[AI_PRICE_SETTING_KEYS[cls]]:
+            params["material_price_per_kg"] = prices[AI_PRICE_SETTING_KEYS[cls]]
+            changed.append("material_price_per_kg")
+    if prices.get("ai_margin") and float(params.get("margin_pct") or 0) != prices["ai_margin"]:
+        params["margin_pct"] = prices["ai_margin"]
+        changed.append("margin_pct")
+    if changed:
+        notes.append("Ставки, ціну металу й націнку взято з налаштувань цеху, а не з припущень ШІ.")
+    return notes
+
+
+def ai_calc_blank_check(params):
+    """Попередження про підозрілі дані ШІ (порожній список - все гаразд).
+    Не змінює params."""
+    warnings = []
+    try:
+        weight = float(params.get("weight_kg") or 0)
+    except (TypeError, ValueError):
+        return warnings
+    size = str(params.get("blank_size") or "")
+    expected = ai_blank_expected_weight(params)
+    if expected and weight > 0 and (weight > expected * 1.25 or weight < expected * 0.75):
+        warnings.append(
+            f"Вага {weight:g} кг не збігається з розмірами заготовки «{size}»: за розмірами та густиною виходить ≈ {expected:.2f} кг. Перевір вагу або розмір."
+        )
+    if not params.get("material_grade"):
+        warnings.append("ШІ не вказав марку матеріалу — уточни її у чаті правок.")
+    elif params.get("material_source") == "assumed":
+        warnings.append(f"Марку «{params.get('material_grade')}» ШІ обрав сам (на кресленні/в описі її немає) — підтверди або виправ.")
+    if not params.get("blank_type") or not params.get("blank_size"):
+        warnings.append("Тип або розмір заготовки не визначено — уточни у чаті правок.")
+    def _f(k):
+        try:
+            return float(params.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    for k, label in (("turning_hours", "токарної"), ("milling_hours", "фрезерної"), ("machine_hours", "додаткової")):
+        if _f(k) > 40:
+            warnings.append(f"Час {label} обробки {_f(k):g} год на одну деталь виглядає нереально великим — перевір.")
+    price = _f("material_price_per_kg")
+    if price and not (15 <= price <= 5000):
+        warnings.append(f"Ціна металу {price:g} грн/кг виходить за розумні межі — перевір.")
+    for k in ("turning_rate_per_hour", "milling_rate_per_hour", "machine_rate_per_hour"):
+        r = _f(k)
+        if r and not (100 <= r <= 6000):
+            warnings.append(f"Ставка {r:g} грн/год виходить за розумні межі — перевір.")
+    if _f("margin_pct") > 100:
+        warnings.append("Націнка понад 100% — перевір.")
+    if weight > 0 and weight > 2000:
+        warnings.append(f"Вага {weight:g} кг на одну деталь дуже велика — перевір одиниці.")
+    return warnings
 
 
 def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", images=None,
@@ -4105,6 +4273,21 @@ CALCULATOR_HTML = """
     {% if result.ai_operations_description %}
     <div class="card card-pad" style="margin-bottom:14px; border-color:var(--accent-2);">
       <div style="font-size:11px; color:var(--accent-2); font-weight:700; margin-bottom:6px;">🤖 ОЦІНКА ШІ — ПЕРЕВІР ПЕРЕД ВИКОРИСТАННЯМ</div>
+      {% if result.ai_material and (result.ai_material.grade or result.ai_material.blank_type) %}
+      <div style="margin:0 0 10px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; font-size:13px;">
+        <b>Матеріал:</b> {{ result.ai_material.grade or '—' }}
+        · <b>Заготовка:</b> {{ result.ai_material.blank_type or '—' }} {{ result.ai_material.blank_size }}
+        {% if result.ai_material.source == 'drawing' %}<span style="color:#1b6e67;">· з креслення</span>
+        {% elif result.ai_material.source == 'description' %}<span style="color:#1b6e67;">· з опису</span>
+        {% elif result.ai_material.source == 'assumed' %}<span style="color:#b4560a;">· обрано ШІ — перевір</span>{% endif %}
+      </div>
+      {% endif %}
+      {% for n in result.ai_notes or [] %}
+      <div style="margin:0 0 8px; padding:8px 10px; border-radius:8px; background:rgba(27,110,103,.12); font-size:13px;">ℹ️ {{ n }}</div>
+      {% endfor %}
+      {% for w in result.ai_warnings or [] %}
+      <div style="margin:0 0 8px; padding:8px 10px; border-radius:8px; background:rgba(240,138,36,.15); font-size:13px;">⚠️ {{ w }}</div>
+      {% endfor %}
       <div style="margin:0 0 12px;">{{ result.ai_operations_description | ops_html }}</div>
       <div style="font-size:11px; color:var(--text-dim);">
         Заготовка: {{ result.ai_inputs.weight_kg }} кг · Метал: {{ result.ai_inputs.material_price_per_kg }} грн/кг ·
@@ -4971,29 +5154,75 @@ PRODUCTION_DETAIL_HTML = """
     </form>
   </div>
 </div>
-<div class="section-title"><span class="accent-dot"></span> Маршрутна карта та розклад по робочих центрах</div>
-<div class="card table-wrap">
-  <table>
-    <tr><th>#</th><th>Операція</th><th>Робочий центр</th><th>Норма, год</th><th>План початок</th><th>План кінець</th><th>Статус</th><th></th></tr>
-    {% for op in operations %}
-    <tr>
-      <td>{{ op['step_order'] }}</td>
-      <td>{{ op['operation_name'] }}</td>
-      <td>{{ op['wc_name'] or '—' }}</td>
-      <td>{{ op['planned_hours'] }}</td>
-      <td>{{ op['planned_start'] or '—' }}</td>
-      <td>{{ op['planned_end'] or '—' }}</td>
-      <td><span class="badge badge-{{ 'low' if op['status']=='done' else ('medium' if op['status']=='in_progress' else 'high') }}">{{ dict(OPERATION_STATUSES)[op['status']] }}</span></td>
-      <td>
-        {% if op['status']!='done' %}
-        <form method="post" action="{{ url_for('operation_advance', op_id=op['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-          <button class="btn btn-sm" type="submit">{{ 'Почати' if op['status']=='waiting' else 'Завершити' }}</button>
-        </form>
-        {% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-  </table>
+<div class="card card-pad" style="margin-bottom:14px;">
+  <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+    <div style="font-weight:700;">Від заготовки до готової деталі: {{ summary.done }} із {{ summary.total }} етапів</div>
+    <div style="font-size:12.5px; color:var(--text-dim);">План: {{ summary.planned_h }} год · Факт: {{ summary.actual_h }} год</div>
+  </div>
+  <div style="background:var(--bg-soft); border-radius:8px; height:14px; overflow:hidden;">
+    <div style="width:{{ summary.pct }}%; height:100%; background:#3fae5c;"></div>
+  </div>
+  {% if summary.current %}
+  <div style="margin-top:10px; font-size:13.5px;">
+    {% if summary.current.status == 'in_progress' %}▶ Зараз: <b>{{ summary.current.operation_name }}</b>{% if summary.current.wc_name %} ({{ summary.current.wc_name }}){% endif %}
+    {% else %}⏭ Наступний етап: <b>{{ summary.current.operation_name }}</b>{% if summary.current.wc_name %} ({{ summary.current.wc_name }}){% endif %}{% endif %}
+  </div>
+  {% else %}
+  <div style="margin-top:10px; font-size:13.5px; color:#3fae5c; font-weight:700;">✅ Усі етапи виконано — деталь готова</div>
+  {% endif %}
+</div>
+<div class="section-title"><span class="accent-dot"></span> Маршрут по етапах</div>
+<div style="display:flex; flex-direction:column;">
+  <div style="display:flex; align-items:center; gap:12px; padding:6px 4px; color:var(--text-dim); font-size:13px;">
+    <div style="width:38px; text-align:center;">📦</div><div>Заготовка (початок маршруту)</div>
+  </div>
+  {% for op in operations %}
+  {% set cur = summary.current and summary.current.id == op['id'] %}
+  <div style="display:flex; gap:12px;">
+    <div style="width:38px; display:flex; flex-direction:column; align-items:center;">
+      <div style="width:2px; height:10px; background:var(--border);"></div>
+      <div style="width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:700; color:#fff;
+           background:{{ '#3fae5c' if op['status']=='done' else ('#e0a02f' if op['status']=='in_progress' else ('#6b7280' if op['blocked'] else '#4fa8e0')) }};">
+        {{ '✓' if op['status']=='done' else op['step_order'] }}</div>
+      <div style="width:2px; flex:1; background:var(--border);"></div>
+    </div>
+    <div class="card card-pad" style="flex:1; margin:4px 0; {{ 'border-color:#e0a02f; box-shadow:0 0 0 2px rgba(224,160,47,.25);' if cur else '' }} {{ 'opacity:.75;' if op['status']=='done' else '' }}">
+      <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center;">
+        <div>
+          <div style="font-size:16px; font-weight:700;">{{ op['operation_name'] }}</div>
+          <div style="font-size:12.5px; color:var(--text-dim); margin-top:3px;">
+            {{ op['wc_name'] or 'Без робочого центру' }} · норма {{ op['planned_hours'] }} год
+            {% if op['status']=='done' and op['actual_h'] is not none %} · факт {{ op['actual_h'] }} год{% endif %}
+            {% if op['status']=='in_progress' and op['running_h'] is not none %} · іде вже {{ op['running_h'] }} год{% endif %}
+          </div>
+          <div style="font-size:12px; color:var(--text-dim); margin-top:2px;">
+            {% if op['planned_start'] %}план {{ op['planned_start'][:16] }} → {{ (op['planned_end'] or '—')[:16] }}{% endif %}
+          </div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <span class="badge badge-{{ 'low' if op['status']=='done' else ('medium' if op['status']=='in_progress' else 'high') }}">{{ dict(OPERATION_STATUSES)[op['status']] }}</span>
+          {% if op['status']!='done' and op['can_act'] %}
+            {% if op['blocked'] %}
+            <span style="font-size:12.5px; color:var(--text-dim);">🔒 чекає етапу {{ op['step_order']-1 }}</span>
+            {% else %}
+            <form method="post" action="{{ url_for('operation_advance', op_id=op['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <button class="btn btn-primary" type="submit" style="padding:10px 18px;">{{ '▶ Почати' if op['status']=='waiting' else '✔ Завершити' }}</button>
+            </form>
+            {% endif %}
+          {% endif %}
+          {% if op['can_revert'] %}
+          <form method="post" action="{{ url_for('operation_revert', op_id=op['id']) }}" onsubmit="return confirm('{{ 'Скасувати початок етапу?' if op['status']=='in_progress' else 'Відкрити етап знову?' }}');"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-sm" type="submit">↩ {{ 'Скасувати старт' if op['status']=='in_progress' else 'Відкрити знову' }}</button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  <div style="display:flex; align-items:center; gap:12px; padding:6px 4px; font-size:13px; color:{{ '#3fae5c' if summary.done == summary.total and summary.total else 'var(--text-dim)' }}; font-weight:{{ 700 if summary.done == summary.total and summary.total else 400 }};">
+    <div style="width:38px; text-align:center;">🏁</div><div>Готова деталь (кінець маршруту)</div>
+  </div>
 </div>
 <div class="section-title"><span class="accent-dot"></span> Gantt-схема (планові терміни операцій)</div>
 <div class="card card-pad">
@@ -5049,20 +5278,39 @@ TERMINAL_HTML = """
   {% endif %}
 </div>
 {% endif %}
+{% set n_run = ops | selectattr('status','equalto','in_progress') | list | length %}
+{% set n_ready = ops | selectattr('ready') | selectattr('status','equalto','waiting') | list | length %}
+<div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; font-size:13.5px;">
+  <span class="badge badge-low">▶ У роботі: {{ n_run }}</span>
+  <span class="badge badge-medium">Готові до старту: {{ n_ready }}</span>
+  <span class="badge badge-high">⏳ Чекають попередній етап: {{ ops|length - n_run - n_ready }}</span>
+</div>
 <div style="display:flex; flex-direction:column; gap:14px;">
   {% for op in ops %}
-  <div class="card card-pad" style="{{ 'opacity:0.55;' if not op.ready }}">
+  {% if loop.first or (op.status=='in_progress') != (loop.previtem.status=='in_progress') or (op.ready != loop.previtem.ready and op.status!='in_progress') %}
+  <div style="font-size:12px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:var(--text-dim); margin-top:{{ '0' if loop.first else '8px' }};">
+    {{ '▶ Зараз у роботі' if op.status=='in_progress' else ('Далі: готово до старту' if op.ready else '⏳ Чекають попередній етап') }}
+  </div>
+  {% endif %}
+  <div class="card card-pad" style="{{ 'opacity:0.6;' if not op.ready }} {{ 'border-color:#e0a02f; box-shadow:0 0 0 2px rgba(224,160,47,.25);' if op.status=='in_progress' }}">
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
-      <div>
+      <div style="flex:1; min-width:240px;">
         <div style="font-size:11px; color:var(--text-dim);">{{ op.client_name or '—' }}</div>
         <div style="font-size:18px; font-weight:700; margin:2px 0;">{{ op.deal_title or ('Замовлення №' ~ op.production_order_id) }}</div>
-        <div style="font-size:13px; color:var(--accent-2);">{{ op.operation_name }}</div>
+        <div style="font-size:15px; font-weight:600; color:var(--accent-2);">{{ op.operation_name }}</div>
         <div style="font-size:11.5px; color:var(--text-dim); margin-top:4px;">
-          Крок {{ op.step_order }} · Кількість: {{ op.quantity }} шт. · Норма: {{ op.planned_hours }} год
-          {% if op.planned_start %} · План: {{ op.planned_start[:16] }}{% endif %}
+          Етап {{ op.step_order }} із {{ op.steps_total }} · {{ op.quantity }} шт. · норма {{ op.planned_hours }} год
+          {% if op.running_h is not none %} · <b style="color:#e0a02f;">іде вже {{ op.running_h }} год</b>{% endif %}
+          {% if op.planned_start %} · план {{ op.planned_start[:16] }}{% endif %}
+        </div>
+        <div style="font-size:12px; margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+          <span style="color:var(--text-dim);">Маршрут:</span>
+          {% if op.prev_step %}<span style="padding:2px 8px; border-radius:10px; background:var(--bg-soft);">{{ '✓ ' if op.prev_step.status=='done' else '' }}{{ op.prev_step.operation_name }}</span> →{% else %}<span style="padding:2px 8px; border-radius:10px; background:var(--bg-soft);">📦 заготовка</span> →{% endif %}
+          <b style="padding:2px 8px; border-radius:10px; background:rgba(224,160,47,.2);">{{ op.operation_name }}</b>
+          {% if op.next_step %}→ <span style="padding:2px 8px; border-radius:10px; background:var(--bg-soft);">{{ op.next_step.operation_name }}{% if op.next_step.wc_name %} ({{ op.next_step.wc_name }}){% endif %}</span>{% else %}→ <span style="padding:2px 8px; border-radius:10px; background:var(--bg-soft);">🏁 готова деталь</span>{% endif %}
         </div>
         {% if not op.ready %}
-        <div style="font-size:11.5px; color:var(--yellow); margin-top:6px;">⏳ Очікує завершення попереднього етапу в іншому цеху</div>
+        <div style="font-size:12px; color:var(--yellow); margin-top:6px;">⏳ Очікує завершення попереднього етапу{% if op.prev_step and op.prev_step.wc_name %} («{{ op.prev_step.operation_name }}», {{ op.prev_step.wc_name }}){% endif %}</div>
         {% endif %}
       </div>
       <div style="text-align:center;">
@@ -5072,8 +5320,8 @@ TERMINAL_HTML = """
         {% if not can_act %}
         <span style="font-size:11.5px; color:var(--text-dim);">Дії доступні лише на своїй дільниці</span>
         {% elif op.ready %}
-        <form method="post" action="{{ url_for('operation_advance', op_id=op.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-          <button class="btn btn-primary" type="submit" style="font-size:16px; padding:16px 28px;">
+        <form method="post" action="{{ url_for('operation_advance', op_id=op.id) }}"{% if op.status=='in_progress' %} onsubmit="return confirm('Завершити «{{ op.operation_name }}»?');"{% endif %}><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-primary" type="submit" style="font-size:18px; padding:18px 34px; min-width:180px;">
             {{ 'ЗАВЕРШИТИ' if op.status=='in_progress' else 'ПОЧАТИ' }}
           </button>
         </form>
@@ -5835,6 +6083,23 @@ SETTINGS_HTML = """
           <input type="password" name="anthropic_api_key" value="{{ settings.get('anthropic_api_key','') }}" placeholder="sk-ant-...">
         </div>
         <button class="btn btn-sm btn-primary" type="submit">Зберегти</button>
+      </form>
+      <form method="post" action="{{ url_for('settings_save') }}" style="margin-top:16px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="form" value="ai_prices">
+        <div style="font-weight:700; font-size:13px; margin-bottom:4px;">Ціни цеху для ШІ-калькулятора</div>
+        <p style="font-size:11.5px; color:var(--text-dim); margin:0 0 8px;">Якщо заповнено, ШІ бере саме ці числа, а не свої припущення. Порожнє поле означає, що ШІ оцінює сам.</p>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px;">
+          <div class="field"><label>Токарна, грн/год</label><input type="number" step="0.01" min="0" name="ai_rate_turning" value="{{ settings.get('ai_rate_turning','') }}"></div>
+          <div class="field"><label>Фрезерна, грн/год</label><input type="number" step="0.01" min="0" name="ai_rate_milling" value="{{ settings.get('ai_rate_milling','') }}"></div>
+          <div class="field"><label>Додаткова, грн/год</label><input type="number" step="0.01" min="0" name="ai_rate_other" value="{{ settings.get('ai_rate_other','') }}"></div>
+          <div class="field"><label>Націнка, %</label><input type="number" step="0.1" min="0" name="ai_margin" value="{{ settings.get('ai_margin','') }}"></div>
+          <div class="field"><label>Сталь, грн/кг</label><input type="number" step="0.01" min="0" name="ai_price_steel" value="{{ settings.get('ai_price_steel','') }}"></div>
+          <div class="field"><label>Нержавійка, грн/кг</label><input type="number" step="0.01" min="0" name="ai_price_stainless" value="{{ settings.get('ai_price_stainless','') }}"></div>
+          <div class="field"><label>Алюміній, грн/кг</label><input type="number" step="0.01" min="0" name="ai_price_aluminium" value="{{ settings.get('ai_price_aluminium','') }}"></div>
+          <div class="field"><label>Латунь/бронза, грн/кг</label><input type="number" step="0.01" min="0" name="ai_price_brass" value="{{ settings.get('ai_price_brass','') }}"></div>
+          <div class="field"><label>Титан, грн/кг</label><input type="number" step="0.01" min="0" name="ai_price_titanium" value="{{ settings.get('ai_price_titanium','') }}"></div>
+        </div>
+        <button class="btn btn-sm btn-primary" type="submit" style="margin-top:8px;">Зберегти ціни</button>
       </form>
       <p style="font-size:11px; color:var(--text-dim); margin-top:10px; margin-bottom:0;">
         ⚠ Розрахунок від ШІ — орієнтовна оцінка. Завжди перевіряй цифри перед тим, як ставити їх у КП клієнту.
@@ -6866,7 +7131,7 @@ def calculator_ai_estimate():
         if not description.strip() and not images and known_fields:
             description = ai_calc_synthesize_description_from_known_fields(known_fields)
         try:
-            calc_result = ai_estimate_cost_params(description, api_key, images=images)
+            calc_result = ai_estimate_cost_params(ai_shop_context_text(ai_shop_prices(db)) + description, api_key, images=images)
         except AICalcError as e:
             flash(str(e), "error")
             return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
@@ -6885,6 +7150,7 @@ def calculator_ai_estimate():
     # це свідомо НЕ застосовуємо - сама суть правки в тому, щоб людина могла
     # природною мовою змінити будь-яке значення, в т.ч. раніше введене вручну,
     # і ШІ має це почути, а не бачити його миттєво відкоченим назад.
+    ai_notes = ai_calc_apply_shop_rules(params, ai_shop_prices(db), override=not correction_token)
     if not correction_token:
         for _k, _v in known_fields.items():
             params[_k] = _v
@@ -6917,6 +7183,14 @@ def calculator_ai_estimate():
         "quantity": quantity, "total_price": round(total_price, 2), "margin_pct": margin_pct,
         "material_calc": None, "stock_check": None,
         "ai_operations_description": params.get("operations_description", ""),
+        "ai_material": {
+            "grade": str(params.get("material_grade") or "")[:80],
+            "blank_type": str(params.get("blank_type") or "")[:80],
+            "blank_size": str(params.get("blank_size") or "")[:80],
+            "source": str(params.get("material_source") or ""),
+        },
+        "ai_warnings": ai_calc_blank_check(params),
+        "ai_notes": ai_notes,
         "ai_inputs": {
             "weight_kg": weight_kg, "material_price_per_kg": material_price,
             "turning_hours": turning_hours, "turning_rate_per_hour": turning_rate,
@@ -8277,7 +8551,71 @@ def production_detail(order_id):
             operations.append(d)
     else:
         operations = [dict(op, offset_pct=0, width_pct=5) for op in ops_rows]
-    return render_template("production_detail.html", active="production", order=order, operations=operations)
+    user = get_current_user()
+    fw = foreman_work_center_id(user)
+    can_manage = bool(user and user["role"] in ("admin", "production") and not fw)
+    now_dt = datetime.datetime.now()
+    prev_status = None
+    for d in operations:
+        d["can_act"] = (not fw) or d["work_center_id"] == fw
+        d["blocked"] = d["status"] == "waiting" and prev_status is not None and prev_status != "done"
+        d["actual_h"] = d["running_h"] = None
+        try:
+            if d["actual_start"] and d["actual_end"]:
+                d["actual_h"] = round((datetime.datetime.strptime(d["actual_end"], "%Y-%m-%d %H:%M:%S")
+                                       - datetime.datetime.strptime(d["actual_start"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600, 1)
+            elif d["actual_start"] and d["status"] == "in_progress":
+                d["running_h"] = round((now_dt - datetime.datetime.strptime(d["actual_start"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600, 1)
+        except ValueError:
+            pass
+        prev_status = d["status"]
+    for i, d in enumerate(operations):
+        nxt = operations[i + 1]["status"] if i + 1 < len(operations) else None
+        d["can_revert"] = can_manage and (
+            (d["status"] == "in_progress") or (d["status"] == "done" and nxt in (None, "waiting")))
+    done_n = sum(1 for d in operations if d["status"] == "done")
+    current = next((d for d in operations if d["status"] != "done"), None)
+    summary = {
+        "done": done_n, "total": len(operations),
+        "pct": round(done_n / len(operations) * 100) if operations else 0,
+        "planned_h": round(sum(d["planned_hours"] or 0 for d in operations), 1),
+        "actual_h": round(sum(d["actual_h"] or 0 for d in operations), 1),
+        "current": current,
+    }
+    return render_template("production_detail.html", active="production", order=order, operations=operations, summary=summary)
+
+
+@app.route("/production/operations/<int:op_id>/revert", methods=["POST"])
+@login_required
+@role_required("production")
+def operation_revert(op_id):
+    """Виправлення помилкового кліку: «Скасувати старт» (in_progress -> waiting)
+    або «Відкрити знову» (done -> in_progress, лише якщо наступний етап ще
+    не розпочато). Лише майстер без прив'язки до дільниці та адміністратор."""
+    db = get_db()
+    op = db.execute("SELECT * FROM production_operations WHERE id=?", (op_id,)).fetchone()
+    if not op:
+        abort(404)
+    if foreman_work_center_id(get_current_user()):
+        flash("Повертати етапи може лише майстер цеху чи адміністратор", "error")
+        return redirect(url_for("production_detail", order_id=op["production_order_id"]))
+    oid = op["production_order_id"]
+    if op["status"] == "in_progress":
+        db.execute("UPDATE production_operations SET status='waiting', actual_start=NULL, actual_end=NULL WHERE id=?", (op_id,))
+    elif op["status"] == "done":
+        nxt = db.execute("SELECT status FROM production_operations WHERE production_order_id=? AND step_order=?",
+                         (oid, op["step_order"] + 1)).fetchone()
+        if nxt is not None and nxt["status"] != "waiting":
+            flash("Не можна відкрити етап: наступний уже розпочато", "error")
+            return redirect(url_for("production_detail", order_id=oid))
+        db.execute("UPDATE production_operations SET status='in_progress', actual_end=NULL WHERE id=?", (op_id,))
+    else:
+        return redirect(url_for("production_detail", order_id=oid))
+    started = db.execute("SELECT COUNT(*) c FROM production_operations WHERE production_order_id=? AND status!='waiting'", (oid,)).fetchone()["c"]
+    db.execute("UPDATE production_orders SET status=? WHERE id=?", ("in_progress" if started else "planned", oid))
+    db.commit()
+    flash("Етап повернуто", "success")
+    return redirect(url_for("production_detail", order_id=oid))
 
 
 @app.route("/production/<int:order_id>/route-sheet.pdf")
@@ -8470,7 +8808,24 @@ def work_center_terminal(wc_id):
         ).fetchone()
         d = dict(op)
         d["ready"] = (prev is None) or (prev["status"] == "done")
+        chain = db.execute(
+            """SELECT po.step_order, po.operation_name, po.status, w.name AS wc_name
+               FROM production_operations po LEFT JOIN work_centers w ON w.id=po.work_center_id
+               WHERE po.production_order_id=? ORDER BY po.step_order""", (op["production_order_id"],)).fetchall()
+        d["steps_total"] = len(chain)
+        d["steps_done"] = sum(1 for c in chain if c["status"] == "done")
+        d["prev_step"] = next((dict(c) for c in chain if c["step_order"] == op["step_order"] - 1), None)
+        d["next_step"] = next((dict(c) for c in chain if c["step_order"] == op["step_order"] + 1), None)
+        d["running_h"] = None
+        if op["status"] == "in_progress" and op["actual_start"]:
+            try:
+                d["running_h"] = round((datetime.datetime.now() - datetime.datetime.strptime(
+                    op["actual_start"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600, 1)
+            except ValueError:
+                pass
         ops_enriched.append(d)
+    # Спершу те, що в роботі, потім готове до старту, наприкінці - що чекає попередній етап
+    ops_enriched.sort(key=lambda x: (0 if x["status"] == "in_progress" else (1 if x["ready"] else 2), x["planned_start"] or ""))
     user = get_current_user()
     work_day = None
     day_ops = []
@@ -8823,7 +9178,7 @@ def shift_log_report_pdf():
                      f"Брак: {totals['scrap']} шт   Годин: {totals['hours']:.1f}")
 
     def draw_table_header(y):
-        col_x = [20, 35, 58, 128, 148, 168]
+        col_x = [22, 40, 77, 140, 159, 172]
         headers = ["Дата", "Дільниця", "Деталь", "Зроблено", "Брак", "Год."]
         c.setFillColor(steel)
         c.rect(20 * mm, y - 6 * mm, width - 40 * mm, 6 * mm, fill=1, stroke=0)
@@ -8852,13 +9207,53 @@ def shift_log_report_pdf():
                     y = height - 20 * mm
                     col_x, y = draw_table_header(y)
                 c.rect(20 * mm, y - row_h, width - 40 * mm, row_h, fill=0, stroke=1)
-                c.drawString(col_x[0] * mm, y - 5 * mm, r["work_date"])
-                c.drawString(col_x[1] * mm, y - 5 * mm, (r["work_center_name"] or "—")[:16])
-                c.drawString(col_x[2] * mm, y - 5 * mm, (r["part_description"] or "")[:32])
+                def _clip(text, max_mm):
+                    from reportlab.pdfbase.pdfmetrics import stringWidth
+                    text = str(text)
+                    while text and stringWidth(text, PDF_FONT, 8) > max_mm * mm:
+                        text = text[:-1]
+                    return text
+                c.drawString(col_x[0] * mm, y - 5 * mm, _clip(r["work_date"], 18))
+                c.drawString(col_x[1] * mm, y - 5 * mm, _clip(r["work_center_name"] or "—", 35))
+                c.drawString(col_x[2] * mm, y - 5 * mm, _clip(r["part_description"] or "", 60))
                 c.drawString(col_x[3] * mm, y - 5 * mm, str(r["quantity_made"] or 0))
                 c.drawString(col_x[4] * mm, y - 5 * mm, str(r["quantity_scrap"] or 0))
                 c.drawString(col_x[5] * mm, y - 5 * mm, f"{r['shift_hours']:.1f}" if r["shift_hours"] is not None else "—")
                 y -= row_h
+            # Підсумок: загалом і по дільницях (годин / зроблено / брак)
+            by_wc = {}
+            for r in g["rows"]:
+                k = r["work_center_name"] or "—"
+                t = by_wc.setdefault(k, {"made": 0, "scrap": 0, "hours": 0.0})
+                t["made"] += r["quantity_made"] or 0
+                t["scrap"] += r["quantity_scrap"] or 0
+                t["hours"] += r["shift_hours"] or 0
+            need = (len(by_wc) + 3) * 7 * mm + 8 * mm
+            if y - need < 15 * mm:
+                c.showPage()
+                y = height - 20 * mm
+            y -= 6 * mm
+            c.setFont(PDF_FONT_BOLD, 10)
+            c.drawString(22 * mm, y, "Підсумок по годинах")
+            y -= 6 * mm
+            c.setFont(PDF_FONT, 9)
+            for k in sorted(by_wc):
+                t = by_wc[k]
+                c.drawString(22 * mm, y, _clip(k, 60))
+                c.drawString(100 * mm, y, f"{t['hours']:.1f} год")
+                c.drawString(128 * mm, y, f"зроблено {t['made']}")
+                c.drawString(158 * mm, y, f"брак {t['scrap']}")
+                y -= 5.5 * mm
+            y -= 4 * mm
+            c.setFillColor(steel)
+            c.rect(20 * mm, y - 2 * mm, width - 40 * mm, 8 * mm, fill=1, stroke=0)
+            c.setFillColor(colors.white)
+            c.setFont(PDF_FONT_BOLD, 10)
+            c.drawString(22 * mm, y + 0.5 * mm, "РАЗОМ")
+            c.drawString(100 * mm, y + 0.5 * mm, f"{g['hours']:.1f} год")
+            c.drawString(128 * mm, y + 0.5 * mm, f"зроблено {g['made']}")
+            c.drawString(158 * mm, y + 0.5 * mm, f"брак {g['scrap']}")
+            c.setFillColor(colors.black)
             c.showPage()
 
     c.save()
@@ -9245,6 +9640,24 @@ def settings_save():
         set_setting(db, "reorder_days", str(days))
         db.commit()
         flash("Налаштування сповіщень збережено", "success")
+    elif f.get("form") == "ai_prices":
+        keys = list(AI_PRICE_SETTING_KEYS.values()) + list(AI_RATE_SETTING_KEYS.values()) + ["ai_margin"]
+        vals = {}
+        for k in keys:
+            raw = (f.get(k) or "").strip()
+            if not raw:
+                vals[k] = ""
+                continue
+            try:
+                v = parse_number(f, k, min_value=0, label=k)
+            except ValidationError as e:
+                flash(str(e), "error")
+                return redirect(url_for("settings_page"))
+            vals[k] = "" if not v else f"{v:g}"
+        for k, v in vals.items():
+            set_setting(db, k, v)
+        db.commit()
+        flash("Ціни цеху для ШІ збережено", "success")
     elif f.get("form") == "anthropic":
         set_setting(db, "anthropic_api_key", f.get("anthropic_api_key", "").strip())
         db.commit()
