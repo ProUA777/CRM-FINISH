@@ -5450,3 +5450,42 @@ def test_np_track_parses_response(client, monkeypatch):
         {"success": False, "errors": ["API key expired"]}).encode()))
     with pytest.raises(RuntimeError):
         m.np_track("k", ["1"])
+
+
+def test_machines_page_live_telemetry_and_connect(client, monkeypatch):
+    m = client._app_module
+    login(client, "admin", "admin123")
+    t = client.get("/machines").get_data(as_text=True)
+    assert "Наше обладнання" in t and "працюють" in t and "Години роботи, 14 днів" in t
+    data = client.get("/machines/live.json").get_json()
+    assert data and any(v["connected"] for v in data.values())
+    db = _raw_db(client)
+    db.execute("INSERT INTO machines (category, model, in_stock) VALUES ('5-осьовий обробний центр','HAAS UMC 750',1)")
+    db.commit()
+    mid = db.execute("SELECT id FROM machines WHERE model='HAAS UMC 750'").fetchone()["id"]
+    assert data.get(str(mid)) is None or not data[str(mid)]["connected"]
+    t = client.get("/machines").get_data(as_text=True)
+    assert "Підключити телеметрію" in t
+    monkeypatch.setattr(m, "fetch_mtconnect", lambda host, port, timeout=4: {
+        "status": "running", "program_name": "T.NC", "mode": "AUTOMATIC", "part_count": 991, "spindle_load_pct": 37.0})
+    monkeypatch.setattr(m, "notify_all", lambda t: None)
+    r = post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "work_center_id": "new"},
+             follow_redirects=True)
+    assert "язок є" in r.get_data(as_text=True)
+    db = _raw_db(client)
+    wc = db.execute("SELECT w.* FROM machines m JOIN work_centers w ON w.id=m.work_center_id WHERE m.id=?", (mid,)).fetchone()
+    assert wc["name"] == "HAAS UMC 750" and wc["mtc_host"] == "192.168.10.2" and wc["mtc_enabled"] == 1
+    live = client.get("/machines/live.json").get_json()[str(mid)]
+    assert live["status"] == "running" and live["program"] == "T.NC" and live["load"] == 37 and live["parts"] == 991
+    # тиша понад 2 хв від MTConnect = немає зв'язку
+    db.execute("UPDATE machine_telemetry SET last_seen='2026-01-01 00:00:00' WHERE work_center_id=?", (wc["id"],)); db.commit()
+    assert client.get("/machines/live.json").get_json()[str(mid)]["status"] == "offline"
+    # погана адреса відхиляється, відключення працює
+    post(client, f"/machines/{mid}/connect", {"mtc_host": "http://bad host", "mtc_port": "8082"})
+    assert _raw_db(client).execute("SELECT mtc_host FROM work_centers WHERE id=?", (wc["id"],)).fetchone()[0] == "192.168.10.2"
+    post(client, f"/machines/{mid}/connect", {"action": "disconnect"})
+    assert _raw_db(client).execute("SELECT work_center_id FROM machines WHERE id=?", (mid,)).fetchone()[0] is None
+    client.get("/logout")
+    login(client, "tokar", "tokar123")
+    post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.3"})
+    assert _raw_db(client).execute("SELECT work_center_id FROM machines WHERE id=?", (mid,)).fetchone()[0] is None

@@ -952,6 +952,21 @@ def register(A):
             seed_orders_demo(A, db)
         except Exception:
             pass
+        try:
+            # демо: верстати каталогу прив'язані до дільниць, щоб на картках була телеметрія
+            pairs = (("Токар", "Токар"), ("Фрезер", "Фрезер"), ("обробний", "Фрезер"), ("Шліф", "Шліф"),
+                     ("Свердл", "Заготів"), ("Універсал", "Складал"))
+            wcs = db.execute("SELECT id, name FROM work_centers").fetchall()
+            for m in db.execute("SELECT id, category FROM machines").fetchall():
+                for key, wc_key in pairs:
+                    if key.lower() in (m["category"] or "").lower():
+                        wc = next((w for w in wcs if wc_key.lower() in w["name"].lower()), None)
+                        if wc:
+                            db.execute("UPDATE machines SET work_center_id=? WHERE id=?", (wc["id"], m["id"]))
+                        break
+            db.commit()
+        except Exception:
+            pass
 
     A.seed_data = seed_with_orders
 

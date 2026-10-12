@@ -249,6 +249,7 @@ STAGE_COLOR[LOST_STAGE] = "#8a3f3f"
 MACHINE_CATEGORIES = [
     "Токарний верстат з ЧПУ",
     "Фрезерний обробний центр",
+    "5-осьовий обробний центр",
     "Універсальний токарно-фрезерний верстат",
     "Свердлильно-фрезерний верстат",
     "Шліфувальний верстат з ЧПУ",
@@ -863,6 +864,7 @@ def migrate_schema(db):
             ("program_name", "TEXT"), ("mode", "TEXT"), ("source", "TEXT DEFAULT 'generic'"),
         ],
         "users": [("work_center_id", "INTEGER")],
+        "machines": [("work_center_id", "INTEGER")],
         "work_centers": [("mtc_host", "TEXT"), ("mtc_port", "INTEGER DEFAULT 8082"),
                          ("mtc_enabled", "INTEGER DEFAULT 0")],
     }
@@ -5059,37 +5061,138 @@ MACHINES_HTML = """
 {% extends "base.html" %}
 {% block title %}Наше обладнання{% endblock %}
 {% block heading %}Наше обладнання{% endblock %}
-{% block subheading %}Технічні характеристики та можливості власного парку{% endblock %}
+{% block subheading %}Живий стан верстатів: що робить, яка програма, скільки годин відпрацював{% endblock %}
 {% block content %}
+<style>
+.mx-sum{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.mx-sum div{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:10px 16px;min-width:120px}
+.mx-sum b{display:block;font-size:24px;line-height:1.1}.mx-sum span{font-size:12px;color:var(--text-dim)}
+.mx-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px}
+.mx-card{background:var(--panel);border:1px solid var(--border);border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
+.mx-band{padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.mx-band .st{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px}
+.mx-dot{width:12px;height:12px;border-radius:50%;background:#7d8590;flex-shrink:0}
+.st-running .mx-dot{background:#3fb27f;box-shadow:0 0 0 0 rgba(63,178,127,.7);animation:mxp 1.6s infinite}
+.st-idle .mx-dot{background:#e8a33d}.st-alarm .mx-dot{background:#e5534b;animation:mxp 0.9s infinite}
+.st-running{background:linear-gradient(90deg,rgba(63,178,127,.18),transparent)}
+.st-idle{background:linear-gradient(90deg,rgba(232,163,61,.16),transparent)}
+.st-alarm{background:linear-gradient(90deg,rgba(229,83,75,.25),transparent)}
+.st-offline,.st-none{background:linear-gradient(90deg,rgba(125,133,144,.14),transparent)}
+@keyframes mxp{0%{box-shadow:0 0 0 0 rgba(255,255,255,.35)}70%{box-shadow:0 0 0 8px rgba(255,255,255,0)}100%{box-shadow:0 0 0 0 rgba(255,255,255,0)}}
+.mx-body{padding:4px 16px 14px;flex:1;display:flex;flex-direction:column;gap:10px}
+.mx-title{font-size:18px;font-weight:700;margin:0}.mx-cat{font-size:11.5px;color:var(--text-dim)}
+.mx-kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.mx-kpis div{background:var(--bg-soft,rgba(255,255,255,.03));border-radius:10px;padding:8px 10px}
+.mx-kpis span{display:block;font-size:11px;color:var(--text-dim)}.mx-kpis b{font-size:16px}
+.mx-load{height:8px;background:var(--border);border-radius:5px;overflow:hidden}.mx-load i{display:block;height:100%;background:linear-gradient(90deg,#3fb27f,#e8a33d 70%,#e5534b)}
+.mx-bars{display:flex;align-items:flex-end;gap:3px;height:42px}.mx-bars i{flex:1;background:#4c9be8;border-radius:2px 2px 0 0;min-height:2px;opacity:.85}
+.mx-specs{font-size:12px;color:var(--text-dim);display:flex;gap:12px;flex-wrap:wrap}
+.mx-foot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 16px;border-top:1px solid var(--border)}
+.mx-prog{font-family:monospace;font-size:15px;font-weight:700}
+</style>
 <div class="toolbar">
-  <div></div>
-  <a class="btn btn-primary" href="{{ url_for('machine_new') }}">+ Додати обладнання</a>
-</div>
-<div class="grid grid-3">
-  {% for m in machines %}
-  <div class="card card-pad">
-    <div class="tag">{{ m['category'] }}</div>
-    <h3 style="margin:8px 0 4px;">{{ m['model'] }}</h3>
-    <p style="color:var(--text-dim); font-size:12.5px; min-height:34px;">{{ m['description'] or '' }}</p>
-    <div class="stat-row" style="gap:14px;">
-      <div class="stat">Потужність<b>{{ m['spindle_power'] or '—' }}</b></div>
-      <div class="stat">Робоча зона<b>{{ m['work_area'] or '—' }}</b></div>
-      <div class="stat">Точність<b>{{ m['accuracy'] or '—' }}</b></div>
-    </div>
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
-      <span class="badge badge-{{ 'low' if m['in_stock'] else 'medium' }}">{{ 'в роботі' if m['in_stock'] else 'на плановому ТО' }}</span>
-    </div>
-    <div style="margin-top:12px; display:flex; gap:8px;">
-      <a class="btn btn-sm" href="{{ url_for('machine_edit', machine_id=m['id']) }}">Редагувати</a>
-      <form method="post" action="{{ url_for('machine_delete', machine_id=m['id']) }}" onsubmit="return confirm('Видалити обладнання зі списку?');"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-        <button class="btn btn-sm btn-danger" type="submit">✕</button>
-      </form>
-    </div>
+  <div class="mx-sum">
+    <div><b style="color:#3fb27f" id="sum-running">{{ summary.running }}</b><span>працюють</span></div>
+    <div><b style="color:#e8a33d" id="sum-idle">{{ summary.idle }}</b><span>простій</span></div>
+    <div><b style="color:#e5534b" id="sum-alarm">{{ summary.alarm }}</b><span>аварія</span></div>
+    <div><b style="color:#9aa1ad" id="sum-offline">{{ summary.offline }}</b><span>немає зв'язку</span></div>
+    {% if summary.none %}<div><b style="color:#9aa1ad">{{ summary.none }}</b><span>без телеметрії</span></div>{% endif %}
   </div>
-  {% else %}
-  <div class="empty">Каталог порожній</div>
-  {% endfor %}
+  {% if current_user['role'] in ('admin','sales','production') %}<a class="btn btn-primary" href="{{ url_for('machine_new') }}">+ Додати обладнання</a>{% endif %}
 </div>
+<div class="mx-grid">
+{% for c in cards %}{% set m = c.m %}{% set L = c.live %}
+<div class="mx-card" id="machine-{{ m['id'] }}" data-id="{{ m['id'] }}">
+  <div class="mx-band st-{{ L.status if L.connected else 'none' }}" data-role="band">
+    <div class="st"><span class="mx-dot"></span><span data-role="label">{{ L.label if L.connected else 'Телеметрія не підключена' }}</span></div>
+    <div style="font-size:11.5px;color:var(--text-dim)" data-role="seen">{{ L.seen if L.connected else '' }}</div>
+  </div>
+  <div class="mx-body">
+    <div><div class="mx-cat">{{ m['category'] }}{% if not m['in_stock'] %} · <span style="color:#e8a33d">на плановому ТО</span>{% endif %}</div>
+      <h3 class="mx-title">{{ m['model'] }}</h3>
+      {% if m['description'] %}<div style="font-size:12.5px;color:var(--text-dim)">{{ m['description'] }}</div>{% endif %}</div>
+    {% if L.connected %}
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+        <div><span style="font-size:11px;color:var(--text-dim)">Програма</span><div class="mx-prog" data-role="program">{{ L.program or '—' }}</div></div>
+        <div style="text-align:right"><span style="font-size:11px;color:var(--text-dim)">Режим</span><div data-role="mode" style="font-weight:600">{{ L.mode or '—' }}</div></div>
+      </div>
+      <div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim)"><span>Навантаження шпинделя</span><span data-role="loadtxt">{{ (L.load ~ '%') if L.load is not none else '—' }}</span></div>
+        <div class="mx-load"><i data-role="load" style="width:{{ L.load or 0 }}%"></i></div></div>
+      <div class="mx-kpis">
+        <div><span>Сьогодні в роботі</span><b data-role="today">{{ L.today_h if L.today_h is defined else 0 }} год</b></div>
+        <div><span>За 7 днів</span><b data-role="week">{{ L.week_h if L.week_h is defined else 0 }} год</b></div>
+        <div><span>Деталей (лічильник)</span><b data-role="parts">{{ L.parts if L.parts is not none else '—' }}</b></div>
+      </div>
+      {% if L.daily %}<div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim);margin-bottom:4px"><span>Години роботи, 14 днів</span><span>завантаження {{ L.availability }}%</span></div>
+        <div class="mx-bars">{% for d in L.daily %}<i style="height:{{ d.pct }}%" title="{{ d.date }}: {{ d.hours }} год"></i>{% endfor %}</div></div>{% endif %}
+      <div style="font-size:11.5px;color:var(--text-dim)">Дільниця: {{ L.wc_name }}{% if L.address %} · MTConnect {{ L.address }}{% endif %}{% if L.alarms_week %} · <span style="color:#e5534b">аварій за тиждень: {{ L.alarms_week }}</span>{% endif %}</div>
+    {% else %}
+      <div style="font-size:13px;color:var(--text-dim)">Підключіть верстат, і тут з'явиться: працює він чи стоїть, яка програма, навантаження шпинделя, лічильник деталей і години роботи.</div>
+    {% endif %}
+    <div class="mx-specs"><span>⚡ {{ m['spindle_power'] or '—' }}</span><span>⬚ {{ m['work_area'] or '—' }}</span><span>◎ {{ m['accuracy'] or '—' }}</span></div>
+  </div>
+  <div class="mx-foot">
+    {% if is_admin %}
+    <details style="flex-basis:100%">
+      <summary class="btn btn-sm {{ '' if L.connected else 'btn-primary' }}" style="list-style:none;display:inline-flex">📡 {{ 'Налаштувати телеметрію' if L.connected else 'Підключити телеметрію' }}</summary>
+      <form method="post" action="{{ url_for('machine_connect', machine_id=m['id']) }}" style="margin-top:10px;display:grid;gap:8px">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:8px">
+          <div class="field"><label>IP-адреса верстата</label><input type="text" name="mtc_host" value="{{ m['mtc_host'] or '' }}" placeholder="напр. 192.168.10.2" autocomplete="off"></div>
+          <div class="field"><label>Порт</label><input type="text" name="mtc_port" value="{{ m['mtc_port'] or 8082 }}"></div>
+        </div>
+        <div class="field"><label>Робочий центр (для плану й журналу)</label>
+          <select name="work_center_id">
+            {% if not m['work_center_id'] %}<option value="new">+ Окремий для цього верстата</option>{% endif %}
+            {% for w in work_centers %}<option value="{{ w['id'] }}" {{ 'selected' if m['work_center_id']==w['id'] }}>{{ w['name'] }}</option>{% endfor %}
+            {% if m['work_center_id'] %}<option value="new">+ Окремий для цього верстата</option>{% endif %}
+          </select></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm btn-primary">Зберегти й перевірити зв'язок</button>
+          {% if L.connected %}<button class="btn btn-sm btn-ghost" name="action" value="disconnect" onclick="return confirm('Відключити телеметрію?')">Відключити</button>{% endif %}</div>
+        <div style="font-size:11px;color:var(--text-dim)">Haas: порт 8082, на стійці має бути ввімкнено MTConnect. Перевірка: на ПК з CRM відкрийте http://IP:8082/current.</div>
+      </form>
+    </details>
+    {% endif %}
+    {% if current_user['role'] in ('admin','sales','production') %}
+    <a class="btn btn-sm" href="{{ url_for('machine_edit', machine_id=m['id']) }}">Редагувати</a>
+    <form method="post" action="{{ url_for('machine_delete', machine_id=m['id']) }}" onsubmit="return confirm('Видалити обладнання зі списку?');"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-sm btn-danger" type="submit">✕</button>
+    </form>{% endif %}
+    {% if L.connected %}<a class="btn btn-sm btn-ghost" href="{{ url_for('work_center_terminal', wc_id=L.wc_id) }}" style="margin-left:auto">🖥 Термінал</a>{% endif %}
+  </div>
+</div>
+{% else %}
+<div class="empty">Каталог порожній — додайте свої верстати.</div>
+{% endfor %}
+</div>
+<script>
+(function(){
+  var LBL = {running:'Працює', idle:'Простій', alarm:'Аварія', offline:"Немає зв'язку"};
+  function upd(){
+    fetch('{{ url_for('machines_live_json') }}', {credentials:'same-origin'}).then(function(r){ return r.ok ? r.json() : null; }).then(function(data){
+      if (!data) return;
+      var sum = {running:0, idle:0, alarm:0, offline:0};
+      Object.keys(data).forEach(function(id){
+        var L = data[id], card = document.getElementById('machine-' + id);
+        if (!card || !L.connected) return;
+        sum[L.status] = (sum[L.status] || 0) + 1;
+        var band = card.querySelector('[data-role=band]');
+        band.className = 'mx-band st-' + L.status;
+        var set = function(role, v){ var e = card.querySelector('[data-role=' + role + ']'); if (e) e.textContent = v; };
+        set('label', LBL[L.status] || L.status); set('seen', L.seen || '');
+        set('program', L.program || '—'); set('mode', L.mode || '—');
+        set('loadtxt', L.load != null ? L.load + '%' : '—');
+        var bar = card.querySelector('[data-role=load]'); if (bar) bar.style.width = (L.load || 0) + '%';
+        if (L.today_h != null) set('today', L.today_h + ' год');
+        if (L.week_h != null) set('week', L.week_h + ' год');
+        set('parts', L.parts != null ? L.parts : '—');
+      });
+      ['running','idle','alarm','offline'].forEach(function(k){ var e = document.getElementById('sum-' + k); if (e) e.textContent = sum[k]; });
+    }).catch(function(){});
+  }
+  setInterval(upd, 15000);
+})();
+</script>
 {% endblock %}
 """
 
@@ -8285,12 +8388,132 @@ def task_toggle(task_id):
 # Наше обладнання
 # ---------------------------------------------------------------------------
 
+MACHINE_STATUS_LABELS = {"running": "Працює", "idle": "Простій", "alarm": "Аварія", "offline": "Немає зв'язку"}
+
+
+def machine_live(db, m):
+    """Живий стан верстата для картки: телеметрія прив'язаного робочого центру."""
+    if not m["work_center_id"]:
+        return {"connected": False}
+    t = db.execute("SELECT * FROM machine_telemetry WHERE work_center_id=?", (m["work_center_id"],)).fetchone()
+    live = {"connected": True, "wc_id": m["work_center_id"], "wc_name": m["wc_name"],
+            "mtc": bool(m["mtc_enabled"] and m["mtc_host"]),
+            "address": f"{m['mtc_host']}:{m['mtc_port'] or 8082}" if m["mtc_host"] else None}
+    if not t:
+        live.update(status="offline", label=MACHINE_STATUS_LABELS["offline"], seen="даних ще не було", demo=False)
+        return live
+    status = t["status"] or "offline"
+    demo = (t["source"] or "").startswith("demo")
+    seen = "даних ще не було"
+    if demo:
+        seen = "демо-дані (верстат ще не підключено)"
+    elif t["last_seen"]:
+        try:
+            age = (datetime.datetime.now() - datetime.datetime.fromisoformat(t["last_seen"][:19])).total_seconds()
+            seen = "щойно" if age < 60 else (f"{int(age // 60)} хв тому" if age < 3600 else t["last_seen"][:16])
+            # MTConnect опитується кожні ~15 с: 2 хв тиші = зв'язку немає
+            if age > (120 if t["source"] == "mtconnect" else 900):
+                status = "offline"
+        except ValueError:
+            pass
+    live.update(status=status, label=MACHINE_STATUS_LABELS.get(status, status), seen=seen, demo=demo,
+                program=t["program_name"] if status != "offline" else None, mode=t["mode"],
+                load=round(t["spindle_load_pct"]) if t["spindle_load_pct"] is not None and status == "running" else None,
+                parts=t["part_count"])
+    stats = get_machine_runtime_stats(db, m["work_center_id"], m["wc_capacity"] or 8)
+    if stats:
+        mx = max([d["hours"] for d in stats["daily"]] + [1])
+        live.update(today_h=stats["today_hours"], week_h=stats["week_hours"], availability=stats["availability_pct"],
+                    alarms_week=stats["alarm_count_week"],
+                    daily=[{"date": d["date"], "hours": d["hours"], "pct": int(d["hours"] / mx * 100)} for d in stats["daily"]])
+    return live
+
+
+def _machines_with_live(db):
+    rows = db.execute("""SELECT m.*, w.name AS wc_name, w.mtc_host, w.mtc_port, w.mtc_enabled,
+                                w.capacity_hours_per_day AS wc_capacity
+                         FROM machines m LEFT JOIN work_centers w ON w.id=m.work_center_id
+                         ORDER BY m.category, m.model""").fetchall()
+    return [{"m": m, "live": machine_live(db, m)} for m in rows]
+
+
 @app.route("/machines")
 @login_required
 def machines_list():
     db = get_db()
-    machines = db.execute("SELECT * FROM machines ORDER BY category, model").fetchall()
-    return render_template("machines.html", active="machines", machines=machines)
+    cards = _machines_with_live(db)
+    summary = {k: 0 for k in ("running", "idle", "alarm", "offline", "none")}
+    for c in cards:
+        summary[c["live"].get("status", "none") if c["live"]["connected"] else "none"] += 1
+    work_centers = db.execute("SELECT id, name FROM work_centers ORDER BY name").fetchall()
+    return render_template("machines.html", active="machines", cards=cards, summary=summary,
+                           work_centers=work_centers)
+
+
+@app.route("/machines/live.json")
+@login_required
+def machines_live_json():
+    """Для автооновлення сторінки «Наше обладнання» без перезавантаження."""
+    db = get_db()
+    return jsonify({str(c["m"]["id"]): c["live"] for c in _machines_with_live(db)})
+
+
+@app.route("/machines/<int:machine_id>/connect", methods=["POST"])
+@login_required
+def machine_connect(machine_id):
+    """Підключення телеметрії прямо з картки верстата: IP Haas (MTConnect) і/або
+    прив'язка до робочого центру. Якщо центру немає - створюємо окремий для
+    цього верстата, щоб на нього можна було планувати операції."""
+    if not is_admin():
+        abort(403)
+    db = get_db()
+    m = db.execute("SELECT * FROM machines WHERE id=?", (machine_id,)).fetchone()
+    if not m:
+        abort(404)
+    f = request.form
+    if f.get("action") == "disconnect":
+        if m["work_center_id"]:
+            db.execute("UPDATE work_centers SET mtc_host=NULL, mtc_enabled=0 WHERE id=?", (m["work_center_id"],))
+        db.execute("UPDATE machines SET work_center_id=NULL WHERE id=?", (machine_id,))
+        db.commit()
+        flash(f"Телеметрію «{m['model']}» відключено", "success")
+        return redirect(url_for("machines_list"))
+    wc_choice = f.get("work_center_id", "")
+    host = (f.get("mtc_host") or "").strip()
+    try:
+        port = int(f.get("mtc_port") or 8082)
+    except ValueError:
+        port = 0
+    if host and (not MTC_HOST_RE.match(host) or not 1 <= port <= 65535):
+        flash("Перевірте IP-адресу (без http://) і порт", "error")
+        return redirect(url_for("machines_list") + f"#machine-{machine_id}")
+    if wc_choice == "new" or (not wc_choice and not m["work_center_id"]):
+        db.execute("INSERT INTO work_centers (name, type, capacity_hours_per_day) VALUES (?,?,?)",
+                   (m["model"], m["category"], 16))
+        wc_id = db.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+    elif wc_choice:
+        wc_id = int(wc_choice)
+        if not db.execute("SELECT 1 FROM work_centers WHERE id=?", (wc_id,)).fetchone():
+            abort(400)
+    else:
+        wc_id = m["work_center_id"]
+    db.execute("UPDATE machines SET work_center_id=? WHERE id=?", (wc_id, machine_id))
+    if host:
+        db.execute("UPDATE work_centers SET mtc_host=?, mtc_port=?, mtc_enabled=1 WHERE id=?", (host, port, wc_id))
+    db.commit()
+    if not host:
+        flash(f"«{m['model']}» прив'язано до робочого центру. Дані з'являться, коли верстат передасть телеметрію.", "success")
+        return redirect(url_for("machines_list") + f"#machine-{machine_id}")
+    try:
+        data = fetch_mtconnect(host, port)
+        data["source"] = "mtconnect"
+        record_telemetry(db, wc_id, data)
+        flash(f"Зв'язок є: «{m['model']}» — {MACHINE_STATUS_LABELS.get(data['status'], data['status']).lower()}, "
+              f"програма {data.get('program_name') or '—'}. Далі дані оновлюються самі.", "success")
+    except Exception as e:
+        flash(f"Адресу збережено, але верстат не відповів: {e}. Перевірте кабель, IP і що на стійці ввімкнено MTConnect. "
+              "CRM пробуватиме знову автоматично.", "error")
+    return redirect(url_for("machines_list") + f"#machine-{machine_id}")
 
 
 @app.route("/machines/new", methods=["GET", "POST"])
