@@ -2388,9 +2388,9 @@ def test_calculator_ai_estimate_shows_correction_chat_and_applies_fix(client):
     assert "Заготовка: 2 кг" not in html2
 
 
-def test_calculator_ai_estimate_reused_correction_token_fails_gracefully(client):
-    """Токен правки, як і токен уточнення, одноразовий - повторне
-    використання має дати зрозумілу помилку, без звернення до API."""
+def test_calculator_ai_correction_token_reusable_and_fallback(client):
+    """Токен правки можна використати повторно (оновлення сторінки, «Назад»),
+    а якщо розмову втрачено - перерахунок з описом і правкою, а не помилка."""
     import re
     from unittest import mock
 
@@ -2444,15 +2444,42 @@ def test_calculator_ai_estimate_reused_correction_token_fails_gracefully(client)
         }, follow_redirects=True)
     assert "Заготовка: 1.5" in r2.get_data(as_text=True)
 
-    with mock.patch("requests.post", side_effect=AssertionError("не має звертатись до API з протухлим токеном правки")):
+    # повторне використання того самого токена працює
+    with mock.patch("requests.post", side_effect=fake_post_correction):
         token3 = get_csrf_token(client, "/calculator")
         r3 = client.post("/calculator/ai-estimate", data={
             "_csrf_token": token3, "ai_correction_token": correction_token,
             "ai_correction_message": "вага ще раз інша",
         }, follow_redirects=True)
+    assert r3.status_code == 200 and "Заготовка: 1.5" in r3.get_data(as_text=True)
+    assert "застаріла" not in r3.get_data(as_text=True)
 
-    assert r3.status_code == 200
-    assert "застаріло" in r3.get_data(as_text=True) or "заново" in r3.get_data(as_text=True)
+    # сесію збережено в базі (переживає перезапуск програми)
+    db = _raw_db(client)
+    assert db.execute("SELECT COUNT(*) c FROM ai_calc_sessions WHERE token=?", (correction_token,)).fetchone()["c"] == 1
+
+    # розмову втрачено, але є опис - перерахунок з описом і правкою
+    sent = []
+    def fake_fresh(url, headers=None, json=None, timeout=None):
+        sent.append(json)
+        return fake_post_correction(url, headers, json, timeout)
+    with mock.patch("requests.post", side_effect=fake_fresh):
+        token4 = get_csrf_token(client, "/calculator")
+        r4 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token4, "ai_correction_token": "deadbeef" * 4,
+            "ai_correction_message": "вага 1.5", "ai_description": "деталь",
+        }, follow_redirects=True)
+    t4 = r4.get_data(as_text=True)
+    assert "Заготовка: 1.5" in t4 and "перераховано заново" in t4
+    assert "вага 1.5" in str(sent[0]["messages"])
+
+    # без опису - зрозуміле повідомлення, без звернення до API
+    with mock.patch("requests.post", side_effect=AssertionError("не має звертатись до API")):
+        token5 = get_csrf_token(client, "/calculator")
+        r5 = client.post("/calculator/ai-estimate", data={
+            "_csrf_token": token5, "ai_correction_token": "deadbeef" * 4, "ai_correction_message": "x",
+        }, follow_redirects=True)
+    assert r5.status_code == 200 and "опиши деталь ще раз" in r5.get_data(as_text=True)
 
 
 def test_ai_correction_does_not_reapply_manually_known_fields():
@@ -4487,7 +4514,7 @@ def test_parts_catalog_crud_and_new_deal(client):
     d = db.execute("SELECT * FROM deals ORDER BY id DESC LIMIT 1").fetchone()
     assert d["title"] == "Вал Ø40" and d["amount"] == 1200 and d["client_id"] == cid and "Сталь 45" in d["tech_requirements"]
     post(client, "/parts/%d/delete" % pid)
-    assert db.execute("SELECT COUNT(*) c FROM parts").fetchone()["c"] == 0
+    assert db.execute("SELECT COUNT(*) c FROM parts WHERE id=?", (pid,)).fetchone()["c"] == 0
 
 
 def test_plan_fact_costs_math(client):
@@ -5051,3 +5078,375 @@ def test_terminal_groups_and_route_chain(client):
     t = client.get(f"/work-centers/{op['work_center_id']}/terminal").get_data(as_text=True)
     assert "Маршрут:" in t and ("Етап " in t or "На цій дільниці зараз немає" in t)
     assert "У роботі:" in t and "Чекають попередній етап" in t
+
+
+def test_boss_page_admin_only_and_content(client):
+    assert client.get("/boss").status_code == 302
+    login(client, "tokar", "tokar123")
+    assert client.get("/boss").status_code == 403
+    client.get("/logout")
+    login(client, "admin", "admin123")
+    r = client.get("/boss")
+    assert r.status_code == 200
+    t = r.get_data(as_text=True)
+    assert "Угоди в роботі" in t and "Верстати" in t and "Виробництво" in t and "manifest.webmanifest" in t
+
+
+def test_boss_machine_alarm_and_stale(client):
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    wc = db.execute("SELECT id, name FROM work_centers ORDER BY id LIMIT 1").fetchone()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("INSERT OR REPLACE INTO machine_telemetry (work_center_id,status,last_seen) VALUES (?,?,?)", (wc["id"], "alarm", now))
+    db.commit()
+    t = client.get("/boss").get_data(as_text=True)
+    assert "Аварія: " + wc["name"] in t
+    db.execute("UPDATE machine_telemetry SET last_seen='2020-01-01 00:00:00' WHERE work_center_id=?", (wc["id"],))
+    db.commit()
+    t = client.get("/boss").get_data(as_text=True)
+    assert "Аварія: " + wc["name"] not in t and 'dot offline' in t
+
+
+def test_pwa_manifest_and_icons_public(client):
+    m = client.get("/manifest.webmanifest")
+    assert m.status_code == 200 and m.get_json()["start_url"] == "/boss"
+    for size in (192, 512):
+        r = client.get(f"/icon-{size}.png")
+        assert r.status_code == 200 and r.data[:4] == b"\x89PNG"
+    assert client.get("/icon-100.png").status_code == 404
+
+
+def test_login_next_is_safe(client):
+    tok = get_csrf_token(client, "/login")
+    r = client.post("/login?next=//evil.com", data={"username": "admin", "password": "admin123", "_csrf_token": tok})
+    assert r.status_code == 302 and "evil.com" not in r.headers["Location"]
+    client.get("/logout")
+    tok = get_csrf_token(client, "/login")
+    r = client.post("/login?next=/clients", data={"username": "admin", "password": "admin123", "_csrf_token": tok})
+    assert r.headers["Location"].endswith("/clients")
+
+
+def test_remember_me_cookie_lifetime(client):
+    tok = get_csrf_token(client, "/login")
+    r = client.post("/login", data={"username": "admin", "password": "admin123", "_csrf_token": tok, "remember": "1"})
+    assert "Max-Age=2592000" in r.headers.get("Set-Cookie", "") or "Expires=" in r.headers.get("Set-Cookie", "")
+    ck = [c for c in r.headers.getlist("Set-Cookie") if c.startswith("session=")][0]
+    if "Max-Age" in ck:
+        assert "Max-Age=2592000" in ck
+    client.get("/logout")
+    tok = get_csrf_token(client, "/login")
+    r = client.post("/login", data={"username": "admin", "password": "admin123", "_csrf_token": tok})
+    ck = [c for c in r.headers.getlist("Set-Cookie") if c.startswith("session=")][0]
+    assert "2592000" not in ck
+
+
+def test_cloudflare_blocked_with_default_passwords(client, monkeypatch):
+    import tunnel
+    calls = []
+    monkeypatch.setattr(tunnel, "apply_settings", lambda s, d: calls.append(s) or {"state": "off", "message": ""})
+    login(client, "admin", "admin123")
+    post(client, "/settings/save", {"form": "cloudflare", "cf_tunnel_token": "tok123", "cf_public_url": "https://crm.example.com", "cf_enabled": "1"})
+    db = _raw_db(client)
+    assert client._app_module.get_setting(db, "cf_enabled") == "0"
+    assert client._app_module.get_setting(db, "cf_tunnel_token") == "tok123"
+    # http:// відхиляється
+    post(client, "/settings/save", {"form": "cloudflare", "cf_tunnel_token": "t", "cf_public_url": "http://x.com"})
+    assert client._app_module.get_setting(_raw_db(client), "cf_public_url") == "https://crm.example.com"
+
+
+def test_cloudflare_enable_after_passwords_changed(client, monkeypatch):
+    import tunnel
+    calls = []
+    monkeypatch.setattr(tunnel, "apply_settings", lambda s, d: calls.append(dict(s)) or {"state": "starting", "message": ""})
+    login(client, "admin", "admin123")
+    m = client._app_module
+    db = _raw_db(client)
+    for u in db.execute("SELECT id FROM users").fetchall():
+        db.execute("UPDATE users SET password_hash=? WHERE id=?", (m.generate_password_hash("Very-Strong-1!"), u["id"]))
+    db.commit()
+    post(client, "/settings/save", {"form": "cloudflare", "cf_tunnel_token": "tok123", "cf_public_url": "https://crm.example.com/", "cf_enabled": "1"})
+    db = _raw_db(client)
+    assert m.get_setting(db, "cf_enabled") == "1" and m.get_setting(db, "cf_public_url") == "https://crm.example.com"
+    assert calls and calls[-1]["cf_enabled"] == "1"
+    page = client.get("/settings").get_data(as_text=True)
+    assert "https://crm.example.com/boss" in page
+
+
+def test_tunnel_manager_runs_and_restarts(tmp_path):
+    import tunnel, sys, stat, time
+    script = tmp_path / "fakecf.py"
+    out = tmp_path / "token.txt"
+    script.write_text("import os,sys,time\nopen(%r,'a').write(os.environ.get('TUNNEL_TOKEN','')+' '+' '.join(sys.argv[1:])+'\\n')\ntime.sleep(0.3)\n" % str(out))
+    wrapper = tmp_path / "fakecf"
+    wrapper.write_text("#!/bin/sh\nexec %s %s \"$@\"\n" % (sys.executable, script))
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+    mgr = tunnel.TunnelManager()
+    mgr.start("SECRET", str(tmp_path), binary=str(wrapper), backoff=(0.1,))
+    time.sleep(1.5)
+    lines = out.read_text().strip().splitlines()
+    assert len(lines) >= 2  # перезапуск після завершення
+    assert lines[0].startswith("SECRET tunnel --no-autoupdate run")
+    assert mgr.status()["state"] in ("running", "starting")
+    mgr.stop()
+    assert mgr.status()["state"] == "off"
+
+
+def test_ensure_cloudflared_download_validation(tmp_path):
+    import tunnel
+    with pytest.raises(RuntimeError):
+        tunnel.ensure_cloudflared(str(tmp_path), opener=lambda u: b"tiny")
+    assert not any(p.name.endswith(".part") for p in tmp_path.iterdir())
+    p = tunnel.ensure_cloudflared(str(tmp_path), opener=lambda u: b"x" * (6 * 1024 * 1024))
+    assert os.path.getsize(p) >= 6 * 1024 * 1024
+    assert tunnel.ensure_cloudflared(str(tmp_path), opener=lambda u: 1 / 0) == p  # вже є — не качає
+
+
+
+def test_telemetry_notifies_only_on_state_change(client, monkeypatch):
+    m = client._app_module
+    sent = []
+    monkeypatch.setattr(m, "notify_all", lambda text: sent.append(text))
+    with m.app.app_context():
+        db = m.get_db()
+        wc = db.execute("SELECT id, name FROM work_centers ORDER BY id LIMIT 1").fetchone()
+        m.record_telemetry(db, wc["id"], {"status": "running"})
+        sent.clear()
+        for _ in range(5):
+            m.record_telemetry(db, wc["id"], {"status": "alarm", "program_name": "O1234"})
+        assert len(sent) == 1 and wc["name"] in sent[0] and "O1234" in sent[0]
+        m.record_telemetry(db, wc["id"], {"status": "running"})
+        m.record_telemetry(db, wc["id"], {"status": "offline"})
+        m.record_telemetry(db, wc["id"], {"status": "offline"})
+        assert len(sent) == 2 and "не відповідає" in sent[1]
+
+
+def test_sidebar_has_machines_online_and_demo_parts(client):
+    login(client, "admin", "admin123")
+    t = client.get("/").get_data(as_text=True)
+    assert "Верстати онлайн" in t and "/work-centers" in t
+    r = client.get("/work-centers").get_data(as_text=True)
+    assert "Верстати онлайн" in r
+    p = client.get("/parts").get_data(as_text=True)
+    assert "Вал приводний" in p
+    client.get("/logout")
+    login(client, "sklad", "sklad123")
+    assert "Верстати онлайн" not in client.get("/").get_data(as_text=True)
+
+
+def test_mtconnect_runtime_hours_computed(client, monkeypatch):
+    m = client._app_module
+    monkeypatch.setattr(m, "notify_all", lambda text: None)
+    with m.app.app_context():
+        db = m.get_db()
+        wc = db.execute("SELECT id FROM work_centers ORDER BY id LIMIT 1").fetchone()["id"]
+        assert db.execute("SELECT COUNT(*) c FROM machine_telemetry_log WHERE work_center_id=?", (wc,)).fetchone()["c"] > 0
+        m.record_telemetry(db, wc, {"status": "running", "source": "mtconnect"})
+        # демо-історію прибрано, лічильник з нуля
+        rows = db.execute("SELECT motion_hours FROM machine_telemetry_log WHERE work_center_id=?", (wc,)).fetchall()
+        assert len(rows) == 1 and rows[0]["motion_hours"] == 0
+        # імітуємо, що попереднє опитування було 2 хв тому
+        two_min = (datetime.datetime.now() - datetime.timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
+        db.execute("UPDATE machine_telemetry SET last_seen=? WHERE work_center_id=?", (two_min, wc)); db.commit()
+        m.record_telemetry(db, wc, {"status": "idle", "source": "mtconnect"})
+        t = db.execute("SELECT motion_hours, power_on_hours FROM machine_telemetry WHERE work_center_id=?", (wc,)).fetchone()
+        assert abs(t["motion_hours"] - 2 / 60) < 0.002 and abs(t["power_on_hours"] - 2 / 60) < 0.002
+        # простій 2 хв: годин руху не додає, увімкненого стану додає
+        db.execute("UPDATE machine_telemetry SET last_seen=? WHERE work_center_id=?", (two_min, wc)); db.commit()
+        m.record_telemetry(db, wc, {"status": "idle", "source": "mtconnect"})
+        t2 = db.execute("SELECT motion_hours, power_on_hours FROM machine_telemetry WHERE work_center_id=?", (wc,)).fetchone()
+        assert t2["motion_hours"] == t["motion_hours"] and t2["power_on_hours"] > t["power_on_hours"]
+        # великий розрив (CRM була вимкнена) не рахується
+        db.execute("UPDATE machine_telemetry SET status='running', last_seen='2026-01-01 00:00:00' WHERE work_center_id=?", (wc,)); db.commit()
+        m.record_telemetry(db, wc, {"status": "running", "source": "mtconnect"})
+        t3 = db.execute("SELECT motion_hours FROM machine_telemetry WHERE work_center_id=?", (wc,)).fetchone()
+        assert t3["motion_hours"] == t2["motion_hours"]
+        assert m.get_machine_runtime_stats(db, wc, 16) is not None
+
+
+# ----------------------------------------------------------------------------- потік замовлення
+def _new_order(client, number="200-1", items=None):
+    db = _raw_db(client)
+    cid = db.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
+    data = {"number": number, "doc_date": "2026-10-12", "client_id": cid}
+    for i, it in enumerate(items or [{"name": "Упор", "drawing": "кр.1", "qty": "200", "batch": "1"},
+                                     {"name": "Кронштейн", "drawing": "кр.2", "qty": "400", "due": "2026-11-01"}]):
+        for k, v in it.items():
+            data[f"items-{i}-{k}"] = v
+    r = post(client, "/orders/new", data)
+    oid = _raw_db(client).execute("SELECT id FROM orders WHERE number=?", (number,)).fetchone()
+    return r, (oid["id"] if oid else None)
+
+
+def test_orders_full_flow(client, monkeypatch):
+    m = client._app_module
+    sent, tg = [], []
+    monkeypatch.setattr(m, "notify_all", lambda t: sent.append(t))
+    monkeypatch.setattr(m, "send_telegram_to", lambda chat, t: tg.append((chat, t)) or (True, "OK"))
+    login(client, "oleh", "manager123")  # маркетинг
+    r, oid = _new_order(client)
+    assert r.status_code == 302 and oid
+    db = _raw_db(client)
+    items = db.execute("SELECT * FROM order_items WHERE order_id=? ORDER BY line_no", (oid,)).fetchall()
+    assert [i["code"] for i in items] == ["200-1-1", "200-1-2"] and items[0]["batch_delivery"] == 1
+    assert any("Нове замовлення 200-1" in s for s in sent)
+    page = client.get(f"/orders/{oid}").get_data(as_text=True)
+    assert "Чекає: заготовка, техпроцес" in page and "партійно" in page
+    client.get("/logout")
+
+    # склад: заготовки немає -> заявка постачальнику
+    login(client, "sklad", "sklad123")
+    post(client, "/settings/orders", {"purchaser_chat_id": "777"})  # склад не може змінювати налаштування
+    assert m.get_setting(_raw_db(client), "purchaser_chat_id", "") == ""
+    db = _raw_db(client)
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('purchaser_chat_id', '777')"); db.commit()
+    r = post(client, f"/orders/items/{items[0]['id']}/blank", {"action": "to_buy", "blank_note": ""})
+    assert _raw_db(client).execute("SELECT blank_status FROM order_items WHERE id=?", (items[0]["id"],)).fetchone()[0] == "unchecked"
+    post(client, f"/orders/items/{items[0]['id']}/blank", {"action": "to_buy", "blank_note": "Коло Ст45 Ø40, 120 кг"})
+    post(client, f"/orders/items/{items[1]['id']}/blank", {"action": "in_stock", "blank_note": "Лист 8 мм"})
+    assert tg and tg[0][0] == "777" and "Коло Ст45" in tg[0][1] and "200-1-1" in tg[0][1]
+    client.get("/logout")
+
+    # постачальник: ТТН, статус НП, отримано
+    login(client, "postach", "postach123")
+    page = client.get("/procurement").get_data(as_text=True)
+    assert "Коло Ст45" in page and "200-1-1" in page
+    monkeypatch.setattr(m, "np_track", lambda key, ttns: {t: (7, "Прибув у відділення") for t in ttns})
+    db = _raw_db(client)
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('np_api_key', 'k')"); db.commit()
+    post(client, f"/orders/items/{items[0]['id']}/purchase", {"action": "ttn", "ttn": "123"})
+    assert _raw_db(client).execute("SELECT ttn FROM order_items WHERE id=?", (items[0]["id"],)).fetchone()[0] is None
+    post(client, f"/orders/items/{items[0]['id']}/purchase", {"action": "ttn", "ttn": "20450000000001"})
+    row = _raw_db(client).execute("SELECT * FROM order_items WHERE id=?", (items[0]["id"],)).fetchone()
+    assert row["blank_status"] == "shipped" and row["np_status"] == "Прибув у відділення"
+    assert any("прибула у відділення" in s for s in sent)
+    monkeypatch.setattr(m, "np_track", lambda key, ttns: {t: (9, "Відправлення отримано") for t in ttns})
+    post(client, f"/orders/items/{items[0]['id']}/purchase", {"action": "refresh"})
+    assert _raw_db(client).execute("SELECT blank_status FROM order_items WHERE id=?", (items[0]["id"],)).fetchone()[0] == "received"
+    assert client.get(f"/orders/items/{items[0]['id']}/routing").status_code in (302, 405)
+    client.get("/logout")
+
+    # технолог: створює техпроцес для позиції, прив'язує
+    login(client, "tehnolog", "tehnolog123")
+    db = _raw_db(client)
+    wc = db.execute("SELECT id FROM work_centers ORDER BY id LIMIT 1").fetchone()["id"]
+    r = post(client, f"/routings/new?for_item={items[0]['id']}", {
+        "for_item": items[0]["id"], "name": "Упор", "drawing_no": "кр.1", "material": "Сталь 45",
+        "steps-0-op": "Токарна", "steps-0-wc": wc, "steps-0-min": "6",
+        "steps-1-op": "Контроль", "steps-1-wc": "", "steps-1-min": "0.5"})
+    assert r.status_code == 302
+    it0 = _raw_db(client).execute("SELECT routing_id FROM order_items WHERE id=?", (items[0]["id"],)).fetchone()
+    assert it0["routing_id"]
+    post(client, f"/orders/items/{items[1]['id']}/routing", {"routing_id": it0["routing_id"]})
+    page = client.get(f"/orders/{oid}").get_data(as_text=True)
+    assert page.count("Готово до запуску") == 2
+    # запуск
+    r = post(client, f"/orders/items/{items[0]['id']}/launch", {})
+    db = _raw_db(client)
+    po_id = db.execute("SELECT production_order_id FROM order_items WHERE id=?", (items[0]["id"],)).fetchone()[0]
+    assert po_id
+    po = db.execute("SELECT * FROM production_orders WHERE id=?", (po_id,)).fetchone()
+    assert po["quantity"] == 200 and po["title"].startswith("200-1-1") and po["client_id"]
+    ops = db.execute("SELECT * FROM production_operations WHERE production_order_id=? ORDER BY step_order", (po_id,)).fetchall()
+    assert [o["operation_name"] for o in ops] == ["Токарна", "Контроль"] and ops[0]["planned_start"]
+    assert abs(ops[0]["planned_hours"] - 0.1) < 1e-6
+    # повторний запуск не дублює
+    post(client, f"/orders/items/{items[0]['id']}/launch", {})
+    assert _raw_db(client).execute("SELECT COUNT(*) FROM production_orders WHERE order_item_id=?", (items[0]["id"],)).fetchone()[0] == 1
+    page = client.get(f"/orders/{oid}").get_data(as_text=True)
+    assert "У виробництві 0/2" in page
+    # виробниче замовлення показує назву позиції й клієнта
+    assert "200-1-1 Упор" in client.get(f"/production/{po_id}").get_data(as_text=True)
+    client.get("/logout")
+    login(client, "admin", "admin123")
+    assert "200-1-1 Упор" in client.get("/production").get_data(as_text=True)
+    t = client.get(f"/work-centers/{wc}/terminal").get_data(as_text=True)
+    assert "200-1-1 Упор" in t
+    assert client.get(f"/orders/{oid}/note.pdf").data[:4] == b"%PDF"
+    assert client.get("/procurement/request.pdf").data[:4] == b"%PDF"
+
+
+def test_orders_validation_and_permissions(client):
+    login(client, "oleh", "manager123")
+    r, oid = _new_order(client, "300-1", [{"name": "Вал", "qty": "0"}])
+    assert oid is None and "кількість" in r.get_data(as_text=True)
+    assert 'value="Вал"' in r.get_data(as_text=True)  # введене не губиться
+    r, oid = _new_order(client, "", [{"name": "Вал", "qty": "1"}])
+    assert oid is None
+    r, oid = _new_order(client, "300-2", [{"name": "Вал", "qty": "1", "due": "не дата"}])
+    assert oid is None
+    r, oid = _new_order(client, "300-3", [{"name": "Вал", "qty": "3", "code": "СВІЙ-1"}])
+    assert oid and _raw_db(client).execute("SELECT code FROM order_items WHERE order_id=?", (oid,)).fetchone()[0] == "СВІЙ-1"
+    client.get("/logout")
+    login(client, "tokar", "tokar123")
+    assert client.get("/orders/new").status_code == 302
+    item = _raw_db(client).execute("SELECT id FROM order_items WHERE order_id=?", (oid,)).fetchone()["id"]
+    post(client, f"/orders/items/{item}/blank", {"action": "in_stock"})
+    assert _raw_db(client).execute("SELECT blank_status FROM order_items WHERE id=?", (item,)).fetchone()[0] == "unchecked"
+    client.get("/logout")
+    login(client, "sklad", "sklad123")
+    assert client.get("/routings/new").status_code == 302
+    post(client, f"/orders/items/{item}/launch", {})
+    assert _raw_db(client).execute("SELECT production_order_id FROM order_items WHERE id=?", (item,)).fetchone()[0] is None
+
+
+def test_orders_launch_requires_blank_and_routing(client):
+    login(client, "admin", "admin123")
+    r, oid = _new_order(client, "400-1", [{"name": "Вал", "qty": "5"}])
+    item = _raw_db(client).execute("SELECT id FROM order_items WHERE order_id=?", (oid,)).fetchone()["id"]
+    r = post(client, f"/orders/items/{item}/launch", {}, follow_redirects=True)
+    assert "техпроцес" in r.get_data(as_text=True)
+    rid = _raw_db(client).execute("SELECT id FROM routing_templates WHERE name='Упор пружини'").fetchone()["id"]
+    post(client, f"/orders/items/{item}/routing", {"routing_id": rid})
+    r = post(client, f"/orders/items/{item}/launch", {}, follow_redirects=True)
+    assert "Заготовки ще немає" in r.get_data(as_text=True)
+    assert _raw_db(client).execute("SELECT production_order_id FROM order_items WHERE id=?", (item,)).fetchone()[0] is None
+
+
+def test_orders_auto_routing_by_drawing_and_edit(client):
+    login(client, "admin", "admin123")
+    r, oid = _new_order(client, "500-1", [{"name": "Упор", "drawing": " КР.322100.022 ", "qty": "10"}])
+    db = _raw_db(client)
+    it = db.execute("SELECT * FROM order_items WHERE order_id=?", (oid,)).fetchone()
+    assert it["routing_id"] == db.execute("SELECT id FROM routing_templates WHERE drawing_no='кр.322100.022'").fetchone()["id"]
+    # редагування: додати позицію, змінити кількість
+    cid = db.execute("SELECT client_id FROM orders WHERE id=?", (oid,)).fetchone()[0]
+    post(client, f"/orders/{oid}/edit", {"number": "500-1", "client_id": cid, "items-0-id": it["id"], "items-0-name": "Упор",
+                                         "items-0-qty": "12", "items-1-name": "Шайба", "items-1-qty": "50"})
+    rows = _raw_db(client).execute("SELECT * FROM order_items WHERE order_id=? ORDER BY line_no", (oid,)).fetchall()
+    assert len(rows) == 2 and rows[0]["quantity"] == 12 and rows[0]["id"] == it["id"] and rows[1]["code"] == "500-1-2"
+
+
+def test_deal_form_uses_routing_library(client):
+    login(client, "admin", "admin123")
+    t = client.get("/deals/new").get_data(as_text=True)
+    assert "Техпроцес (бібліотека технолога)" in t and "Упор пружини" in t
+    db = _raw_db(client)
+    rid = db.execute("SELECT id FROM routing_templates WHERE name='Упор пружини'").fetchone()["id"]
+    cid = db.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
+    post(client, "/deals/new", {"title": "Тест техпроцес", "client_id": cid, "routing_template_id": rid,
+                                "stage": "lead", "currency": "UAH", "amount": "100"})
+    d = _raw_db(client).execute("SELECT * FROM deals WHERE title='Тест техпроцес'").fetchone()
+    assert d["routing_template_id"] == rid
+    m = client._app_module
+    with m.app.app_context():
+        mdb = m.get_db()
+        po = m.create_production_order_from_deal(mdb, mdb.execute("SELECT * FROM deals WHERE id=?", (d["id"],)).fetchone())
+        mdb.commit()
+    ops = _raw_db(client).execute("SELECT operation_name FROM production_operations WHERE production_order_id=?", (po,)).fetchall()
+    assert len(ops) == 4
+
+
+def test_np_track_parses_response(client, monkeypatch):
+    m = client._app_module
+    import urllib.request, io, json as _j
+
+    class R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: R(_j.dumps(
+        {"success": True, "data": [{"Number": "20450000000001", "StatusCode": "9", "Status": "Відправлення отримано"}]}).encode()))
+    assert m.np_track("k", ["20450000000001"]) == {"20450000000001": (9, "Відправлення отримано")}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: R(_j.dumps(
+        {"success": False, "errors": ["API key expired"]}).encode()))
+    with pytest.raises(RuntimeError):
+        m.np_track("k", ["1"])

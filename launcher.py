@@ -179,6 +179,13 @@ def _start_server_inner():
         crm_app.start_machine_poller()  # опитування верстатів по MTConnect (якщо задані в CRM)
     except Exception:
         log.exception("Не вдалось запустити опитування верстатів")
+    try:
+        # Доступ ззовні (Cloudflare Tunnel), якщо адмін увімкнув у Налаштуваннях
+        import tunnel
+        with crm_app.app.app_context():
+            tunnel.apply_settings(crm_app.get_all_settings(crm_app.get_db()), crm_app.DATA_DIR)
+    except Exception:
+        log.exception("Не вдалось запустити тунель Cloudflare")
     serve(crm_app.app, host=BIND_HOST, port=PORT, _quiet=True)
 
 

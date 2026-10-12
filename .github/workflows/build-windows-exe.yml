@@ -65,6 +65,9 @@ jobs:
           --hidden-import=openpyxl.cell._writer
           --hidden-import=waitress
           --hidden-import=features_ext
+          --hidden-import=tunnel
+          --hidden-import=orders_ext
+          --hidden-import=orders_templates
           --hidden-import=features_templates
           --hidden-import=tkinter
           --hidden-import=tkinter.messagebox

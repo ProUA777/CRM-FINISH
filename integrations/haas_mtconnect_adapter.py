@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Адаптер Haas MTConnect -> STANOK CRM.
+Адаптер Haas MTConnect -> Оснастка-Маркет.
 
 Альтернатива haas_q_adapter.py: використовує вбудований MTConnect-агент
 контролера Haas NGC (галузевий відкритий стандарт обміну даними верстатів)
@@ -114,10 +114,10 @@ def send_to_crm(crm_url, api_key, work_center_id, payload, timeout=5):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Адаптер Haas MTConnect -> STANOK CRM")
+    ap = argparse.ArgumentParser(description="Адаптер Haas MTConnect -> Оснастка-Маркет")
     ap.add_argument("--haas-ip", required=True, help="IP-адреса контролера Haas у цеховій мережі")
     ap.add_argument("--mtconnect-port", type=int, default=8082, help="Порт MTConnect-агента (типово 8082)")
-    ap.add_argument("--work-center-id", type=int, required=True, help="ID робочого центру в STANOK CRM")
+    ap.add_argument("--work-center-id", type=int, required=True, help="ID робочого центру в Оснастка-Маркет")
     ap.add_argument("--crm-url", required=True, help="Базова адреса CRM, напр. http://192.168.1.10:5000")
     ap.add_argument("--api-key", required=True, help="API-ключ зі сторінки Налаштування в CRM")
     ap.add_argument("--interval", type=int, default=15, help="Інтервал опитування, секунд")

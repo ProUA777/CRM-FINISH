@@ -19,6 +19,8 @@
 AppId={{8F2B1E4A-6C3D-4A9E-9B1F-OSNASTKAMKT01}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppPublisher=Greater Koreec Project Group
+AppCopyright=© 2026 by Greater Koreec Project Group
 DefaultDirName={autopf}\OsnastkaMarket
 DefaultGroupName=Оснастка-Маркет
 DisableProgramGroupPage=yes

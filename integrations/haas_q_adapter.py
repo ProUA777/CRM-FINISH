@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Адаптер Haas Ethernet Q Commands -> STANOK CRM.
+Адаптер Haas Ethernet Q Commands -> Оснастка-Маркет.
 
 Що робить: підключається по TCP до контролера Haas (NGC та новіші SGC з
 увімкненим Machine Data Collect), періодично опитує стан верстата і
-пересилає дані в STANOK CRM через /api/v1/telemetry/<work_center_id>.
+пересилає дані в Оснастка-Маркет через /api/v1/telemetry/<work_center_id>.
 
 ПЕРЕДУМОВИ НА ВЕРСТАТІ (робиться один раз на пульті керування):
   1. Верстат підключений до тієї ж мережі, що й ПК, на якому запускається
@@ -186,10 +186,10 @@ def send_to_crm(crm_url, api_key, work_center_id, payload, timeout=5):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Адаптер Haas Ethernet Q Commands -> STANOK CRM")
+    ap = argparse.ArgumentParser(description="Адаптер Haas Ethernet Q Commands -> Оснастка-Маркет")
     ap.add_argument("--haas-ip", required=True, help="IP-адреса контролера Haas у цеховій мережі")
     ap.add_argument("--haas-port", type=int, default=5051, help="Порт Machine Data Collect (Setting 143), типово 5051")
-    ap.add_argument("--work-center-id", type=int, required=True, help="ID робочого центру в STANOK CRM")
+    ap.add_argument("--work-center-id", type=int, required=True, help="ID робочого центру в Оснастка-Маркет")
     ap.add_argument("--crm-url", required=True, help="Базова адреса CRM, напр. http://192.168.1.10:5000")
     ap.add_argument("--api-key", required=True, help="API-ключ зі сторінки Налаштування в CRM")
     ap.add_argument("--interval", type=int, default=30, help="Інтервал опитування, секунд (типово 30)")

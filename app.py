@@ -14,6 +14,7 @@ CRM для металообробного підприємства (токарн
 
 import os
 import sqlite3
+import json
 import functools
 import datetime
 import time
@@ -33,7 +34,7 @@ except Exception:
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import (
     Flask, request, session, redirect, url_for, g, render_template,
-    flash, jsonify, abort
+    flash, jsonify, abort, Response
 )
 from jinja2 import DictLoader
 
@@ -136,6 +137,20 @@ PDF_FONT, PDF_FONT_BOLD = _register_pdf_fonts()
 app = Flask(__name__)
 app.secret_key = _get_or_create_secret_key()
 MAX_UPLOAD_SIZE_MB = 25
+
+from flask.sessions import SecureCookieSessionInterface
+
+
+class _RememberSessionInterface(SecureCookieSessionInterface):
+    """Звичайна сесія живе 12 год; якщо на вході позначено «Запам'ятати» -
+    30 днів (щоб шефу не вводити пароль щодня на своєму телефоні)."""
+    def get_expiration_time(self, app, session):
+        if session.permanent and session.get("remember"):
+            return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        return super().get_expiration_time(app, session)
+
+
+app.session_interface = _RememberSessionInterface()
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -259,7 +274,9 @@ PAYMENT_STATUSES = [("pending", "Очікується"), ("paid", "Оплаче�
 
 ROLES = [
     ("admin", "Адміністратор"),
-    ("sales", "Менеджер"),
+    ("sales", "Маркетинг / продажі"),
+    ("technologist", "Технолог"),
+    ("purchaser", "Постачальник (закупівля)"),
     ("production", "Виробництво (майстер / верстатник)"),
     ("warehouse", "Склад"),
     ("service", "Сервіс"),
@@ -727,6 +744,12 @@ CREATE TABLE IF NOT EXISTS service_tickets (
 -- Історія всіх розрахунків вартості (ручних і через ШІ) - кожен завершений
 -- розрахунок у калькуляторі зберігається сюди автоматично, щоб потім можна
 -- було переглянути, хто і коли рахував яку деталь та за якою ціною.
+CREATE TABLE IF NOT EXISTS ai_calc_sessions (
+    token TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    created REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cost_calculations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -831,7 +854,10 @@ def migrate_schema(db):
     (SQLite повертав би 'no such column'). Виконується при кожному запуску,
     без втрати наявних даних."""
     expected_columns = {
-        "deals": [("closed_at", "TEXT")],
+        "deals": [("closed_at", "TEXT"), ("routing_template_id", "INTEGER")],
+        "production_orders": [("title", "TEXT"), ("client_id", "INTEGER"), ("order_item_id", "INTEGER")],
+        "routing_templates": [("drawing_no", "TEXT"), ("material", "TEXT"), ("blank", "TEXT"),
+                              ("notes", "TEXT"), ("created_at", "TEXT"), ("updated_at", "TEXT")],
         "machine_telemetry": [
             ("power_on_hours", "REAL"), ("motion_hours", "REAL"), ("part_count", "INTEGER"),
             ("program_name", "TEXT"), ("mode", "TEXT"), ("source", "TEXT DEFAULT 'generic'"),
@@ -1139,6 +1165,22 @@ def seed_data(db):
         cur.execute(
             "INSERT INTO warehouse_transactions (item_id, qty_delta, type, reference, user_id, created_at) VALUES (?,?,?,?,?,?)",
             (i, items[i - 1][4], "in", "Початкове завантаження залишків", admin_id, now_iso()),
+        )
+
+    # Демо-каталог деталей: щоб розділ «Каталог деталей» не був порожнім
+    # на показі (повторне замовлення в один клік з готовим техпроцесом).
+    demo_clients = [r[0] for r in cur.execute("SELECT id FROM clients ORDER BY id LIMIT 4").fetchall()] or [None]
+    demo_parts = [
+        ("Вал приводний", "ОМ-101.02", "Сталь 45, коло Ø60", "005 Відрізна: пила\n010 Токарна ЧПУ: чорнова+чистова\n020 Фрезерна: шпонковий паз\n030 Контроль", 1850),
+        ("Фланець кріпильний", "ОМ-214.01", "Сталь 20, лист 30 мм", "005 Відрізна: плазма\n010 Токарна ЧПУ\n020 Свердлильна: 6 отв. Ø13\n030 Контроль", 960),
+        ("Корпус підшипника", "ОМ-330.05", "Алюміній Д16Т, плита 80 мм", "010 Фрезерна ЧПУ: 3 установи\n020 Розточна: посадка Ø72 H7\n030 Контроль КВМ", 4200),
+        ("Втулка напрямна", "ОМ-118.03", "Бронза БрАЖ9-4, пруток Ø45", "005 Відрізна\n010 Токарна ЧПУ\n020 Шліфувальна: Ø30 h6\n030 Контроль", 720),
+        ("Кронштейн гідроциліндра", "ОМ-402.00", "Сталь 09Г2С, лист 20 мм", "005 Різка лазер\n010 Фрезерна ЧПУ\n020 Зварювальна\n030 Контроль", 2650),
+    ]
+    for n, (name, dwg, mat, route, price) in enumerate(demo_parts):
+        cur.execute(
+            "INSERT INTO parts (name, drawing_no, client_id, material, routing_text, last_price, currency, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, dwg, demo_clients[n % len(demo_clients)], mat, route, price, "UAH", now_iso()),
         )
 
     # Прив'язка норм витрат матеріалів (BOM) до окремих операцій техпроцесу —
@@ -1770,6 +1812,21 @@ def send_telegram_notification(text):
             return True, "OK"
         return False, result.get("description", "Telegram повернув помилку")
     except Exception as e:
+        # HTTPError ховає причину в тілі відповіді ("chat not found" тощо) -
+        # без неї «400 Bad Request» нічого не пояснює.
+        body = getattr(e, "read", None)
+        if body:
+            try:
+                desc = _json.loads(body().decode("utf-8")).get("description", "")
+            except Exception:
+                desc = ""
+            low = desc.lower()
+            if "chat not found" in low:
+                return False, "Telegram: чат не знайдено. Перевір chat_id і напиши боту будь-що (/start), щоб він міг писати тобі"
+            if "unauthorized" in low or "not found" in low and "chat" not in low:
+                return False, "Telegram: неправильний токен бота"
+            if desc:
+                return False, f"Telegram: {desc}"
         return False, str(e)
 
 
@@ -1929,45 +1986,47 @@ def detect_image_media_type(raw_bytes):
     return None
 
 
-_AI_CALC_PENDING = {}
-_AI_CALC_PENDING_TTL_SECONDS = 30 * 60  # 30 хвилин - достатньо, щоб встигнути відповісти на питання
+_AI_CALC_PENDING_TTL_SECONDS = 24 * 3600  # доба: розрахунок не «губиться» за обідом чи після перезапуску
 
 
 def _ai_calc_pending_store(messages, description, known_fields=None):
-    """Зберігає стан розмови з ШІ (messages, включно з попереднім
-    tool_use ask_clarifying_question) сервер-side під одноразовим
-    токеном, поки користувач відповідає на уточнююче питання - HTTP
-    без стану, тож між двома POST-запитами розмову треба десь тримати,
-    а передавати назад у прихованому полі форми (з base64-зображеннями
-    всередині) було б і негарно, і могло б перевищити розумний розмір
-    форми. Заразом прибирає протухлі записи старші за TTL.
-
-    known_fields: поля, які користувач уже заповнив вручну в об'єднаній
-    формі калькулятора (ПЕРЕД першим зверненням до ШІ) - треба донести їх
-    і до другого кроку (після відповіді на уточнення), щоб фінальний
-    результат так само поважав уже введені значення."""
+    """Зберігає стан розмови з ШІ (messages) під токеном, поки користувач
+    відповідає на уточнення чи пише правку. Раніше стан жив лише в пам'яті
+    30 хв і зникав після перезапуску програми (оновлення exe, сон ноутбука) -
+    тоді вилітало «Сесія правок застаріла». Тепер - у базі, на добу."""
     import uuid as _uuid
     now = time.time()
-    for key in [k for k, v in _AI_CALC_PENDING.items() if now - v["created"] > _AI_CALC_PENDING_TTL_SECONDS]:
-        _AI_CALC_PENDING.pop(key, None)
+    db = get_db()
+    db.execute("DELETE FROM ai_calc_sessions WHERE created < ?", (now - _AI_CALC_PENDING_TTL_SECONDS,))
     token = _uuid.uuid4().hex
-    _AI_CALC_PENDING[token] = {
-        "messages": messages, "description": description,
-        "known_fields": known_fields or {}, "created": now,
-    }
+    data = {"messages": messages, "description": description, "known_fields": known_fields or {}}
+    db.execute("INSERT INTO ai_calc_sessions (token, data, created) VALUES (?,?,?)",
+               (token, json.dumps(data, ensure_ascii=False), now))
+    db.commit()
     return token
 
 
-def _ai_calc_pending_pop(token):
-    """Дістає й одразу видаляє збережений стан розмови за токеном -
-    одноразовий, щоб ту саму відповідь не можна було випадково
-    надіслати двічі й отримати два різні продовження однієї розмови.
-    Повертає None, якщо токен невідомий або протух (TTL вичерпано)."""
-    entry = _AI_CALC_PENDING.pop(token, None)
-    if entry is None:
+def _ai_calc_pending_pop(token, consume=True):
+    """Дістає збережений стан розмови. consume=True (відповідь на уточнення) -
+    одноразово; для правок (consume=False) токен можна використати повторно:
+    оновлення сторінки чи кнопка «Назад» більше не ламають розрахунок.
+    Повертає None, якщо токен невідомий або старший за добу."""
+    if not token or len(token) > 64:
         return None
-    if time.time() - entry["created"] > _AI_CALC_PENDING_TTL_SECONDS:
+    db = get_db()
+    row = db.execute("SELECT data, created FROM ai_calc_sessions WHERE token=?", (token,)).fetchone()
+    if row is None:
         return None
+    if consume:
+        db.execute("DELETE FROM ai_calc_sessions WHERE token=?", (token,))
+        db.commit()
+    if time.time() - row["created"] > _AI_CALC_PENDING_TTL_SECONDS:
+        return None
+    try:
+        entry = json.loads(row["data"])
+    except ValueError:
+        return None
+    entry["created"] = row["created"]
     return entry
 
 
@@ -3066,18 +3125,25 @@ def create_production_order_from_deal(db, deal):
     """Створює виробниче замовлення з операціями на основі типової маршрутної карти
     для категорії обраного верстата, списує основні матеріали зі складу за нормами
     та розраховує розклад по робочих центрах."""
-    if not deal["machine_id"]:
-        return None
-    machine = db.execute("SELECT * FROM machines WHERE id=?", (deal["machine_id"],)).fetchone()
-    if not machine:
-        return None
-    routing = db.execute("SELECT * FROM routing_templates WHERE category=?", (machine["category"],)).fetchone()
+    lib_routing_id = deal["routing_template_id"] if "routing_template_id" in deal.keys() else None
+    machine = None
+    if lib_routing_id:
+        routing = db.execute("SELECT * FROM routing_templates WHERE id=?", (lib_routing_id,)).fetchone()
+        if deal["machine_id"]:
+            machine = db.execute("SELECT * FROM machines WHERE id=?", (deal["machine_id"],)).fetchone()
+    else:
+        if not deal["machine_id"]:
+            return None
+        machine = db.execute("SELECT * FROM machines WHERE id=?", (deal["machine_id"],)).fetchone()
+        if not machine:
+            return None
+        routing = db.execute("SELECT * FROM routing_templates WHERE category=?", (machine["category"],)).fetchone()
     existing = db.execute("SELECT id FROM production_orders WHERE deal_id=?", (deal["id"],)).fetchone()
     if existing:
         return existing["id"]
     db.execute(
         "INSERT INTO production_orders (deal_id, machine_id, routing_template_id, quantity, status, due_date, created_at) VALUES (?,?,?,?,?,?,?)",
-        (deal["id"], machine["id"], routing["id"] if routing else None, 1, "planned", deal["expected_close"], now_iso()),
+        (deal["id"], machine["id"] if machine else None, routing["id"] if routing else None, 1, "planned", deal["expected_close"], now_iso()),
     )
     order_id = db.execute("SELECT last_insert_rowid() id").fetchone()["id"]
     if routing:
@@ -3093,7 +3159,7 @@ def create_production_order_from_deal(db, deal):
                                          reference=f"Виробниче замовлення №{order_id}: {s['operation_name']}")
         schedule_production_order(db, order_id)
     log_activity(db, deal["id"], deal["client_id"], "note",
-                 f"Створено виробниче замовлення №{order_id} за маршрутною картою «{machine['category']}»")
+                 f"Створено виробниче замовлення №{order_id} за техпроцесом «{routing['name'] if routing else machine['category']}»")
     return order_id
 
 
@@ -3129,6 +3195,7 @@ BASE_HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}Дашборд{% endblock %} · Оснастка-Маркет</title>
 {% if current_user %}<meta name="csrf-token" content="{{ csrf_token() }}">{% endif %}
+<link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="#15171b"><link rel="apple-touch-icon" href="/icon-192.png">
 <script>
   // Застосовуємо збережений масштаб інтерфейсу ДО рендеру сторінки, щоб
   // уникнути помітного "стрибка" розміру після завантаження. Використовуємо
@@ -3372,16 +3439,23 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
     <nav class="nav">
       {% set role = current_user['role'] %}
       <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active=='dashboard' }}"><span class="icon">▣</span> Дашборд</a>
+      {% if current_user and current_user['role']=='admin' %}<a href="{{ url_for('boss_page') }}" class="{{ 'active' if active=='boss' }}"><span class="icon">📱</span> Шеф (мобільний)</a>{% endif %}
+      {% if role in ('admin','sales','warehouse','technologist','purchaser','production','viewer') %}<a href="{{ url_for('orders_list') }}" class="{{ 'active' if active=='orders' }}"><span class="icon">📑</span> Замовлення{% if orders_attention() %} <span class="badge badge-high">{{ orders_attention() }}</span>{% endif %}</a>{% endif %}
+      {% if role in ('admin','warehouse','purchaser') %}<a href="{{ url_for('procurement_list') }}" class="{{ 'active' if active=='procurement' }}"><span class="icon">🚚</span> Закупівля заготовок</a>{% endif %}
+      {% if role in ('admin','technologist','production') %}<a href="{{ url_for('routings_list') }}" class="{{ 'active' if active=='routings' }}"><span class="icon">🧭</span> Техпроцеси</a>{% endif %}
 
-      <details class="nav-group" data-g="prod" {{ 'open' if active in ('machines','production','board','quality','shift_log') }}>
+      <details class="nav-group" data-g="prod" {{ 'open' if active in ('machines','production','board','quality','shift_log','telemetry') }}>
         <summary>Виробництво</summary>
         {% if not foreman_wc_id %}
         <a href="{{ url_for('machines_list') }}" class="{{ 'active' if active=='machines' }}"><span class="icon">⬢</span> Наше обладнання</a>
         {% endif %}
-        {% if role in ('admin','production','sales','viewer') %}
+        {% if role in ('admin','production','sales','viewer','technologist') %}
         <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробничі замовлення' }}</a>
         {% if not foreman_wc_id %}
         <a href="{{ url_for('production_board') }}" class="{{ 'active' if active=='board' }}"><span class="icon">▦</span> Завантаження верстатів</a>
+        {% endif %}
+        {% if role in ('admin','production','sales') %}
+        <a href="{{ url_for('work_centers_list') }}" class="{{ 'active' if active=='telemetry' }}"><span class="icon">📡</span> Верстати онлайн</a>
         {% endif %}
         {% if not foreman_wc_id %}
         <a href="{{ url_for('quality_list') }}" class="{{ 'active' if active=='quality' }}"><span class="icon">✔</span> Контроль якості</a>
@@ -3584,6 +3658,9 @@ LOGIN_HTML = """
         <label>Пароль</label>
         <input type="password" name="password" required>
       </div>
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; margin:4px 0 12px; color:var(--text-dim);">
+        <input type="checkbox" name="remember" value="1" style="width:auto;"> Запам'ятати мене на цьому пристрої (30 днів)
+      </label>
       <div class="actions">
         <button class="btn btn-primary" style="width:100%; justify-content:center;" type="submit">Увійти</button>
       </div>
@@ -4302,6 +4379,7 @@ CALCULATOR_HTML = """
       <form method="post" action="{{ url_for('calculator_ai_estimate') }}" style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
         <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="ai_correction_token" value="{{ result.ai_correction_token }}">
+        <input type="hidden" name="ai_description" value="{{ ai_description or '' }}">
         <div class="field" style="flex:1; min-width:240px;">
           <input type="text" name="ai_correction_message" placeholder="напр.: вага заготовки не 2, а 3.2 кг; додай свердління 4 отворів" required>
         </div>
@@ -4639,12 +4717,23 @@ DEAL_FORM_HTML = """
       </select>
     </div>
     <div class="field">
-      <label>Обладнання / техпроцес</label>
+      <label>Техпроцес (бібліотека технолога)</label>
+      {% set lib = routing_library() %}
+      <select name="routing_template_id">
+        <option value="">— не обрано —</option>
+        {% for r in lib %}<option value="{{ r['id'] }}" {{ 'selected' if deal and deal['routing_template_id']==r['id'] }}>{{ r['name'] }}{% if r['drawing_no'] %} · {{ r['drawing_no'] }}{% endif %}</option>{% endfor %}
+      </select>
+      {% if not lib %}<div style="font-size:11px; color:var(--text-dim); margin-top:4px;">Техпроцесів ще немає — їх створює технолог у розділі «Техпроцеси».</div>{% endif %}
+    </div>
+    {% if machines %}
+    <div class="field">
+      <label>Обладнання (каталог верстатів)</label>
       <select name="machine_id">
         <option value="">— не обрано —</option>
         {% for m in machines %}<option value="{{ m['id'] }}" {{ 'selected' if deal and deal['machine_id']==m['id'] }}>{{ m['category'] }} — {{ m['model'] }}</option>{% endfor %}
       </select>
     </div>
+    {% endif %}
     <div class="field">
       <label>Стадія</label>
       <select name="stage">
@@ -5138,7 +5227,7 @@ PRODUCTION_DETAIL_HTML = """
 {% extends "base.html" %}
 {% block title %}Виробниче замовлення №{{ order['id'] }}{% endblock %}
 {% block heading %}Виробниче замовлення №{{ order['id'] }}{% endblock %}
-{% block subheading %}{{ order['client_name'] or '' }} · {{ order['machine_name'] or '' }}{% endblock %}
+{% block subheading %}{{ order['deal_title'] or '' }}{% if order['client_name'] %} · {{ order['client_name'] }}{% endif %}{% if order['machine_name'] %} · {{ order['machine_name'] }}{% endif %}{% endblock %}
 {% block content %}
 <div class="detail-header">
   <div class="stat-row">
@@ -5191,7 +5280,7 @@ PRODUCTION_DETAIL_HTML = """
         <div>
           <div style="font-size:16px; font-weight:700;">{{ op['operation_name'] }}</div>
           <div style="font-size:12.5px; color:var(--text-dim); margin-top:3px;">
-            {{ op['wc_name'] or 'Без робочого центру' }} · норма {{ op['planned_hours'] }} год
+            {{ op['wc_name'] or 'Без робочого центру' }} · норма {{ op['planned_hours']|hm }}
             {% if op['status']=='done' and op['actual_h'] is not none %} · факт {{ op['actual_h'] }} год{% endif %}
             {% if op['status']=='in_progress' and op['running_h'] is not none %} · іде вже {{ op['running_h'] }} год{% endif %}
           </div>
@@ -5232,7 +5321,7 @@ PRODUCTION_DETAIL_HTML = """
     <div style="flex:1; background:var(--bg-soft); border-radius:6px; height:18px; position:relative;">
       <div style="position:absolute; left:{{ op['offset_pct'] }}%; width:{{ op['width_pct'] }}%; min-width:2%; height:100%; border-radius:6px; background:{{ '#3fae5c' if op['status']=='done' else '#4fa8e0' }};"></div>
     </div>
-    <div style="width:90px; font-size:11px; color:var(--text-dim);">{{ op['planned_hours'] }} год</div>
+    <div style="width:90px; font-size:11px; color:var(--text-dim);">{{ op['planned_hours']|hm }}</div>
   </div>
   {% endfor %}
 </div>
@@ -5299,7 +5388,7 @@ TERMINAL_HTML = """
         <div style="font-size:18px; font-weight:700; margin:2px 0;">{{ op.deal_title or ('Замовлення №' ~ op.production_order_id) }}</div>
         <div style="font-size:15px; font-weight:600; color:var(--accent-2);">{{ op.operation_name }}</div>
         <div style="font-size:11.5px; color:var(--text-dim); margin-top:4px;">
-          Етап {{ op.step_order }} із {{ op.steps_total }} · {{ op.quantity }} шт. · норма {{ op.planned_hours }} год
+          Етап {{ op.step_order }} із {{ op.steps_total }} · {{ op.quantity }} шт. · норма {{ op.planned_hours|hm }}
           {% if op.running_h is not none %} · <b style="color:#e0a02f;">іде вже {{ op.running_h }} год</b>{% endif %}
           {% if op.planned_start %} · план {{ op.planned_start[:16] }}{% endif %}
         </div>
@@ -5409,7 +5498,7 @@ WORK_CENTERS_HTML = """
       {% endfor %}
     </div>
     {% else %}
-    <div style="font-size:11px; color:var(--text-dim); margin-top:10px;">Немає даних напрацювання — підключіть телеметрію (див. «Налаштування»)</div>
+    <div style="font-size:11px; color:var(--text-dim); margin-top:10px;">Напрацювання ще не накопичилось: CRM рахує години, поки верстат у стані «працює».</div>
     {% endif %}
 
     <div class="section-title" style="font-size:12px; margin:14px 0 6px;">Планове завантаження, %</div>
@@ -6002,6 +6091,87 @@ SETTINGS_HTML = """
   {% endif %}
 </div>
 
+
+<div class="section-title" id="orders-settings"><span class="accent-dot"></span> 🚚 Закупівля заготовок і Нова Пошта</div>
+<div class="card card-pad" style="margin-bottom:22px;">
+  <p style="font-size:12.5px; color:var(--text-dim); margin-top:0;">
+    Коли склад позначає «заготовки немає», заявка йде постачальнику в Telegram (тим самим ботом, що й сповіщення).
+    Статуси посилок за ТТН підтягуються з API Нової Пошти.
+  </p>
+  <form method="post" action="{{ url_for('settings_orders_save') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:10px;">
+      <div class="field"><label>chat_id постачальника в Telegram</label>
+        <input type="text" name="purchaser_chat_id" value="{{ settings.get('purchaser_chat_id','') }}" placeholder="напр. 123456789"></div>
+      <div class="field"><label>API-ключ Нової Пошти</label>
+        <input type="password" name="np_api_key" value="{{ settings.get('np_api_key','') }}" placeholder="з особистого кабінету НП"></div>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:8px;">
+      <button class="btn btn-sm btn-primary" type="submit">Зберегти</button>
+      <button class="btn btn-sm" type="submit" name="test" value="1">Зберегти й надіслати тест постачальнику</button>
+    </div>
+  </form>
+  <details style="margin-top:10px;">
+    <summary style="cursor:pointer; font-size:12.5px; color:var(--accent-2);">Як дізнатись chat_id і ключ НП</summary>
+    <ol style="font-size:12px; color:var(--text-dim); margin:8px 0 0; padding-left:18px;">
+      <li>Постачальник знаходить вашого бота в Telegram і пише йому будь-що (напр. /start).</li>
+      <li>У картці «Сповіщення в Telegram» нижче натисніть пошук чатів — серед них буде постачальник; скопіюйте його chat_id сюди.</li>
+      <li>Ключ Нової Пошти: особистий кабінет НП (бізнес) → Налаштування → Безпека → «Створити ключ».</li>
+    </ol>
+  </details>
+</div>
+
+<div class="section-title"><span class="accent-dot"></span> ☁️ Доступ з будь-якого місця (постійна адреса)</div>
+<div class="card card-pad" style="margin-bottom:22px;">
+  <p style="font-size:12.5px; color:var(--text-dim); margin-top:0;">
+    Шеф відкриває CRM з телефона чи ноутбука просто за посиланням у браузері, з дому чи в дорозі, без жодних програм.
+    Адреса постійна, з'єднання шифрується (HTTPS). Потрібен безкоштовний акаунт Cloudflare і свій домен.
+  </p>
+  {% set tst = tunnel_status or {} %}
+  <div style="margin-bottom:10px; font-size:13px;">
+    Стан:
+    {% if tst.get('state') == 'running' %}<b style="color:var(--green,#3fb27f);">● працює</b>
+    {% elif tst.get('state') == 'starting' %}<b style="color:#e8a33d;">● запускається…</b>
+    {% elif tst.get('state') == 'error' %}<b style="color:#e5534b;">● помилка</b>
+    {% else %}<b style="color:var(--text-dim);">○ вимкнено</b>{% endif %}
+    {% if tst.get('message') %}<span style="color:var(--text-dim);"> · {{ tst.get('message') }}</span>{% endif %}
+  </div>
+  <form method="post" action="{{ url_for('settings_save') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="form" value="cloudflare">
+    <div class="field" style="margin-bottom:10px;">
+      <label>Токен тунелю Cloudflare</label>
+      <input type="password" name="cf_tunnel_token" value="{{ settings.get('cf_tunnel_token','') }}" placeholder="eyJh...">
+    </div>
+    <div class="field" style="margin-bottom:10px;">
+      <label>Публічна адреса (для шефа)</label>
+      <input type="text" name="cf_public_url" value="{{ settings.get('cf_public_url','') }}" placeholder="https://crm.вашдомен.com">
+    </div>
+    <label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:10px;">
+      <input type="checkbox" name="cf_enabled" value="1" style="width:auto;" {{ 'checked' if settings.get('cf_enabled')=='1' }}> Увімкнути доступ ззовні
+    </label>
+    <button class="btn btn-sm btn-primary" type="submit">Зберегти</button>
+  </form>
+  {% if public_url_for_boss %}
+  <div style="display:flex; gap:14px; align-items:center; margin-top:14px; flex-wrap:wrap;">
+    {% if public_qr_svg %}<div style="width:132px; height:132px; background:#fff; border-radius:8px; padding:4px;">{{ public_qr_svg }}</div>{% endif %}
+    <div style="font-size:12.5px; max-width:380px;">
+      Сторінка для шефа: <code>{{ public_url_for_boss }}/boss</code><br>
+      <span style="color:var(--text-dim);">Надішли шефу посилання. На телефоні: «Додати на головний екран», і воно відкриватиметься як програма.</span>
+    </div>
+  </div>
+  {% endif %}
+  <details style="margin-top:12px;">
+    <summary style="cursor:pointer; font-size:12.5px; color:var(--accent-2);">Як отримати токен (один раз, ~10 хвилин)</summary>
+    <ol style="font-size:12px; color:var(--text-dim); margin:8px 0 0; padding-left:18px;">
+      <li>Зареєструйся на cloudflare.com і додай свій домен (його можна купити там же, приблизно 10 $ на рік).</li>
+      <li>Відкрий Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared.</li>
+      <li>Скопіюй токен (довгий рядок після <code>--token</code>) і встав у поле вище.</li>
+      <li>У Public hostname вкажи, наприклад, <code>crm.вашдомен.com</code>, тип HTTP, адреса <code>localhost:{{ (network_url or ':5000').rsplit(':',1)[-1] }}</code>.</li>
+      <li>Встав ту саму адресу в поле «Публічна адреса», постав галочку і збережи. При першому запуску CRM сама завантажить cloudflared (потрібен інтернет).</li>
+    </ol>
+    <p style="font-size:11.5px; color:#e8a33d; margin:8px 0 0;">⚠ Поки в користувачів типові паролі (admin123 тощо), CRM не дасть увімкнути доступ ззовні. Для додаткового захисту можна ввімкнути Cloudflare Access (вхід по e-mail).</p>
+  </details>
+</div>
+
 <div class="grid grid-2">
   <div>
     <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> 📱 Сповіщення в Telegram</div>
@@ -6231,8 +6401,77 @@ SETTINGS_HTML = """
 {% endblock %}
 """
 
+
+BOSS_HTML = """<!doctype html>
+<html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#15171b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon-192.png">
+<title>Шеф · Оснастка-Маркет</title>
+<style>
+:root{--bg:#15171b;--card:#1f2228;--line:#2c3038;--text:#eef0f3;--dim:#9aa1ad;--ok:#3fb27f;--warn:#e8a33d;--bad:#e5534b;--acc:#f08a24}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:14px 14px 40px;max-width:640px;margin:0 auto}
+h1{font-size:19px;margin:4px 0 2px}.sub{color:var(--dim);font-size:12px;margin-bottom:12px}
+.top{display:flex;justify-content:space-between;align-items:center}
+.top a{color:var(--acc);text-decoration:none;font-size:13px}
+.alert{border-radius:12px;padding:10px 12px;margin:8px 0;font-size:14px;font-weight:600}
+.alert.bad{background:rgba(229,83,75,.15);border:1px solid var(--bad)}.alert.warn{background:rgba(232,163,61,.13);border:1px solid var(--warn)}
+.alert.ok{background:rgba(63,178,127,.12);border:1px solid var(--ok)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.kpi .l{color:var(--dim);font-size:12px}.kpi .v{font-size:21px;font-weight:700;margin-top:2px}.kpi .s{color:var(--dim);font-size:11.5px;margin-top:2px}
+h2{font-size:14px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:20px 0 8px}
+.row{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:8px}
+.row .t{display:flex;justify-content:space-between;gap:8px;font-weight:600}.row .m{color:var(--dim);font-size:12.5px;margin-top:2px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:var(--dim)}
+.dot.running{background:var(--ok)}.dot.idle{background:var(--warn)}.dot.alarm{background:var(--bad)}
+.bar{height:6px;background:var(--line);border-radius:4px;margin-top:6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
+.late{color:var(--bad)}.links{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.links a{background:var(--card);border:1px solid var(--line);color:var(--text);text-decoration:none;padding:10px 14px;border-radius:10px;font-size:14px}
+.empty{color:var(--dim);font-size:13px;padding:6px 2px}
+</style></head><body>
+<div class="top"><div><h1>📱 Оснастка-Маркет</h1><div class="sub">Оновлено {{ now }} · автооновлення кожні 60 с</div></div><a href="{{ url_for('logout') }}">Вийти</a></div>
+
+{% for a in alerts %}<div class="alert {{ a.kind }}">{{ a.text }}</div>{% endfor %}
+{% if not alerts %}<div class="alert ok">✅ Тривожних сигналів немає</div>{% endif %}
+
+<div class="grid">
+  <div class="kpi"><div class="l">Угоди в роботі</div><div class="v">{{ open_deals }}</div><div class="s">{{ open_amount|uah0 }} грн</div></div>
+  <div class="kpi"><div class="l">Виграно за місяць</div><div class="v">{{ won_month_amount|uah0 }}</div><div class="s">грн · угод: {{ won_month }}</div></div>
+  <div class="kpi"><div class="l">Чекаємо оплат</div><div class="v">{{ pending_amount|uah0 }}</div><div class="s">грн{% if overdue_pay_count %} · <span class="late">прострочено {{ overdue_pay_count }} ({{ overdue_pay_amount|uah0 }})</span>{% endif %}</div></div>
+  <div class="kpi"><div class="l">Сьогодні в цеху</div><div class="v">{{ shift_made }} шт</div><div class="s">брак {{ shift_scrap }} · {{ shift_hours }} год</div></div>
+</div>
+
+<h2>Верстати</h2>
+{% for m in machines %}<div class="row"><div class="t"><span><span class="dot {{ m.status }}"></span>{{ m.name }}</span><span>{{ m.label }}</span></div>
+{% if m.program %}<div class="m">Програма: {{ m.program }}</div>{% endif %}<div class="m">{{ m.seen }}</div></div>
+{% else %}<div class="empty">Верстати не підключені.</div>{% endfor %}
+
+<h2>Виробництво</h2>
+{% for o in orders %}<div class="row"><div class="t"><span><a href="{{ url_for('production_detail', order_id=o.id) }}" style="color:inherit;text-decoration:none;">№{{ o.id }} · {{ o.title }}</a></span><span>{{ o.pct }}%</span></div>
+<div class="m">{% if o.client %}{{ o.client }} · {% endif %}{{ o.qty }} шт · {{ o.done }}/{{ o.total }} операцій{% if o.due %} · термін {{ o.due }}{% endif %}{% if o.late %} · <span class="late">прострочено</span>{% endif %}</div>
+<div class="bar"><i style="width:{{ o.pct }}%"></i></div></div>
+{% else %}<div class="empty">Немає замовлень у роботі.</div>{% endfor %}
+
+<h2>Склад і завдання</h2>
+<div class="grid">
+  <div class="kpi"><div class="l">Закінчується на складі</div><div class="v {{ 'late' if low_stock else '' }}">{{ low_stock }}</div></div>
+  <div class="kpi"><div class="l">Прострочені завдання</div><div class="v {{ 'late' if overdue_tasks else '' }}">{{ overdue_tasks }}</div></div>
+</div>
+
+<h2>Останні дії</h2>
+{% for a in activity %}<div class="row"><div class="t"><span>{{ a.label }}</span></div><div class="m">{{ a.username }} · {{ a.at }}</div></div>
+{% else %}<div class="empty">Поки порожньо.</div>{% endfor %}
+
+<div class="links"><a href="{{ url_for('dashboard') }}">Повна версія</a><a href="{{ url_for('boss_page') }}">↻ Оновити</a></div>
+<script>setTimeout(function(){location.reload()},60000);</script>
+</body></html>"""
+
 app.jinja_loader = DictLoader({
     "base.html": BASE_HTML,
+    "boss.html": BOSS_HTML,
     "login.html": LOGIN_HTML,
     "dashboard.html": DASHBOARD_HTML,
     "clients_list.html": CLIENTS_LIST_HTML,
@@ -6296,6 +6535,13 @@ DEFAULT_PASSWORDS = {
 }
 
 
+def _safe_next(url):
+    """Дозволяє редірект лише на внутрішній шлях (захист від open redirect)."""
+    if url and url.startswith("/") and not url.startswith("//") and "\\" not in url and "\n" not in url and "\r" not in url:
+        return url
+    return None
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -6310,6 +6556,8 @@ def login():
             session.clear()
             session.permanent = True
             session["user_id"] = user["id"]
+            if request.form.get("remember"):
+                session["remember"] = True
             # Якщо людина зайшла з типовим демо-паролем - показуємо на всіх
             # сторінках помітне нагадування змінити його (особливо важливо,
             # коли CRM доступна з інших комп'ютерів чи через VPN). Прапорець
@@ -6317,7 +6565,7 @@ def login():
             # щоразу перераховувати хеші на кожному запиті.
             if DEFAULT_PASSWORDS.get(user["username"]) == request.form.get("password", ""):
                 session["default_password"] = True
-            return redirect(request.args.get("next") or url_for("dashboard"))
+            return redirect(_safe_next(request.args.get("next")) or url_for("dashboard"))
         register_failed_login(throttle_key)
         flash("Невірний логін або пароль", "error")
     return render_template("login.html")
@@ -7107,16 +7355,23 @@ def calculator_ai_estimate():
             return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
                                     warehouse_items=warehouse_items, ai_description=description)
     elif correction_token:
-        pending = _ai_calc_pending_pop(correction_token)
-        description = (pending or {}).get("description", "")
-        known_fields = (pending or {}).get("known_fields", {})
-        if pending is None:
-            flash("Сесія правок застаріла або вже використана — почни розрахунок заново", "error")
-            return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
-                                    warehouse_items=warehouse_items, ai_description=description)
+        pending = _ai_calc_pending_pop(correction_token, consume=False)
         correction_text = request.form.get("ai_correction_message", "")
+        description = (pending or {}).get("description", "") or request.form.get("ai_description", "")
+        known_fields = (pending or {}).get("known_fields", {})
         try:
-            calc_result = ai_calc_apply_correction(pending["messages"], correction_text, api_key)
+            if pending is not None:
+                calc_result = ai_calc_apply_correction(pending["messages"], correction_text, api_key)
+            elif description.strip():
+                # Розмову втрачено (минула доба) - не скидаємо все, а рахуємо
+                # заново з тим самим описом і правкою користувача.
+                description = description.strip() + "\n\nВажливе уточнення від користувача: " + correction_text.strip()
+                calc_result = ai_estimate_cost_params(ai_shop_context_text(ai_shop_prices(db)) + description, api_key)
+                flash("Попередній розрахунок застарів — перераховано заново з описом і твоєю правкою", "success")
+            else:
+                flash("Попередній розрахунок застарів — опиши деталь ще раз", "error")
+                return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
+                                        warehouse_items=warehouse_items, ai_description="")
         except AICalcError as e:
             flash(str(e), "error")
             return render_template("calculator.html", active="calculator", result=None, dxf_result=None,
@@ -7497,11 +7752,12 @@ def deal_new():
                                     machines=machines, managers=get_managers(), CURRENCIES=CURRENCIES,
                                     preselect_client=request.args.get("client_id", type=int))
         db.execute(
-            """INSERT INTO deals (title, client_id, contact_id, machine_id, stage, amount, currency,
+            """INSERT INTO deals (title, client_id, contact_id, machine_id, routing_template_id, stage, amount, currency,
                prepayment_percent, probability, manager_id, expected_close, source, priority,
                competitor, tech_requirements, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (title, client_id, f.get("contact_id") or None, f.get("machine_id") or None,
+             f.get("routing_template_id") or None,
              f.get("stage", "lead"), amount, f.get("currency", "USD"),
              prepayment, probability, f.get("manager_id") or None,
              f.get("expected_close") or None, f.get("source"), f.get("priority", "medium"),
@@ -7543,10 +7799,10 @@ def deal_edit(deal_id):
             flash(str(e), "error")
             return redirect(url_for("deal_edit", deal_id=deal_id))
         db.execute(
-            """UPDATE deals SET title=?, client_id=?, machine_id=?, stage=?, amount=?, currency=?,
+            """UPDATE deals SET title=?, client_id=?, machine_id=?, routing_template_id=?, stage=?, amount=?, currency=?,
                prepayment_percent=?, probability=?, manager_id=?, expected_close=?, priority=?,
                competitor=?, tech_requirements=?, updated_at=? WHERE id=?""",
-            (title, client_id, f.get("machine_id") or None, f.get("stage", "lead"),
+            (title, client_id, f.get("machine_id") or None, f.get("routing_template_id") or None, f.get("stage", "lead"),
              amount, f.get("currency", "USD"), prepayment,
              probability, f.get("manager_id") or None, f.get("expected_close") or None,
              f.get("priority", "medium"), f.get("competitor"), f.get("tech_requirements"),
@@ -8481,17 +8737,17 @@ def user_toggle(user_id):
 
 @app.route("/production")
 @login_required
-@role_required("production", "sales")
+@role_required("production", "sales", "technologist")
 def production_list():
     fw = foreman_work_center_id(get_current_user())
     if fw:
         return redirect(url_for("work_center_terminal", wc_id=fw))
     db = get_db()
     rows = db.execute(
-        """SELECT o.*, c.name as client_name, d.title as deal_title, m.model as machine_name
+        """SELECT o.*, c.name as client_name, COALESCE(d.title, o.title) as deal_title, m.model as machine_name
            FROM production_orders o
            LEFT JOIN deals d ON d.id=o.deal_id
-           LEFT JOIN clients c ON c.id=d.client_id
+           LEFT JOIN clients c ON c.id=COALESCE(d.client_id, o.client_id)
            LEFT JOIN machines m ON m.id=o.machine_id
            ORDER BY o.created_at DESC"""
     ).fetchall()
@@ -8513,16 +8769,16 @@ def production_list():
 
 @app.route("/production/<int:order_id>")
 @login_required
-@role_required("production", "sales")
+@role_required("production", "sales", "technologist")
 def production_detail(order_id):
     fw = foreman_work_center_id(get_current_user())
     if fw:
         return redirect(url_for("work_center_terminal", wc_id=fw))
     db = get_db()
     order = db.execute(
-        """SELECT o.*, c.name as client_name, m.model as machine_name
+        """SELECT o.*, c.name as client_name, m.model as machine_name, COALESCE(d.title, o.title) as deal_title
            FROM production_orders o LEFT JOIN deals d ON d.id=o.deal_id
-           LEFT JOIN clients c ON c.id=d.client_id LEFT JOIN machines m ON m.id=o.machine_id
+           LEFT JOIN clients c ON c.id=COALESCE(d.client_id, o.client_id) LEFT JOIN machines m ON m.id=o.machine_id
            WHERE o.id=?""", (order_id,)
     ).fetchone()
     if not order:
@@ -8634,9 +8890,9 @@ def production_route_sheet_pdf(order_id):
 
     db = get_db()
     order = db.execute(
-        """SELECT o.*, c.name as client_name, d.title as deal_title, m.model as machine_name, m.category as machine_category
+        """SELECT o.*, c.name as client_name, COALESCE(d.title, o.title) as deal_title, m.model as machine_name, m.category as machine_category
            FROM production_orders o LEFT JOIN deals d ON d.id=o.deal_id
-           LEFT JOIN clients c ON c.id=d.client_id LEFT JOIN machines m ON m.id=o.machine_id
+           LEFT JOIN clients c ON c.id=COALESCE(d.client_id, o.client_id) LEFT JOIN machines m ON m.id=o.machine_id
            WHERE o.id=?""", (order_id,)
     ).fetchone()
     if not order:
@@ -8791,11 +9047,11 @@ def work_center_terminal(wc_id):
     if not wc:
         abort(404)
     ops = db.execute(
-        """SELECT op.*, po.quantity, d.title as deal_title, c.name as client_name
+        """SELECT op.*, po.quantity, COALESCE(d.title, po.title) as deal_title, c.name as client_name
            FROM production_operations op
            JOIN production_orders po ON po.id=op.production_order_id
            LEFT JOIN deals d ON d.id=po.deal_id
-           LEFT JOIN clients c ON c.id=d.client_id
+           LEFT JOIN clients c ON c.id=COALESCE(d.client_id, po.client_id)
            WHERE op.work_center_id=? AND op.status IN ('waiting','in_progress')
            ORDER BY (op.status='in_progress') DESC, op.planned_start""",
         (wc_id,),
@@ -8843,7 +9099,7 @@ def _work_day_ops(db, work_day):
     """Операції цієї дільниці, розпочаті або завершені після старту дня."""
     end = work_day["ended_at"] or "9999-12-31 23:59:59"
     return db.execute(
-        """SELECT op.*, po.quantity, d.title as deal_title
+        """SELECT op.*, po.quantity, COALESCE(d.title, po.title) as deal_title
            FROM production_operations op
            JOIN production_orders po ON po.id=op.production_order_id
            LEFT JOIN deals d ON d.id=po.deal_id
@@ -8938,7 +9194,7 @@ def work_centers_list():
         ).fetchone()["h"]
         capacity = wc["capacity_hours_per_day"] * 14
         utilization[wc["id"]] = min(round(hours / capacity * 100) if capacity else 0, 100)
-    return render_template("work_centers.html", active="production", work_centers=work_centers,
+    return render_template("work_centers.html", active="telemetry", work_centers=work_centers,
                             telemetry=telemetry, utilization=utilization, runtime_stats=runtime_stats,
                             can_connect=is_admin(),
                             foreman_own_wc=foreman_work_center_id(get_current_user()))
@@ -9471,6 +9727,179 @@ def warehouse_transaction_add(item_id):
     return redirect(url_for("warehouse_item_detail", item_id=item_id))
 
 
+def users_with_default_passwords(db):
+    """Імена активних користувачів, у яких досі типовий пароль із DEFAULT_PASSWORDS."""
+    bad = []
+    for u in db.execute("SELECT username, password_hash FROM users WHERE active=1").fetchall():
+        pw = DEFAULT_PASSWORDS.get(u["username"])
+        if pw and check_password_hash(u["password_hash"], pw):
+            bad.append(u["username"])
+    return bad
+
+
+def _tunnel_status():
+    try:
+        import tunnel
+        return tunnel.MANAGER.status()
+    except Exception:
+        return {"state": "off", "message": ""}
+
+
+def _public_url(db):
+    if get_setting(db, "cf_enabled", "0") != "1":
+        return None
+    return (get_setting(db, "cf_public_url", "") or "").strip().rstrip("/") or None
+
+
+@app.template_filter("hm")
+def _hours_filter(v):
+    """Норма часу: менше години - у хвилинах (0.1 год -> «6 хв»), інакше в годинах."""
+    try:
+        h = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if h < 1:
+        m = round(h * 60, 1)
+        return f"{m:g} хв"
+    return f"{round(h, 2):g} год"
+
+
+@app.template_filter("uah0")
+def _money_filter(v):
+    try:
+        return f"{float(v):,.0f}".replace(",", " ")
+    except Exception:
+        return "0"
+
+
+@app.route("/boss")
+@login_required
+def boss_page():
+    """Компактна мобільна сторінка для шефа: усе головне на одному екрані."""
+    if not is_admin():
+        abort(403)
+    db = get_db()
+    today = today_str()
+    month = today[:7]
+    alerts = []
+
+    open_rows = db.execute("SELECT amount, currency FROM deals WHERE stage NOT IN ('won','lost')").fetchall()
+    open_amount = sum(to_uah(db, r["amount"], r["currency"]) for r in open_rows)
+    won_rows = db.execute(
+        "SELECT amount, currency, closed_at FROM deals WHERE stage='won' AND strftime('%Y-%m', closed_at)=?", (month,)
+    ).fetchall()
+    won_amount = sum(to_uah(db, r["amount"], r["currency"], r["closed_at"]) for r in won_rows)
+
+    pay_rows = db.execute("SELECT amount, currency, due_date FROM payments WHERE status='pending'").fetchall()
+    pending_amount = sum(to_uah(db, r["amount"], r["currency"]) for r in pay_rows)
+    late_pay = [r for r in pay_rows if r["due_date"] and r["due_date"] < today]
+    overdue_pay_amount = sum(to_uah(db, r["amount"], r["currency"]) for r in late_pay)
+    if late_pay:
+        alerts.append({"kind": "warn", "text": f"💰 Прострочені оплати: {len(late_pay)} на {_money_filter(overdue_pay_amount)} грн"})
+
+    sh = db.execute(
+        "SELECT COALESCE(SUM(quantity_made),0) m, COALESCE(SUM(quantity_scrap),0) s, COALESCE(SUM(shift_hours),0) h FROM shift_logs WHERE work_date=?",
+        (today,)).fetchone()
+
+    now = datetime.datetime.now()
+    machines = []
+    labels = {"running": "працює", "idle": "простій", "alarm": "АВАРІЯ", "offline": "немає зв'язку"}
+    for r in db.execute(
+        """SELECT w.name, t.status, t.program_name, t.last_seen, t.source FROM work_centers w
+           LEFT JOIN machine_telemetry t ON t.work_center_id=w.id
+           WHERE t.work_center_id IS NOT NULL ORDER BY w.name"""
+    ).fetchall():
+        status = r["status"] or "offline"
+        seen_txt = "ніколи не виходив на зв'язок"
+        if r["source"] == "demo_seed":
+            # демо-дані з першого запуску: не «старіють», інакше на показі
+            # усі верстати були б «немає зв'язку», а на сторінці верстатів - «працює»
+            seen_txt = "демо-дані (верстат ще не підключено)"
+        elif r["last_seen"]:
+            try:
+                age = (now - datetime.datetime.fromisoformat(r["last_seen"][:19])).total_seconds() / 60
+                seen_txt = f"оновлено {int(age)} хв тому" if age >= 1 else "оновлено щойно"
+                if age > 15:
+                    status = "offline"
+            except ValueError:
+                pass
+        elif r["source"] != "demo_seed":
+            status = "offline"
+        if status == "alarm":
+            alerts.insert(0, {"kind": "bad", "text": f"🚨 Аварія: {r['name']}"})
+        machines.append({"name": r["name"], "status": status, "label": labels.get(status, status),
+                         "program": r["program_name"] if status != "offline" else None, "seen": seen_txt})
+
+    orders = []
+    for o in db.execute(
+        """SELECT o.id, o.quantity, o.due_date, COALESCE(d.title, o.title) AS deal_title, c.name AS client_name
+           FROM production_orders o LEFT JOIN deals d ON d.id=o.deal_id LEFT JOIN clients c ON c.id=COALESCE(d.client_id, o.client_id)
+           WHERE o.status IN ('planned','in_progress') ORDER BY o.due_date IS NULL, o.due_date LIMIT 12"""
+    ).fetchall():
+        c = db.execute(
+            "SELECT COUNT(*) t, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) d, (SELECT operation_name FROM production_operations WHERE production_order_id=? ORDER BY step_order LIMIT 1) n FROM production_operations WHERE production_order_id=?",
+            (o["id"], o["id"])).fetchone()
+        total, done = c["t"] or 0, c["d"] or 0
+        late = bool(o["due_date"] and o["due_date"] < today)
+        title = o["deal_title"] or "без угоди"
+        orders.append({"id": o["id"], "title": title, "client": o["client_name"], "qty": o["quantity"], "done": done, "total": total,
+                       "pct": int(done * 100 / total) if total else 0, "due": o["due_date"], "late": late})
+    late_orders = sum(1 for o in orders if o["late"])
+    if late_orders:
+        alerts.append({"kind": "warn", "text": f"⏰ Прострочені виробничі замовлення: {late_orders}"})
+
+    low_stock = db.execute("SELECT COUNT(*) c FROM warehouse_items WHERE qty_on_hand <= min_qty").fetchone()["c"]
+    overdue_tasks = db.execute(
+        "SELECT COUNT(*) c FROM tasks WHERE done=0 AND due_date IS NOT NULL AND due_date < ?", (today,)).fetchone()["c"]
+    activity = [dict(a) for a in db.execute(
+        "SELECT label, username, at FROM audit_log WHERE label IS NOT NULL AND label != '' ORDER BY id DESC LIMIT 8").fetchall()]
+
+    return render_template(
+        "boss.html", now=now.strftime("%H:%M"), alerts=alerts,
+        open_deals=len(open_rows), open_amount=open_amount, won_month=len(won_rows), won_month_amount=won_amount,
+        pending_amount=pending_amount, overdue_pay_count=len(late_pay), overdue_pay_amount=overdue_pay_amount,
+        shift_made=int(sh["m"]), shift_scrap=int(sh["s"]), shift_hours=round(sh["h"] or 0, 1),
+        machines=machines, orders=orders, low_stock=low_stock, overdue_tasks=overdue_tasks, activity=activity)
+
+
+@app.route("/manifest.webmanifest")
+def pwa_manifest():
+    data = {
+        "name": "Оснастка-Маркет", "short_name": "Шеф", "start_url": "/boss", "scope": "/",
+        "display": "standalone", "background_color": "#15171b", "theme_color": "#15171b",
+        "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                  {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}],
+    }
+    return Response(json.dumps(data, ensure_ascii=False), mimetype="application/manifest+json")
+
+
+def _make_icon_png(size):
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (size, size), "#15171b")
+    d = ImageDraw.Draw(img)
+    m = size // 6
+    d.rounded_rectangle([m, m, size - m, size - m], radius=size // 5, fill="#f08a24")
+    cx, cy, r = size // 2, size // 2, size // 5
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill="#15171b")
+    r2 = r // 2
+    d.ellipse([cx - r2, cy - r2, cx + r2, cy + r2], fill="#f08a24")
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+@app.route("/icon-<int:size>.png")
+def pwa_icon(size):
+    if size not in (192, 512):
+        abort(404)
+    resp = Response(_make_icon_png(size), mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+
+
 # ---------------------------------------------------------------------------
 # Налаштування та інтеграції
 # ---------------------------------------------------------------------------
@@ -9533,7 +9962,10 @@ def settings_page():
         pass
     return render_template("settings.html", active="settings", settings=get_all_settings(db), detected_chats=None,
                             network_url=network_url, network_host_url=network_host_url,
-                            network_qr_svg=make_qr_svg(network_url))
+                            network_qr_svg=make_qr_svg(network_url),
+                            tunnel_status=_tunnel_status(),
+                            public_url_for_boss=_public_url(db),
+                            public_qr_svg=make_qr_svg((_public_url(db) or "") + "/boss") if _public_url(db) else None)
 
 
 @app.route("/settings/custom-fields", methods=["GET", "POST"])
@@ -9658,6 +10090,34 @@ def settings_save():
             set_setting(db, k, v)
         db.commit()
         flash("Ціни цеху для ШІ збережено", "success")
+    elif f.get("form") == "cloudflare":
+        token = f.get("cf_tunnel_token", "").strip()
+        url = f.get("cf_public_url", "").strip().rstrip("/")
+        enable = f.get("cf_enabled") == "1"
+        if url and not url.lower().startswith("https://"):
+            flash("Публічна адреса має починатись з https://", "error")
+            return redirect(url_for("settings_page"))
+        weak = users_with_default_passwords(db)
+        if enable and weak:
+            enable = False
+            flash("Доступ ззовні НЕ ввімкнено: у користувачів ще типові паролі (" + ", ".join(weak) +
+                  "). Змініть їх у розділі «Користувачі», потім увімкніть знову.", "error")
+        elif enable and not token:
+            enable = False
+            flash("Вкажіть токен тунелю", "error")
+        set_setting(db, "cf_tunnel_token", token)
+        set_setting(db, "cf_public_url", url)
+        set_setting(db, "cf_enabled", "1" if enable else "0")
+        db.commit()
+        try:
+            import tunnel
+            tunnel.apply_settings(get_all_settings(db), DATA_DIR)
+        except Exception as e:
+            flash(f"Не вдалось застосувати тунель: {e}", "error")
+        if enable:
+            flash("Доступ ззовні увімкнено. Запуск тунелю може зайняти до хвилини.", "success")
+        elif not weak and not f.get("cf_enabled"):
+            flash("Налаштування збережено, доступ ззовні вимкнено", "success")
     elif f.get("form") == "anthropic":
         set_setting(db, "anthropic_api_key", f.get("anthropic_api_key", "").strip())
         db.commit()
@@ -9804,6 +10264,32 @@ def record_telemetry(db, work_center_id, data):
     program_name = data.get("program_name")
     mode = data.get("mode")
     source = data.get("source", "generic")
+    prev_row = db.execute("SELECT * FROM machine_telemetry WHERE work_center_id=?", (work_center_id,)).fetchone()
+    prev_status = prev_row["status"] if prev_row else None
+    if source == "mtconnect" and motion_hours is None:
+        # Haas по MTConnect не віддає лічильник годин у потрібному вигляді,
+        # тож напрацювання рахуємо самі: час між опитуваннями, поки верстат
+        # «працює», іде в motion_hours; поки увімкнений (працює/простій/аварія) -
+        # у power_on_hours. Перший реальний запис стартує з нуля і прибирає
+        # демо-історію цього верстата, щоб не змішувати її з реальними даними.
+        fresh = (prev_row is None or prev_row["source"] != "mtconnect" or prev_row["motion_hours"] is None)
+        if fresh:
+            db.execute("DELETE FROM machine_telemetry_log WHERE work_center_id=?", (work_center_id,))
+            motion_hours, power_on_hours = 0.0, 0.0
+        else:
+            motion_hours = prev_row["motion_hours"] or 0.0
+            power_on_hours = prev_row["power_on_hours"] or 0.0
+            try:
+                elapsed = (datetime.datetime.now() - datetime.datetime.fromisoformat(prev_row["last_seen"][:19])).total_seconds()
+            except (TypeError, ValueError):
+                elapsed = 0
+            # більші проміжки - CRM була вимкнена, і що робив верстат, невідомо
+            if 0 < elapsed <= 300:
+                if prev_status == "running":
+                    motion_hours += elapsed / 3600
+                if prev_status in ("running", "idle", "alarm"):
+                    power_on_hours += elapsed / 3600
+        motion_hours, power_on_hours = round(motion_hours, 4), round(power_on_hours, 4)
     db.execute(
         """INSERT INTO machine_telemetry (work_center_id, status, spindle_load_pct, cycle_count,
            power_on_hours, motion_hours, part_count, program_name, mode, source, last_seen)
@@ -9821,9 +10307,16 @@ def record_telemetry(db, work_center_id, data):
            motion_hours, power_on_hours, part_count, recorded_at) VALUES (?,?,?,?,?,?,?)""",
         (work_center_id, status, spindle_load, motion_hours, power_on_hours, part_count, now_iso()),
     )
-    if status == "alarm":
-        notify_all(f"🚨 Аварійний сигнал з робочого центру #{work_center_id} (джерело: {source})!")
     db.commit()
+    # Сповіщаємо лише про ЗМІНУ стану: раніше аварія слала повідомлення при
+    # кожному опитуванні (кожні кілька секунд), що засмічувало Telegram.
+    if status != prev_status and status in ("alarm", "offline"):
+        wc = db.execute("SELECT name FROM work_centers WHERE id=?", (work_center_id,)).fetchone()
+        name = wc["name"] if wc else f"#{work_center_id}"
+        if status == "alarm":
+            notify_all(f"🚨 Аварія верстата: {name}" + (f" (програма {program_name})" if program_name else ""))
+        elif prev_status in ("running", "idle", "alarm"):
+            notify_all(f"📡 Верстат не відповідає: {name}. Перевірте живлення і мережу.")
 
 
 # ---------------------------------------------------------------------------
@@ -10305,6 +10798,8 @@ def settings_reset_demo_data():
 send_overdue_reminder = lambda: False
 import features_ext  # noqa: E402  (додаткові розділи: деталі, якість, план/факт, дошка, аудит)
 features_ext.register(sys.modules[__name__])
+import orders_ext  # noqa: E402  (замовлення: маркетинг → склад/закупівля → технолог → виробництво)
+orders_ext.register(sys.modules[__name__])
 
 init_db()  # ІНІЦІАЛІЗАЦІЯ БАЗИ ДАНИХ (виконується один раз при старті процесу)
 
