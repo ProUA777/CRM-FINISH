@@ -4563,6 +4563,7 @@ def test_purchase_request_export_and_telegram_fallback(client):
     r = post(client, "/warehouse/purchase/telegram", {"item_id": item, "pick_%d" % item: "1", "qty_%d" % item: "5"},
              follow_redirects=True)
     assert "не налаштовані" in r.get_data(as_text=True)
+    assert _raw_db(client).execute("SELECT qty FROM stock_requests WHERE warehouse_item_id=?", (item,)).fetchone()[0] == 5
 
 
 def test_quality_validation_stats_and_notify(client, monkeypatch):
@@ -5080,36 +5081,9 @@ def test_terminal_groups_and_route_chain(client):
     assert "У роботі:" in t and "Чекають попередній етап" in t
 
 
-def test_boss_page_admin_only_and_content(client):
-    assert client.get("/boss").status_code == 302
-    login(client, "tokar", "tokar123")
-    assert client.get("/boss").status_code == 403
-    client.get("/logout")
-    login(client, "admin", "admin123")
-    r = client.get("/boss")
-    assert r.status_code == 200
-    t = r.get_data(as_text=True)
-    assert "Угоди в роботі" in t and "Верстати" in t and "Виробництво" in t and "manifest.webmanifest" in t
-
-
-def test_boss_machine_alarm_and_stale(client):
-    login(client, "admin", "admin123")
-    db = _raw_db(client)
-    wc = db.execute("SELECT id, name FROM work_centers ORDER BY id LIMIT 1").fetchone()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db.execute("INSERT OR REPLACE INTO machine_telemetry (work_center_id,status,last_seen) VALUES (?,?,?)", (wc["id"], "alarm", now))
-    db.commit()
-    t = client.get("/boss").get_data(as_text=True)
-    assert "Аварія: " + wc["name"] in t
-    db.execute("UPDATE machine_telemetry SET last_seen='2020-01-01 00:00:00' WHERE work_center_id=?", (wc["id"],))
-    db.commit()
-    t = client.get("/boss").get_data(as_text=True)
-    assert "Аварія: " + wc["name"] not in t and 'dot offline' in t
-
-
 def test_pwa_manifest_and_icons_public(client):
     m = client.get("/manifest.webmanifest")
-    assert m.status_code == 200 and m.get_json()["start_url"] == "/boss"
+    assert m.status_code == 200 and m.get_json()["start_url"] == "/"
     for size in (192, 512):
         r = client.get(f"/icon-{size}.png")
         assert r.status_code == 200 and r.data[:4] == b"\x89PNG"
@@ -5169,7 +5143,8 @@ def test_cloudflare_enable_after_passwords_changed(client, monkeypatch):
     assert m.get_setting(db, "cf_enabled") == "1" and m.get_setting(db, "cf_public_url") == "https://crm.example.com"
     assert calls and calls[-1]["cf_enabled"] == "1"
     page = client.get("/settings").get_data(as_text=True)
-    assert "https://crm.example.com/boss" in page
+    assert "https://crm.example.com" in page and "/boss" not in page
+    assert client.get("/boss").status_code == 404
 
 
 def test_tunnel_manager_runs_and_restarts(tmp_path):
@@ -5489,3 +5464,98 @@ def test_machines_page_live_telemetry_and_connect(client, monkeypatch):
     login(client, "tokar", "tokar123")
     post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.3"})
     assert _raw_db(client).execute("SELECT work_center_id FROM machines WHERE id=?", (mid,)).fetchone()[0] is None
+
+
+def test_purchaser_sees_warehouse_read_only(client):
+    login(client, "postach", "postach123")
+    t = client.get("/warehouse").get_data(as_text=True)
+    assert client.get("/warehouse").status_code == 200 and "Лише перегляд" in t and "+ Нова позиція" not in t
+    db = _raw_db(client)
+    item = db.execute("SELECT id, qty_on_hand FROM warehouse_items ORDER BY id LIMIT 1").fetchone()
+    t = client.get(f"/warehouse/{item['id']}").get_data(as_text=True)
+    assert "Провести операцію" not in t and "Зареєструвати партію" not in t
+    assert client.get("/warehouse/scrap").status_code == 200
+    post(client, f"/warehouse/{item['id']}/transactions", {"type": "in", "qty": "100"})
+    post(client, "/warehouse/new", {"sku": "X1", "name": "Хак", "unit": "шт", "qty_on_hand": "1"})
+    db = _raw_db(client)
+    assert db.execute("SELECT qty_on_hand FROM warehouse_items WHERE id=?", (item["id"],)).fetchone()[0] == item["qty_on_hand"]
+    assert db.execute("SELECT COUNT(*) FROM warehouse_items WHERE sku='X1'").fetchone()[0] == 0
+    assert "Склад" in client.get("/").get_data(as_text=True)
+
+
+def test_warehouse_purchase_request_goes_to_purchaser(client, monkeypatch):
+    m = client._app_module
+    tg = []
+    monkeypatch.setattr(m, "send_telegram_to", lambda chat, t: tg.append((chat, t)) or (True, "OK"))
+    monkeypatch.setattr(m, "notify_all", lambda t: None)
+    login(client, "sklad", "sklad123")
+    db = _raw_db(client)
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('purchaser_chat_id', '555')"); db.commit()
+    low = db.execute("SELECT * FROM warehouse_items WHERE qty_on_hand <= min_qty ORDER BY id LIMIT 1").fetchone()
+    assert low
+    post(client, "/warehouse/purchase/telegram", {"item_id": low["id"], f"pick_{low['id']}": "1", f"qty_{low['id']}": "10"})
+    assert tg and tg[0][0] == "555" and low["name"] in tg[0][1]
+    req = _raw_db(client).execute("SELECT * FROM stock_requests WHERE warehouse_item_id=?", (low["id"],)).fetchone()
+    assert req and req["status"] == "to_buy" and req["qty"] == 10
+    client.get("/logout")
+    login(client, "postach", "postach123")
+    t = client.get("/procurement").get_data(as_text=True)
+    assert "Матеріали для складу" in t and low["name"] in t
+    post(client, f"/procurement/stock/{req['id']}", {"action": "ttn", "ttn": "20450000000099", "price": "-1"})
+    assert _raw_db(client).execute("SELECT ttn FROM stock_requests WHERE id=?", (req["id"],)).fetchone()[0] is None
+    post(client, f"/procurement/stock/{req['id']}", {"action": "ttn", "ttn": "", "price": "125.5", "supplier_note": "Метінвест"})
+    r = _raw_db(client).execute("SELECT * FROM stock_requests WHERE id=?", (req["id"],)).fetchone()
+    assert r["status"] == "ordered" and r["price"] == 125.5
+    before = _raw_db(client).execute("SELECT qty_on_hand FROM warehouse_items WHERE id=?", (low["id"],)).fetchone()[0]
+    post(client, f"/procurement/stock/{req['id']}", {"action": "received", "qty_received": "12"})
+    db = _raw_db(client)
+    w = db.execute("SELECT qty_on_hand, unit_cost FROM warehouse_items WHERE id=?", (low["id"],)).fetchone()
+    assert w["qty_on_hand"] == before + 12 and w["unit_cost"] == 125.5
+    assert db.execute("SELECT COUNT(*) FROM warehouse_transactions WHERE item_id=? AND reference LIKE 'Закупівля №%'",
+                      (low["id"],)).fetchone()[0] == 1
+    # повторне «отримано» не додає вдруге
+    post(client, f"/procurement/stock/{req['id']}", {"action": "received", "qty_received": "12"})
+    assert _raw_db(client).execute("SELECT qty_on_hand FROM warehouse_items WHERE id=?", (low["id"],)).fetchone()[0] == before + 12
+    assert client.get("/procurement/request.pdf").data[:4] == b"%PDF"
+
+
+def test_order_prices_and_terms(client):
+    login(client, "oleh", "manager123")
+    db = _raw_db(client)
+    cid = db.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
+    post(client, "/orders/new", {"number": "600-1", "client_id": cid, "contact_person": "Іван, 067",
+                                 "payment_terms": "50% передоплата", "delivery": "НП Львів",
+                                 "items-0-name": "Упор", "items-0-qty": "200", "items-0-price": "45.5", "items-0-currency": "UAH",
+                                 "items-1-name": "Кронштейн", "items-1-qty": "10", "items-1-price": "-3"})
+    assert _raw_db(client).execute("SELECT COUNT(*) FROM orders WHERE number='600-1'").fetchone()[0] == 0
+    post(client, "/orders/new", {"number": "600-1", "client_id": cid, "contact_person": "Іван, 067",
+                                 "payment_terms": "50% передоплата", "delivery": "НП Львів",
+                                 "items-0-name": "Упор", "items-0-qty": "200", "items-0-price": "45.5", "items-0-currency": "UAH",
+                                 "items-1-name": "Кронштейн", "items-1-qty": "10", "items-1-price": "100", "items-1-currency": "USD"})
+    oid = _raw_db(client).execute("SELECT id FROM orders WHERE number='600-1'").fetchone()[0]
+    t = client.get(f"/orders/{oid}").get_data(as_text=True)
+    assert "50% передоплата" in t and "НП Львів" in t and "Іван, 067" in t
+    assert "45.50 UAH" in t and "₴9 100" in t and "$1 000" in t
+    assert "₴9 100" in client.get("/orders").get_data(as_text=True)
+    client.get("/logout")
+    login(client, "tokar", "tokar123")  # цех ціни не бачить
+    t = client.get(f"/orders/{oid}").get_data(as_text=True)
+    assert "₴9 100" not in t and "45.50" not in t
+    client.get("/logout")
+    login(client, "postach", "postach123")  # постачальник бачить усе
+    t = client.get(f"/orders/{oid}").get_data(as_text=True)
+    assert "₴9 100" in t and "50% передоплата" in t
+
+
+def test_orders_migration_adds_columns_to_old_db(client):
+    m = client._app_module
+    import sqlite3, tempfile, os
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    con = sqlite3.connect(path); con.row_factory = sqlite3.Row
+    con.executescript("""CREATE TABLE orders (id INTEGER PRIMARY KEY, number TEXT NOT NULL, created_at TEXT NOT NULL,
+                         status TEXT NOT NULL DEFAULT 'active');
+                         CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT NOT NULL);""")
+    m.migrate_schema(con)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(order_items)")}
+    assert {"price", "currency", "purchase_cost"} <= cols
+    assert "payment_terms" in {r[1] for r in con.execute("PRAGMA table_info(orders)")}

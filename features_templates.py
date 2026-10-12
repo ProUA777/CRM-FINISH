@@ -76,7 +76,7 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 <td><input name="qty_{{ i['id'] }}" value="{{ i['suggested'] }}" style="width:90px"> {{ i['unit'] }}</td></tr>{% endfor %}</table>
 {% if current_user['role'] in ('admin','warehouse','production') %}<div style="padding:12px;display:flex;gap:8px">
 <button class="btn btn-primary" formaction="{{ url_for('purchase_export') }}">⬇ Excel</button>
-<button class="btn" formaction="{{ url_for('purchase_telegram') }}">✈ Надіслати в Telegram</button></div>{% endif %}</form>
+<button class="btn" formaction="{{ url_for('purchase_telegram') }}">✈ Передати постачальнику (Telegram + «Закупівля»)</button></div>{% endif %}</form>
 {% else %}<div class="card empty" style="padding:24px">Усі залишки в нормі 👍</div>{% endif %}""")
 
 QUALITY_LIST = _page("Контроль якості", "Контроль якості", "Перевірки та облік браку за 30 днів", """

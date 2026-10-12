@@ -39,7 +39,7 @@ ORDERS_LIST = _page("Замовлення", "Замовлення", "Служб�
 <div class="o-item">
  <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
   <h3>№ {{ o['number'] }} · {{ o['client_name'] or '—' }}</h3>
-  <div style="font-size:12.5px;color:var(--text-dim)">від {{ o['doc_date'] or '' }}{% if e.due %} · найближчий термін <span class="{{ 'o-late' if e.overdue }}">{{ e.due }}</span>{% endif %}{% if o['status']!='active' %} · <b>{{ 'закрито' if o['status']=='closed' else 'скасовано' }}</b>{% endif %}</div>
+  <div style="font-size:12.5px;color:var(--text-dim)">від {{ o['doc_date'] or '' }}{% if e.due %} · найближчий термін <span class="{{ 'o-late' if e.overdue }}">{{ e.due }}</span>{% endif %}{% if money and e.totals %} · <b style="color:var(--text)">{% for cur, v in e.totals.items() %}{{ v|money(cur) }}{% if not loop.last %} + {% endif %}{% endfor %}</b>{% endif %}{% if o['status']!='active' %} · <b>{{ 'закрито' if o['status']=='closed' else 'скасовано' }}</b>{% endif %}</div>
  </div>
  <div style="margin-top:8px;display:grid;gap:6px">
  {% for i in e['items'] %}<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px">
@@ -63,9 +63,14 @@ ORDER_FORM = _page("Замовлення", "{{ 'Замовлення № ' ~ ord
  {% for c in clients %}<option value="{{ c['id'] }}" {{ 'selected' if (fv.get('client_id')|string)==(c['id']|string) or (order and order['client_id']==c['id']) }}>{{ c['name'] }}</option>{% endfor %}</select>
  <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Немає в списку? <a href="{{ url_for('client_new') }}" target="_blank" style="color:var(--accent-2)">Додати клієнта</a> і оновіть сторінку.</div></div>
 </div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px">
+ <div class="field"><label>Контактна особа замовника</label><input type="text" name="contact_person" placeholder="ПІБ, телефон" value="{{ fv.get('contact_person') or (order['contact_person'] or '' if order else '') }}"></div>
+ <div class="field"><label>Умови оплати</label><input type="text" name="payment_terms" placeholder="напр. 50% передоплата, решта після відвантаження" value="{{ fv.get('payment_terms') or (order['payment_terms'] or '' if order else '') }}"></div>
+ <div class="field"><label>Доставка</label><input type="text" name="delivery" placeholder="самовивіз / НП, адреса" value="{{ fv.get('delivery') or (order['delivery'] or '' if order else '') }}"></div>
+</div>
 <h3 style="margin:18px 0 8px;font-size:15px">Позиції</h3>
 <div class="table-wrap"><table class="items-table" style="width:100%">
-<tr><th style="width:34px">№</th><th>Назва *</th><th>Креслення</th><th style="width:70px">Од.</th><th style="width:90px">К-сть *</th><th style="width:150px">Термін</th><th style="width:90px">Партійно</th><th style="width:120px">Шифр</th><th style="width:40px"></th></tr>
+<tr><th style="width:34px">№</th><th style="min-width:220px">Назва *</th><th style="min-width:150px">Креслення</th><th style="width:70px">Од.</th><th style="width:90px">К-сть *</th><th style="width:150px">Термін</th><th style="width:90px">Партійно</th><th style="width:120px">Шифр</th><th style="width:110px">Ціна за од.</th><th style="width:80px">Валюта</th><th style="width:40px"></th></tr>
 <tbody id="item-rows">
 {% for it in items %}<tr>
  <td class="ln">{{ loop.index }}<input type="hidden" name="items-{{ loop.index0 }}-id" value="{{ it['id'] }}"></td>
@@ -76,6 +81,8 @@ ORDER_FORM = _page("Замовлення", "{{ 'Замовлення № ' ~ ord
  <td><input name="items-{{ loop.index0 }}-due" type="date" value="{{ it['due_date'] or '' }}"></td>
  <td style="text-align:center"><input name="items-{{ loop.index0 }}-batch" type="checkbox" value="1" style="width:auto" {{ 'checked' if it['batch_delivery'] }}></td>
  <td><input type="text" name="items-{{ loop.index0 }}-code" value="{{ it['code'] or '' }}"></td>
+ <td><input name="items-{{ loop.index0 }}-price" type="number" step="0.01" min="0" value="{{ '%g'|format(it['price']) if it['price'] is not none else '' }}"></td>
+ <td><select name="items-{{ loop.index0 }}-currency">{% for c in CURRENCIES %}<option {{ 'selected' if (it['currency'] or 'UAH')==c }}>{{ c }}</option>{% endfor %}</select></td>
  <td>{% if not it['production_order_id'] %}<button type="button" class="btn btn-sm btn-ghost" onclick="this.closest('tr').remove();renum()">✕</button>{% else %}🏭{% endif %}</td>
 </tr>{% endfor %}
 </tbody></table></div>
@@ -97,6 +104,8 @@ function addRow(){
    '<td><input name="items-'+i+'-due" type="date"></td>'+
    '<td style="text-align:center"><input name="items-'+i+'-batch" type="checkbox" value="1" style="width:auto"></td>'+
    '<td><input type="text" name="items-'+i+'-code" placeholder="авто"></td>'+
+   '<td><input name="items-'+i+'-price" type="number" step="0.01" min="0"></td>'+
+   '<td><select name="items-'+i+'-currency">{% for c in CURRENCIES %}<option>{{ c }}</option>{% endfor %}</select></td>'+
    '<td><button type="button" class="btn btn-sm btn-ghost" onclick="this.closest(\\'tr\\').remove();renum()">✕</button></td>';
   tb.appendChild(tr); renum(); tr.querySelector('input').focus();
 }
@@ -115,7 +124,15 @@ ORDER_DETAIL = _page("Замовлення {{ order['number'] }}", "Замовл
 {% if order['status']=='active' %}<input type="hidden" name="status" value="closed"><button class="btn btn-sm">✔ Закрити замовлення</button>
 {% else %}<input type="hidden" name="status" value="active"><button class="btn btn-sm">↺ Повернути в роботу</button>{% endif %}</form>{% endif %}
 </div>
-{% if order['notes'] %}<div class="card card-pad" style="margin-bottom:14px;font-size:13px">{{ order['notes'] }}</div>{% endif %}
+<div class="card card-pad" style="margin-bottom:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;font-size:13px">
+ <div><span style="color:var(--text-dim);font-size:11.5px">Замовник</span><br><b>{{ order['client_name'] or '—' }}</b></div>
+ <div><span style="color:var(--text-dim);font-size:11.5px">Контактна особа</span><br>{{ order['contact_person'] or '—' }}</div>
+ <div><span style="color:var(--text-dim);font-size:11.5px">Умови оплати</span><br>{{ order['payment_terms'] or '—' }}</div>
+ <div><span style="color:var(--text-dim);font-size:11.5px">Доставка</span><br>{{ order['delivery'] or '—' }}</div>
+ {% if money %}<div><span style="color:var(--text-dim);font-size:11.5px">Сума замовлення</span><br><b style="font-size:16px">{% for cur, v in totals.items() %}{{ v|money(cur) }}{% if not loop.last %} + {% endif %}{% else %}—{% endfor %}</b></div>
+ {% if purchase_total %}<div><span style="color:var(--text-dim);font-size:11.5px">Закупівля заготовок</span><br><b>{{ purchase_total|money('UAH') }}</b></div>{% endif %}{% endif %}
+ {% if order['notes'] %}<div style="grid-column:1/-1"><span style="color:var(--text-dim);font-size:11.5px">Примітки</span><br>{{ order['notes'] }}</div>{% endif %}
+</div>
 <div class="o-flow" style="margin-bottom:14px">📑 Замовлення <span>→</span> 📦 Склад: заготовка <span>+</span> 🧭 Технолог: техпроцес <span>→</span> 🏭 Запуск у виробництво</div>
 
 {% for i in items %}
@@ -124,7 +141,7 @@ ORDER_DETAIL = _page("Замовлення {{ order['number'] }}", "Замовл
   <h3>{{ i.code }} · {{ i.name }} <span style="color:var(--text-dim);font-weight:400">{{ i.drawing_no or '' }}</span></h3>
   <span class="o-chip" style="color:{{ i.stage_color }};border-color:{{ i.stage_color }}">{{ i.stage_label }}</span>
  </div>
- <div style="font-size:13px;color:var(--text-dim);margin-top:4px">{{ '%g'|format(i.quantity) }} {{ i.unit }} · термін: <span class="{{ 'o-late' if i.overdue }}">{{ i.due_text }}</span>{% if i.overdue %} (прострочено){% endif %}</div>
+ <div style="font-size:13px;color:var(--text-dim);margin-top:4px">{{ '%g'|format(i.quantity) }} {{ i.unit }} · термін: <span class="{{ 'o-late' if i.overdue }}">{{ i.due_text }}</span>{% if i.overdue %} (прострочено){% endif %}{% if money and i.price is not none %} · ціна {{ '%.2f'|format(i.price) }} {{ i.currency or 'UAH' }} за {{ i.unit }} · сума <b style="color:var(--text)">{{ i.line_sum|money(i.currency or 'UAH') }}</b>{% endif %}{% if money and i.purchase_cost %} · закупівля заготовки {{ i.purchase_cost|money('UAH') }}{% endif %}</div>
 
  <div class="o-cols">
   <!-- СКЛАД -->
@@ -147,8 +164,9 @@ ORDER_DETAIL = _page("Замовлення {{ order['number'] }}", "Замовл
    {% if r in ('admin','warehouse','purchaser') and i.blank_status in ('to_buy','ordered','shipped') %}
     <form method="post" action="{{ url_for('order_item_purchase', item_id=i.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
      <input type="hidden" name="back" value="{{ url_for('orders_detail', order_id=order['id']) }}#item-{{ i.id }}">
-     <div class="o-row"><input type="text" name="ttn" value="{{ i.ttn or '' }}" placeholder="ТТН Нової Пошти (14 цифр)" inputmode="numeric"></div>
-     <div class="o-row"><button class="btn btn-sm" name="action" value="ttn">Зберегти ТТН</button>
+     <div class="o-row"><input type="text" name="ttn" value="{{ i.ttn or '' }}" placeholder="ТТН Нової Пошти (14 цифр)" inputmode="numeric">
+      <input name="purchase_cost" type="number" step="0.01" min="0" value="{{ '%g'|format(i.purchase_cost) if i.purchase_cost else '' }}" placeholder="Сума закупівлі, грн"></div>
+     <div class="o-row"><button class="btn btn-sm" name="action" value="ttn">Зберегти</button>
       <button class="btn btn-sm btn-primary" name="action" value="received">✔ Отримано</button>
       {% if i.ttn %}<button class="btn btn-sm btn-ghost" name="action" value="refresh">↻ Статус НП</button>{% endif %}</div></form>
    {% endif %}
@@ -206,7 +224,8 @@ PROCUREMENT = _page("Закупівля заготовок", "Закупівля
  {% if i.ttn %}<div style="font-size:13px;margin-top:6px">ТТН <b>{{ i.ttn }}</b>{% if i.np_status %} · {{ i.np_status }}{% endif %}{% if i.np_checked_at %} <span style="color:var(--text-dim);font-size:11.5px">(перевірено {{ i.np_checked_at[11:16] }})</span>{% endif %}</div>{% endif %}
  {% if i.blank_status != 'received' %}
  <form method="post" action="{{ url_for('order_item_purchase', item_id=i.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-  <div class="o-row"><input type="text" name="supplier_note" value="{{ i.supplier_note or '' }}" placeholder="Де купив, ціна (необов'язково)"></div>
+  <div class="o-row"><input type="text" name="supplier_note" value="{{ i.supplier_note or '' }}" placeholder="Постачальник (де купив)">
+   <input name="purchase_cost" type="number" step="0.01" min="0" value="{{ '%g'|format(i.purchase_cost) if i.purchase_cost else '' }}" placeholder="Сума закупівлі, грн"></div>
   <div class="o-row"><input type="text" name="ttn" value="{{ i.ttn or '' }}" placeholder="ТТН Нової Пошти (14 цифр)" inputmode="numeric"></div>
   <div class="o-row">
    <button class="btn btn-sm" name="action" value="ttn">{{ 'Зберегти ТТН' }}</button>
@@ -216,7 +235,34 @@ PROCUREMENT = _page("Закупівля заготовок", "Закупівля
   <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Без ТТН «Зберегти» означає «замовлено, ще не відправлено». Коли НП покаже «отримано», статус зміниться сам.</div>
  </form>{% endif %}
 </div>
-{% else %}<div class="card card-pad empty">Заявок на закупівлю немає 👍</div>{% endfor %}
+{% else %}<div class="card card-pad empty">Заготовок під замовлення купувати не треба 👍</div>{% endfor %}
+
+<h3 style="margin:22px 0 10px;font-size:16px">📦 Матеріали для складу</h3>
+{% for s in stock %}
+<div class="o-item" id="stock-{{ s.id }}">
+ <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+  <h3>{{ s.name }}{% if s.sku %} <span style="color:var(--text-dim);font-weight:400">{{ s.sku }}</span>{% endif %}</h3>
+  <span class="o-chip" style="color:{{ s.color }};border-color:{{ s.color }}">{{ s.label }}</span>
+ </div>
+ <div style="font-size:13px;margin-top:6px"><b>Купити:</b> {{ '%g'|format(s.qty) }} {{ s.unit or '' }}{% if s.qty_on_hand is not none %} <span style="color:var(--text-dim)">· зараз на складі {{ '%g'|format(s.qty_on_hand) }}, мінімум {{ '%g'|format(s.min_qty or 0) }}</span>{% endif %}</div>
+ {% if s.price is not none %}<div style="font-size:12.5px;margin-top:2px">Ціна {{ '%.2f'|format(s.price) }} грн за {{ s.unit or 'од.' }} · сума <b>{{ s.sum|money('UAH') }}</b>{% if s.supplier_note %} · {{ s.supplier_note }}{% endif %}</div>{% elif s.supplier_note %}<div style="font-size:12.5px;margin-top:2px">{{ s.supplier_note }}</div>{% endif %}
+ {% if s.ttn %}<div style="font-size:13px;margin-top:6px">ТТН <b>{{ s.ttn }}</b>{% if s.np_status %} · {{ s.np_status }}{% endif %}</div>{% endif %}
+ {% if s.status != 'received' %}
+ <form method="post" action="{{ url_for('stock_request_update', req_id=s.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+  <div class="o-row"><input type="text" name="supplier_note" value="{{ s.supplier_note or '' }}" placeholder="Постачальник (де купив)">
+   <input name="price" type="number" step="0.01" min="0" value="{{ '%g'|format(s.price) if s.price is not none else '' }}" placeholder="Ціна за од., грн"></div>
+  <div class="o-row"><input type="text" name="ttn" value="{{ s.ttn or '' }}" placeholder="ТТН Нової Пошти (14 цифр)" inputmode="numeric">
+   <input name="qty_received" type="number" step="any" min="0" value="{{ '%g'|format(s.qty) }}" title="Скільки фактично отримано"></div>
+  <div class="o-row">
+   <button class="btn btn-sm" name="action" value="ttn">Зберегти</button>
+   <button class="btn btn-sm btn-primary" name="action" value="received">✔ Отримано на склад</button>
+   {% if s.ttn %}<button class="btn btn-sm btn-ghost" name="action" value="refresh">↻ Статус</button>{% endif %}
+   <button class="btn btn-sm btn-ghost" name="action" value="cancel" onclick="return confirm('Скасувати заявку?')">Скасувати</button>
+  </div>
+  <div style="font-size:11px;color:var(--text-dim);margin-top:4px">«Отримано на склад» додає вказану кількість до залишку і оновлює ціну позиції.</div>
+ </form>{% endif %}
+</div>
+{% else %}<div class="card card-pad empty">Заявок складу немає. Склад створює їх у «Заявка на закупівлю».</div>{% endfor %}
 """)
 
 ROUTINGS_LIST = _page("Техпроцеси", "Бібліотека техпроцесів", "Операції по дільницях з нормою часу — технолог веде, маркетинг і цех обирають", STYLE + """

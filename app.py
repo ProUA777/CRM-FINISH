@@ -3441,7 +3441,6 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
     <nav class="nav">
       {% set role = current_user['role'] %}
       <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active=='dashboard' }}"><span class="icon">▣</span> Дашборд</a>
-      {% if current_user and current_user['role']=='admin' %}<a href="{{ url_for('boss_page') }}" class="{{ 'active' if active=='boss' }}"><span class="icon">📱</span> Шеф (мобільний)</a>{% endif %}
       {% if role in ('admin','sales','warehouse','technologist','purchaser','production','viewer') %}<a href="{{ url_for('orders_list') }}" class="{{ 'active' if active=='orders' }}"><span class="icon">📑</span> Замовлення{% if orders_attention() %} <span class="badge badge-high">{{ orders_attention() }}</span>{% endif %}</a>{% endif %}
       {% if role in ('admin','warehouse','purchaser') %}<a href="{{ url_for('procurement_list') }}" class="{{ 'active' if active=='procurement' }}"><span class="icon">🚚</span> Закупівля заготовок</a>{% endif %}
       {% if role in ('admin','technologist','production') %}<a href="{{ url_for('routings_list') }}" class="{{ 'active' if active=='routings' }}"><span class="icon">🧭</span> Техпроцеси</a>{% endif %}
@@ -3468,10 +3467,10 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
         {% endif %}
       </details>
 
-      {% if role in ('admin','warehouse','production','viewer','service') %}
+      {% if role in ('admin','warehouse','production','viewer','service','purchaser') %}
       <details class="nav-group" data-g="stock" {{ 'open' if active in ('warehouse','purchase','service') }}>
         <summary>Склад і сервіс</summary>
-        {% if role in ('admin','warehouse','production','viewer') %}
+        {% if role in ('admin','warehouse','production','viewer','purchaser') %}
         <a href="{{ url_for('warehouse_list') }}" class="{{ 'active' if active=='warehouse' }}"><span class="icon">▤</span> Склад</a>
         <a href="{{ url_for('purchase_request') }}" class="{{ 'active' if active=='purchase' }}"><span class="icon">🛒</span> Заявка на закупівлю</a>
         {% endif %}
@@ -5639,7 +5638,7 @@ WAREHOUSE_HTML = """
     {% if low_stock_count %}<span class="badge badge-high">⚠ {{ low_stock_count }} позицій потребують поповнення</span>{% endif %}
   </div>
   <a class="btn" href="{{ url_for('scrap_list') }}">🔩 Обрізки та відходи</a>
-  <a class="btn btn-primary" href="{{ url_for('warehouse_item_new') }}">+ Нова позиція</a>
+  {% if current_user['role'] != 'purchaser' %}<a class="btn btn-primary" href="{{ url_for('warehouse_item_new') }}">+ Нова позиція</a>{% else %}<span class="badge">👁 Лише перегляд</span>{% endif %}
 </div>
 <div class="card table-wrap">
   <table>
@@ -5689,19 +5688,19 @@ SCRAP_HTML = """
         <td>{{ o['weight_kg'] or '—' }}</td>
         <td>{{ o['location'] or '—' }}</td>
         <td><span class="badge badge-{{ 'low' if o['status']=='available' else 'medium' }}">{{ dict(SCRAP_STATUSES)[o['status']] }}</span></td>
-        <td style="display:flex; gap:6px;">
+        <td style="display:flex; gap:6px;">{% if current_user['role'] != 'purchaser' %}
           <form method="post" action="{{ url_for('scrap_mark_used', offcut_id=o['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
             <button class="btn btn-sm" type="submit">{{ 'Позначити використаним' if o['status']=='available' else 'Повернути в наявність' }}</button>
           </form>
           <form method="post" action="{{ url_for('scrap_delete', offcut_id=o['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-danger" type="submit">✕</button></form>
-        </td>
+        {% endif %}</td>
       </tr>
       {% else %}
       <tr><td colspan="7" class="empty">Записів немає</td></tr>
       {% endfor %}
     </table>
   </div>
-  <form method="post" action="{{ url_for('scrap_add') }}" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+  {% if current_user['role'] != 'purchaser' %}<form method="post" action="{{ url_for('scrap_add') }}" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
     <div class="field" style="margin-bottom:10px;"><label>Матеріал *</label><input type="text" name="material_name" placeholder="напр. Сталь 3, лист" required></div>
     <div class="form-grid" style="margin-bottom:10px;">
       <div class="field"><label>Товщина, мм</label><input type="number" step="0.1" name="thickness_mm"></div>
@@ -5711,7 +5710,7 @@ SCRAP_HTML = """
     </div>
     <div class="field" style="margin-bottom:10px;"><label>Локація</label><input type="text" name="location"></div>
     <button class="btn btn-primary" type="submit">+ Зареєструвати обрізок</button>
-  </form>
+  </form>{% endif %}
 </div>
 {% endblock %}
 """
@@ -5770,7 +5769,7 @@ WAREHOUSE_ITEM_HTML = """
       </table>
     </div>
   </div>
-  <div>
+  {% if current_user['role'] != 'purchaser' %}<div>
     <div class="section-title"><span class="accent-dot"></span> {{ 'Списання матеріалу' if current_user['role']=='production' else 'Прихід / списання' }}</div>
     <form method="post" action="{{ url_for('warehouse_transaction_add', item_id=item['id']) }}" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       {% if current_user['role']=='production' %}
@@ -5786,7 +5785,7 @@ WAREHOUSE_ITEM_HTML = """
       <div class="field" style="margin-bottom:10px;"><label>Примітка</label><input type="text" name="reference" placeholder="{{ 'напр.: списано на в.з. №12' if current_user['role']=='production' else '' }}"></div>
       <button class="btn btn-primary" type="submit">{{ 'Списати' if current_user['role']=='production' else 'Провести операцію' }}</button>
     </form>
-  </div>
+  </div>{% endif %}
 </div>
 
 {% if current_user['role'] != 'production' %}
@@ -5802,14 +5801,14 @@ WAREHOUSE_ITEM_HTML = """
         <td>{{ lot['supplier'] or '—' }}</td>
         <td>{{ lot['qty'] }} {{ item['unit'] }}</td>
         <td>{{ lot['received_date'] or '—' }}</td>
-        <td><form method="post" action="{{ url_for('material_lot_delete', lot_id=lot['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-danger" type="submit">✕</button></form></td>
+        <td>{% if current_user['role'] != 'purchaser' %}<form method="post" action="{{ url_for('material_lot_delete', lot_id=lot['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-danger" type="submit">✕</button></form>{% endif %}</td>
       </tr>
       {% else %}
       <tr><td colspan="6" class="empty">Партій ще не зареєстровано</td></tr>
       {% endfor %}
     </table>
   </div>
-  <form method="post" action="{{ url_for('material_lot_add', item_id=item['id']) }}" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+  {% if current_user['role'] != 'purchaser' %}<form method="post" action="{{ url_for('material_lot_add', item_id=item['id']) }}" class="card card-pad"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
     <p style="font-size:11.5px; color:var(--text-dim); margin-top:0;">Для простежуваності: до якої партії металу належить конкретний лист/пруток, з яким сертифікатом якості.</p>
     <div class="field" style="margin-bottom:10px;"><label>№ плавки (heat number)</label><input type="text" name="heat_number"></div>
     <div class="field" style="margin-bottom:10px;"><label>№ сертифіката якості</label><input type="text" name="certificate_number"></div>
@@ -5819,7 +5818,7 @@ WAREHOUSE_ITEM_HTML = """
       <div class="field"><label>Дата отримання</label><input type="date" name="received_date"></div>
     </div>
     <button class="btn btn-sm btn-primary" type="submit">+ Зареєструвати партію</button>
-  </form>
+  </form>{% endif %}
 </div>
 {% endif %}
 {% endif %}
@@ -6257,8 +6256,8 @@ SETTINGS_HTML = """
   <div style="display:flex; gap:14px; align-items:center; margin-top:14px; flex-wrap:wrap;">
     {% if public_qr_svg %}<div style="width:132px; height:132px; background:#fff; border-radius:8px; padding:4px;">{{ public_qr_svg }}</div>{% endif %}
     <div style="font-size:12.5px; max-width:380px;">
-      Сторінка для шефа: <code>{{ public_url_for_boss }}/boss</code><br>
-      <span style="color:var(--text-dim);">Надішли шефу посилання. На телефоні: «Додати на головний екран», і воно відкриватиметься як програма.</span>
+      Адреса CRM з будь-якого місця: <code>{{ public_url_for_boss }}</code><br>
+      <span style="color:var(--text-dim);">Надішли шефу посилання або QR. На телефоні: «Додати на головний екран», і CRM відкриватиметься як програма.</span>
     </div>
   </div>
   {% endif %}
@@ -6505,76 +6504,9 @@ SETTINGS_HTML = """
 """
 
 
-BOSS_HTML = """<!doctype html>
-<html lang="uk"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#15171b">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
-<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon-192.png">
-<title>Шеф · Оснастка-Маркет</title>
-<style>
-:root{--bg:#15171b;--card:#1f2228;--line:#2c3038;--text:#eef0f3;--dim:#9aa1ad;--ok:#3fb27f;--warn:#e8a33d;--bad:#e5534b;--acc:#f08a24}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:14px 14px 40px;max-width:640px;margin:0 auto}
-h1{font-size:19px;margin:4px 0 2px}.sub{color:var(--dim);font-size:12px;margin-bottom:12px}
-.top{display:flex;justify-content:space-between;align-items:center}
-.top a{color:var(--acc);text-decoration:none;font-size:13px}
-.alert{border-radius:12px;padding:10px 12px;margin:8px 0;font-size:14px;font-weight:600}
-.alert.bad{background:rgba(229,83,75,.15);border:1px solid var(--bad)}.alert.warn{background:rgba(232,163,61,.13);border:1px solid var(--warn)}
-.alert.ok{background:rgba(63,178,127,.12);border:1px solid var(--ok)}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
-.kpi .l{color:var(--dim);font-size:12px}.kpi .v{font-size:21px;font-weight:700;margin-top:2px}.kpi .s{color:var(--dim);font-size:11.5px;margin-top:2px}
-h2{font-size:14px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:20px 0 8px}
-.row{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:8px}
-.row .t{display:flex;justify-content:space-between;gap:8px;font-weight:600}.row .m{color:var(--dim);font-size:12.5px;margin-top:2px}
-.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:var(--dim)}
-.dot.running{background:var(--ok)}.dot.idle{background:var(--warn)}.dot.alarm{background:var(--bad)}
-.bar{height:6px;background:var(--line);border-radius:4px;margin-top:6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
-.late{color:var(--bad)}.links{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
-.links a{background:var(--card);border:1px solid var(--line);color:var(--text);text-decoration:none;padding:10px 14px;border-radius:10px;font-size:14px}
-.empty{color:var(--dim);font-size:13px;padding:6px 2px}
-</style></head><body>
-<div class="top"><div><h1>📱 Оснастка-Маркет</h1><div class="sub">Оновлено {{ now }} · автооновлення кожні 60 с</div></div><a href="{{ url_for('logout') }}">Вийти</a></div>
-
-{% for a in alerts %}<div class="alert {{ a.kind }}">{{ a.text }}</div>{% endfor %}
-{% if not alerts %}<div class="alert ok">✅ Тривожних сигналів немає</div>{% endif %}
-
-<div class="grid">
-  <div class="kpi"><div class="l">Угоди в роботі</div><div class="v">{{ open_deals }}</div><div class="s">{{ open_amount|uah0 }} грн</div></div>
-  <div class="kpi"><div class="l">Виграно за місяць</div><div class="v">{{ won_month_amount|uah0 }}</div><div class="s">грн · угод: {{ won_month }}</div></div>
-  <div class="kpi"><div class="l">Чекаємо оплат</div><div class="v">{{ pending_amount|uah0 }}</div><div class="s">грн{% if overdue_pay_count %} · <span class="late">прострочено {{ overdue_pay_count }} ({{ overdue_pay_amount|uah0 }})</span>{% endif %}</div></div>
-  <div class="kpi"><div class="l">Сьогодні в цеху</div><div class="v">{{ shift_made }} шт</div><div class="s">брак {{ shift_scrap }} · {{ shift_hours }} год</div></div>
-</div>
-
-<h2>Верстати</h2>
-{% for m in machines %}<div class="row"><div class="t"><span><span class="dot {{ m.status }}"></span>{{ m.name }}</span><span>{{ m.label }}</span></div>
-{% if m.program %}<div class="m">Програма: {{ m.program }}</div>{% endif %}<div class="m">{{ m.seen }}</div></div>
-{% else %}<div class="empty">Верстати не підключені.</div>{% endfor %}
-
-<h2>Виробництво</h2>
-{% for o in orders %}<div class="row"><div class="t"><span><a href="{{ url_for('production_detail', order_id=o.id) }}" style="color:inherit;text-decoration:none;">№{{ o.id }} · {{ o.title }}</a></span><span>{{ o.pct }}%</span></div>
-<div class="m">{% if o.client %}{{ o.client }} · {% endif %}{{ o.qty }} шт · {{ o.done }}/{{ o.total }} операцій{% if o.due %} · термін {{ o.due }}{% endif %}{% if o.late %} · <span class="late">прострочено</span>{% endif %}</div>
-<div class="bar"><i style="width:{{ o.pct }}%"></i></div></div>
-{% else %}<div class="empty">Немає замовлень у роботі.</div>{% endfor %}
-
-<h2>Склад і завдання</h2>
-<div class="grid">
-  <div class="kpi"><div class="l">Закінчується на складі</div><div class="v {{ 'late' if low_stock else '' }}">{{ low_stock }}</div></div>
-  <div class="kpi"><div class="l">Прострочені завдання</div><div class="v {{ 'late' if overdue_tasks else '' }}">{{ overdue_tasks }}</div></div>
-</div>
-
-<h2>Останні дії</h2>
-{% for a in activity %}<div class="row"><div class="t"><span>{{ a.label }}</span></div><div class="m">{{ a.username }} · {{ a.at }}</div></div>
-{% else %}<div class="empty">Поки порожньо.</div>{% endfor %}
-
-<div class="links"><a href="{{ url_for('dashboard') }}">Повна версія</a><a href="{{ url_for('boss_page') }}">↻ Оновити</a></div>
-<script>setTimeout(function(){location.reload()},60000);</script>
-</body></html>"""
 
 app.jinja_loader = DictLoader({
     "base.html": BASE_HTML,
-    "boss.html": BOSS_HTML,
     "login.html": LOGIN_HTML,
     "dashboard.html": DASHBOARD_HTML,
     "clients_list.html": CLIENTS_LIST_HTML,
@@ -9749,7 +9681,7 @@ def shift_log_report_pdf():
 
 @app.route("/warehouse")
 @login_required
-@role_required("warehouse", "production")
+@role_required("warehouse", "production", "purchaser")
 def warehouse_list():
     db = get_db()
     items = db.execute("SELECT * FROM warehouse_items ORDER BY name").fetchall()
@@ -9759,7 +9691,7 @@ def warehouse_list():
 
 @app.route("/warehouse/scrap")
 @login_required
-@role_required("warehouse", "production")
+@role_required("warehouse", "production", "purchaser")
 def scrap_list():
     db = get_db()
     status_filter = request.args.get("status", "available")
@@ -9854,7 +9786,7 @@ def warehouse_item_new():
 
 @app.route("/warehouse/<int:item_id>")
 @login_required
-@role_required("warehouse", "production")
+@role_required("warehouse", "production", "purchaser")
 def warehouse_item_detail(item_id):
     db = get_db()
     item = db.execute("SELECT * FROM warehouse_items WHERE id=?", (item_id,)).fetchone()
@@ -9995,100 +9927,10 @@ def _money_filter(v):
         return "0"
 
 
-@app.route("/boss")
-@login_required
-def boss_page():
-    """Компактна мобільна сторінка для шефа: усе головне на одному екрані."""
-    if not is_admin():
-        abort(403)
-    db = get_db()
-    today = today_str()
-    month = today[:7]
-    alerts = []
-
-    open_rows = db.execute("SELECT amount, currency FROM deals WHERE stage NOT IN ('won','lost')").fetchall()
-    open_amount = sum(to_uah(db, r["amount"], r["currency"]) for r in open_rows)
-    won_rows = db.execute(
-        "SELECT amount, currency, closed_at FROM deals WHERE stage='won' AND strftime('%Y-%m', closed_at)=?", (month,)
-    ).fetchall()
-    won_amount = sum(to_uah(db, r["amount"], r["currency"], r["closed_at"]) for r in won_rows)
-
-    pay_rows = db.execute("SELECT amount, currency, due_date FROM payments WHERE status='pending'").fetchall()
-    pending_amount = sum(to_uah(db, r["amount"], r["currency"]) for r in pay_rows)
-    late_pay = [r for r in pay_rows if r["due_date"] and r["due_date"] < today]
-    overdue_pay_amount = sum(to_uah(db, r["amount"], r["currency"]) for r in late_pay)
-    if late_pay:
-        alerts.append({"kind": "warn", "text": f"💰 Прострочені оплати: {len(late_pay)} на {_money_filter(overdue_pay_amount)} грн"})
-
-    sh = db.execute(
-        "SELECT COALESCE(SUM(quantity_made),0) m, COALESCE(SUM(quantity_scrap),0) s, COALESCE(SUM(shift_hours),0) h FROM shift_logs WHERE work_date=?",
-        (today,)).fetchone()
-
-    now = datetime.datetime.now()
-    machines = []
-    labels = {"running": "працює", "idle": "простій", "alarm": "АВАРІЯ", "offline": "немає зв'язку"}
-    for r in db.execute(
-        """SELECT w.name, t.status, t.program_name, t.last_seen, t.source FROM work_centers w
-           LEFT JOIN machine_telemetry t ON t.work_center_id=w.id
-           WHERE t.work_center_id IS NOT NULL ORDER BY w.name"""
-    ).fetchall():
-        status = r["status"] or "offline"
-        seen_txt = "ніколи не виходив на зв'язок"
-        if r["source"] == "demo_seed":
-            # демо-дані з першого запуску: не «старіють», інакше на показі
-            # усі верстати були б «немає зв'язку», а на сторінці верстатів - «працює»
-            seen_txt = "демо-дані (верстат ще не підключено)"
-        elif r["last_seen"]:
-            try:
-                age = (now - datetime.datetime.fromisoformat(r["last_seen"][:19])).total_seconds() / 60
-                seen_txt = f"оновлено {int(age)} хв тому" if age >= 1 else "оновлено щойно"
-                if age > 15:
-                    status = "offline"
-            except ValueError:
-                pass
-        elif r["source"] != "demo_seed":
-            status = "offline"
-        if status == "alarm":
-            alerts.insert(0, {"kind": "bad", "text": f"🚨 Аварія: {r['name']}"})
-        machines.append({"name": r["name"], "status": status, "label": labels.get(status, status),
-                         "program": r["program_name"] if status != "offline" else None, "seen": seen_txt})
-
-    orders = []
-    for o in db.execute(
-        """SELECT o.id, o.quantity, o.due_date, COALESCE(d.title, o.title) AS deal_title, c.name AS client_name
-           FROM production_orders o LEFT JOIN deals d ON d.id=o.deal_id LEFT JOIN clients c ON c.id=COALESCE(d.client_id, o.client_id)
-           WHERE o.status IN ('planned','in_progress') ORDER BY o.due_date IS NULL, o.due_date LIMIT 12"""
-    ).fetchall():
-        c = db.execute(
-            "SELECT COUNT(*) t, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) d, (SELECT operation_name FROM production_operations WHERE production_order_id=? ORDER BY step_order LIMIT 1) n FROM production_operations WHERE production_order_id=?",
-            (o["id"], o["id"])).fetchone()
-        total, done = c["t"] or 0, c["d"] or 0
-        late = bool(o["due_date"] and o["due_date"] < today)
-        title = o["deal_title"] or "без угоди"
-        orders.append({"id": o["id"], "title": title, "client": o["client_name"], "qty": o["quantity"], "done": done, "total": total,
-                       "pct": int(done * 100 / total) if total else 0, "due": o["due_date"], "late": late})
-    late_orders = sum(1 for o in orders if o["late"])
-    if late_orders:
-        alerts.append({"kind": "warn", "text": f"⏰ Прострочені виробничі замовлення: {late_orders}"})
-
-    low_stock = db.execute("SELECT COUNT(*) c FROM warehouse_items WHERE qty_on_hand <= min_qty").fetchone()["c"]
-    overdue_tasks = db.execute(
-        "SELECT COUNT(*) c FROM tasks WHERE done=0 AND due_date IS NOT NULL AND due_date < ?", (today,)).fetchone()["c"]
-    activity = [dict(a) for a in db.execute(
-        "SELECT label, username, at FROM audit_log WHERE label IS NOT NULL AND label != '' ORDER BY id DESC LIMIT 8").fetchall()]
-
-    return render_template(
-        "boss.html", now=now.strftime("%H:%M"), alerts=alerts,
-        open_deals=len(open_rows), open_amount=open_amount, won_month=len(won_rows), won_month_amount=won_amount,
-        pending_amount=pending_amount, overdue_pay_count=len(late_pay), overdue_pay_amount=overdue_pay_amount,
-        shift_made=int(sh["m"]), shift_scrap=int(sh["s"]), shift_hours=round(sh["h"] or 0, 1),
-        machines=machines, orders=orders, low_stock=low_stock, overdue_tasks=overdue_tasks, activity=activity)
-
-
 @app.route("/manifest.webmanifest")
 def pwa_manifest():
     data = {
-        "name": "Оснастка-Маркет", "short_name": "Шеф", "start_url": "/boss", "scope": "/",
+        "name": "Оснастка-Маркет", "short_name": "Оснастка", "start_url": "/", "scope": "/",
         "display": "standalone", "background_color": "#15171b", "theme_color": "#15171b",
         "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
                   {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}],
@@ -10188,7 +10030,7 @@ def settings_page():
                             network_qr_svg=make_qr_svg(network_url),
                             tunnel_status=_tunnel_status(),
                             public_url_for_boss=_public_url(db),
-                            public_qr_svg=make_qr_svg((_public_url(db) or "") + "/boss") if _public_url(db) else None)
+                            public_qr_svg=make_qr_svg(_public_url(db)) if _public_url(db) else None)
 
 
 @app.route("/settings/custom-fields", methods=["GET", "POST"])

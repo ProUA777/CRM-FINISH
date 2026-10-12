@@ -59,7 +59,32 @@ CREATE TABLE IF NOT EXISTS order_items (
     production_order_id INTEGER,
     FOREIGN KEY(order_id) REFERENCES orders(id)
 );
+
+CREATE TABLE IF NOT EXISTS stock_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    warehouse_item_id INTEGER,
+    name TEXT NOT NULL,
+    unit TEXT,
+    qty REAL NOT NULL DEFAULT 0,
+    note TEXT,
+    status TEXT NOT NULL DEFAULT 'to_buy',
+    supplier_note TEXT,
+    price REAL,
+    ttn TEXT,
+    np_status TEXT,
+    np_status_code INTEGER,
+    np_checked_at TEXT,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    received_at TEXT
+);
 """
+
+# Нові колонки для вже існуючих баз (ціни, умови замовлення)
+ORDERS_MIGRATIONS = {
+    "orders": [("contact_person", "TEXT"), ("payment_terms", "TEXT"), ("delivery", "TEXT")],
+    "order_items": [("price", "REAL"), ("currency", "TEXT DEFAULT 'UAH'"), ("purchase_cost", "REAL")],
+}
 
 # Стан заготовки по позиції
 BLANK_STATUSES = {
@@ -88,7 +113,23 @@ def register(A):
     A.DEFAULT_PASSWORDS.setdefault("tehnolog", "tehnolog123")
     A.DEFAULT_PASSWORDS.setdefault("postach", "postach123")
 
-    VIEW_ROLES = ("sales", "warehouse", "technologist", "purchaser", "production", "viewer")
+    VIEW_ROLES = ("sales", "warehouse", "technologist", "purchaser", "production", "viewer", "accountant")
+    MONEY_ROLES = ("admin", "sales", "purchaser", "accountant")
+
+    original_migrate = A.migrate_schema
+
+    def migrate_with_orders(db):
+        original_migrate(db)
+        for table, cols in ORDERS_MIGRATIONS.items():
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                continue
+            have = {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, ddl in cols:
+                if name not in have:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        db.commit()
+
+    A.migrate_schema = migrate_with_orders
 
     # ------------------------------------------------------------------ helpers
     def role():
@@ -158,13 +199,15 @@ def register(A):
 
     A.np_track = np_track
 
-    def refresh_np(db, items, force=False):
-        """Оновлює статуси ТТН (не частіше ніж раз на 30 хв, якщо не force)."""
+    def refresh_np(db, items, force=False, table="order_items"):
+        """Оновлює статуси ТТН (не частіше ніж раз на 30 хв, якщо не force).
+        table: order_items (заготовки під замовлення) або stock_requests (матеріали складу)."""
+        status_col = "blank_status" if table == "order_items" else "status"
         api_key = A.get_setting(db, "np_api_key", "")
         now = datetime.datetime.now()
         todo = []
         for it in items:
-            if not it["ttn"] or it["blank_status"] not in ("ordered", "shipped"):
+            if not it["ttn"] or it[status_col] not in ("ordered", "shipped"):
                 continue
             if not force and it["np_checked_at"]:
                 try:
@@ -183,17 +226,19 @@ def register(A):
             return f"Нова Пошта: {e}"
         for it in todo:
             code, text = statuses.get(it["ttn"], (None, ""))
-            new_blank = it["blank_status"]
-            if code in NP_RECEIVED_CODES:
-                new_blank = "received"
-            elif it["blank_status"] == "ordered":
-                new_blank = "shipped"
+            cur = it[status_col]
+            new = "shipped" if cur == "ordered" else cur
+            what = (f"Заготовка для {it['code'] or it['name']}" if table == "order_items" else f"Матеріал «{it['name']}»")
             if code in NP_ARRIVED_CODES and it["np_status_code"] not in NP_ARRIVED_CODES:
-                A.notify_all(f"📦 Заготовка для {it['code'] or it['name']} прибула у відділення НП (ТТН {it['ttn']}). Заберіть!")
-            if new_blank == "received" and it["blank_status"] != "received":
-                A.notify_all(f"✅ Заготовку для {it['code'] or it['name']} отримано (ТТН {it['ttn']}).")
-            db.execute("""UPDATE order_items SET np_status=?, np_status_code=?, np_checked_at=?, blank_status=?
-                          WHERE id=?""", (text or None, code, A.now_iso(), new_blank, it["id"]))
+                A.notify_all(f"📦 {what} прибула у відділення НП (ТТН {it['ttn']}). Заберіть!")
+            if code in NP_RECEIVED_CODES and table == "order_items":
+                # заготовку під замовлення вважаємо отриманою; матеріал складу -
+                # лише після «Отримано на склад» (тоді він і додається до залишку)
+                new = "received"
+                if cur != "received":
+                    A.notify_all(f"✅ {what} отримано (ТТН {it['ttn']}).")
+            db.execute(f"UPDATE {table} SET np_status=?, np_status_code=?, np_checked_at=?, {status_col}=? WHERE id=?",
+                       (text or None, code, A.now_iso(), new, it["id"]))
         db.commit()
         return None
 
@@ -245,6 +290,7 @@ def register(A):
             d["progress"] = item_progress(db, it)
             d["due_text"] = due_text(it)
             d["overdue"] = bool(it["due_date"] and it["due_date"] < today and d["stage_key"] != "done")
+            d["line_sum"] = round(it["price"] * it["quantity"], 2) if it["price"] is not None else None
             out.append(d)
         return out
 
@@ -282,6 +328,7 @@ def register(A):
                                    "AND production_order_id IS NULL AND blank_status='unchecked'").fetchone()["c"]
                 elif r == "purchaser":
                     n = db.execute("SELECT COUNT(*) c FROM order_items WHERE blank_status='to_buy'").fetchone()["c"]
+                    n += db.execute("SELECT COUNT(*) c FROM stock_requests WHERE status='to_buy'").fetchone()["c"]
                 elif r == "technologist":
                     n = db.execute("SELECT COUNT(*) c FROM order_items oi JOIN orders o ON o.id=oi.order_id "
                                    "WHERE oi.routing_id IS NULL AND oi.production_order_id IS NULL "
@@ -326,13 +373,19 @@ def register(A):
         for o in db.execute(sql, params).fetchall():
             items = enrich(db, db.execute("SELECT * FROM order_items WHERE order_id=? ORDER BY line_no", (o["id"],)).fetchall())
             dues = [i["due_date"] for i in items if i["due_date"]]
-            orders.append({"o": o, "items": items, "due": min(dues) if dues else None,
+            tot = {}
+            for i in items:
+                if i["line_sum"] is not None:
+                    tot[i["currency"] or "UAH"] = round(tot.get(i["currency"] or "UAH", 0) + i["line_sum"], 2)
+            orders.append({"o": o, "items": items, "due": min(dues) if dues else None, "totals": tot,
                            "overdue": any(i["overdue"] for i in items)})
-        return render_template("orders_list.html", active="orders", orders=orders, q=q, show=show)
+        return render_template("orders_list.html", active="orders", orders=orders, q=q, show=show,
+                               money=role() in MONEY_ROLES)
 
     def _order_form_context(db, order=None, items=None):
         clients = db.execute("SELECT id, name FROM clients ORDER BY name").fetchall()
-        return dict(active="orders", order=order, items=items or [], clients=clients, today=A.today_str())
+        return dict(active="orders", order=order, items=items or [], clients=clients, today=A.today_str(),
+                    CURRENCIES=A.CURRENCIES)
 
     def _parse_items(form):
         rows = {}
@@ -359,10 +412,14 @@ def register(A):
                     datetime.date.fromisoformat(due)
                 except ValueError:
                     raise A.ValidationError(f"Позиція «{r['name']}»: некоректна дата терміну")
+            price = num(r.get("price"), None) if (r.get("price") or "").strip() else None
+            if price is not None and price < 0:
+                raise A.ValidationError(f"Позиція «{r['name']}»: ціна не може бути від'ємною")
+            cur = r.get("currency") if r.get("currency") in A.CURRENCIES else "UAH"
             out.append({"id": int(r["id"]) if r.get("id", "").isdigit() else None, "name": r["name"][:200],
                         "drawing_no": (r.get("drawing") or "")[:100] or None, "unit": (r.get("unit") or "шт")[:10],
                         "quantity": qty, "due_date": due, "batch_delivery": 1 if r.get("batch") else 0,
-                        "code": (r.get("code") or "")[:50] or None})
+                        "code": (r.get("code") or "")[:50] or None, "price": price, "currency": cur})
         if not out:
             raise A.ValidationError("Додайте хоча б одну позицію")
         return out
@@ -383,7 +440,8 @@ def register(A):
             out.append({"id": r.get("id") or "", "name": r.get("name", ""), "drawing_no": r.get("drawing", ""),
                         "unit": r.get("unit") or "шт", "quantity": num(r.get("qty"), 0) or 0,
                         "due_date": r.get("due", ""), "batch_delivery": bool(r.get("batch")),
-                        "code": r.get("code", ""), "production_order_id": None})
+                        "code": r.get("code", ""), "production_order_id": None,
+                        "price": num(r.get("price"), None), "currency": r.get("currency") or "UAH"})
         return out
 
     def _save_order(db, order=None):
@@ -396,15 +454,18 @@ def register(A):
             raise A.ValidationError("Оберіть замовника")
         items = _parse_items(f)
         doc_date = f.get("doc_date") or A.today_str()
+        extra = tuple((f.get(k) or "").strip()[:300] or None for k in ("contact_person", "payment_terms", "delivery"))
         if order:
-            db.execute("UPDATE orders SET number=?, doc_date=?, client_id=?, notes=?, updated_at=? WHERE id=?",
-                       (number[:50], doc_date, client_id, (f.get("notes") or "").strip() or None, A.now_iso(), order["id"]))
+            db.execute("""UPDATE orders SET number=?, doc_date=?, client_id=?, notes=?, contact_person=?, payment_terms=?,
+                          delivery=?, updated_at=? WHERE id=?""",
+                       (number[:50], doc_date, client_id, (f.get("notes") or "").strip() or None) + extra
+                       + (A.now_iso(), order["id"]))
             oid = order["id"]
         else:
-            db.execute("""INSERT INTO orders (number, doc_date, client_id, notes, status, created_by, created_at)
-                          VALUES (?,?,?,?,?,?,?)""",
-                       (number[:50], doc_date, client_id, (f.get("notes") or "").strip() or None, "active",
-                        A.session.get("user_id"), A.now_iso()))
+            db.execute("""INSERT INTO orders (number, doc_date, client_id, notes, contact_person, payment_terms, delivery,
+                          status, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       (number[:50], doc_date, client_id, (f.get("notes") or "").strip() or None) + extra
+                       + ("active", A.session.get("user_id"), A.now_iso()))
             oid = db.execute("SELECT last_insert_rowid() id").fetchone()["id"]
         existing = {r["id"]: r for r in db.execute("SELECT * FROM order_items WHERE order_id=?", (oid,)).fetchall()}
         keep = set()
@@ -413,14 +474,14 @@ def register(A):
             if it["id"] and it["id"] in existing:
                 keep.add(it["id"])
                 db.execute("""UPDATE order_items SET line_no=?, name=?, drawing_no=?, unit=?, quantity=?, due_date=?,
-                              batch_delivery=?, code=? WHERE id=?""",
+                              batch_delivery=?, code=?, price=?, currency=? WHERE id=?""",
                            (line_no, it["name"], it["drawing_no"], it["unit"], it["quantity"], it["due_date"],
-                            it["batch_delivery"], code, it["id"]))
+                            it["batch_delivery"], code, it["price"], it["currency"], it["id"]))
             else:
                 db.execute("""INSERT INTO order_items (order_id, line_no, name, drawing_no, unit, quantity, due_date,
-                              batch_delivery, code) VALUES (?,?,?,?,?,?,?,?,?)""",
+                              batch_delivery, code, price, currency) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                            (oid, line_no, it["name"], it["drawing_no"], it["unit"], it["quantity"], it["due_date"],
-                            it["batch_delivery"], code))
+                            it["batch_delivery"], code, it["price"], it["currency"]))
         for iid, row in existing.items():
             if iid not in keep:
                 if row["production_order_id"]:
@@ -506,8 +567,14 @@ def register(A):
         items = enrich(db, raw)
         routings = db.execute("SELECT id, name, drawing_no FROM routing_templates ORDER BY name").fetchall()
         purchaser_ready = bool(A.get_setting(db, "purchaser_chat_id", "") and A.get_setting(db, "telegram_bot_token", ""))
+        totals = {}
+        for i in items:
+            if i["line_sum"] is not None:
+                totals[i["currency"] or "UAH"] = round(totals.get(i["currency"] or "UAH", 0) + i["line_sum"], 2)
+        purchase_total = round(sum(i["purchase_cost"] or 0 for i in items), 2)
         return render_template("order_detail.html", active="orders", order=order, items=items, routings=routings,
-                               r=role(), purchaser_ready=purchaser_ready)
+                               r=role(), purchaser_ready=purchaser_ready, money=role() in MONEY_ROLES,
+                               totals=totals, purchase_total=purchase_total)
 
     def _item(db, item_id):
         it = db.execute("""SELECT oi.*, o.number, o.client_id, c.name AS client_name FROM order_items oi
@@ -571,6 +638,13 @@ def register(A):
         if not back.startswith("/") or back.startswith("//"):
             back = url_for("procurement_list")
         supplier = (request.form.get("supplier_note") or "").strip()[:300] or it["supplier_note"]
+        cost_raw = (request.form.get("purchase_cost") or "").strip()
+        cost = num(cost_raw, None) if cost_raw else it["purchase_cost"]
+        if cost is not None and cost < 0:
+            flash("Сума закупівлі не може бути від'ємною", "error")
+            return redirect(back)
+        if action in ("ttn", "received"):
+            db.execute("UPDATE order_items SET purchase_cost=? WHERE id=?", (cost, item_id))
         if action == "ttn":
             ttn = "".join(ch for ch in (request.form.get("ttn") or "") if ch.isdigit())
             if ttn and not 10 <= len(ttn) <= 20:
@@ -597,32 +671,136 @@ def register(A):
             abort(400)
         return redirect(back)
 
+    # -------------------------------------------------- заявки складу (матеріали) для постачальника
+    def create_stock_requests(db, lines):
+        """lines: [(warehouse_item_row, qty)] -> записи в «Закупівлі» постачальника
+        і повідомлення йому в Telegram. Повертає (кількість, ok, msg)."""
+        ids = []
+        for it, qty in lines:
+            db.execute("""INSERT INTO stock_requests (warehouse_item_id, name, unit, qty, note, status, price,
+                          created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                       (it["id"], it["name"], it["unit"], qty, f"Залишок {it['qty_on_hand']:g}, мін. {it['min_qty']:g}",
+                        "to_buy", None, A.session.get("user_id"), A.now_iso()))
+            ids.append(db.execute("SELECT last_insert_rowid() id").fetchone()["id"])
+        db.commit()
+        text = ("🛒 Заявка складу на закупівлю:\n" + "\n".join(f"• {it['name']} — {qty:g} {it['unit']}" for it, qty in lines)
+                + f"\nПісля закупівлі впишіть ТТН і ціну: {base_url(db)}/procurement")
+        chat = A.get_setting(db, "purchaser_chat_id", "")
+        if chat:
+            ok, msg = A.send_telegram_to(chat, text)
+        else:
+            ok, msg = A.send_telegram_notification(text)
+            if not ok:
+                msg = "канали сповіщень не налаштовані (Налаштування → «Закупівля заготовок і Нова Пошта»)"
+        return len(ids), ok, msg
+
+    A.create_stock_requests = create_stock_requests
+
+    def _stock_req(db, req_id):
+        r = db.execute("SELECT * FROM stock_requests WHERE id=?", (req_id,)).fetchone()
+        if not r:
+            abort(404)
+        return r
+
+    @app.route("/procurement/stock/<int:req_id>", methods=["POST"])
+    @login_required
+    @role_required("purchaser", "warehouse")
+    def stock_request_update(req_id):
+        db = get_db()
+        r = _stock_req(db, req_id)
+        f = request.form
+        action = f.get("action", "ttn")
+        back = url_for("procurement_list") + f"#stock-{req_id}"
+        supplier = (f.get("supplier_note") or "").strip()[:300] or r["supplier_note"]
+        price_raw = (f.get("price") or "").strip()
+        price = num(price_raw, None) if price_raw else r["price"]
+        if price is not None and price < 0:
+            flash("Ціна не може бути від'ємною", "error")
+            return redirect(back)
+        if r["status"] == "received" and action != "refresh":
+            flash("Цю заявку вже отримано", "error")
+            return redirect(back)
+        if action == "ttn":
+            ttn = "".join(ch for ch in (f.get("ttn") or "") if ch.isdigit())
+            if ttn and not 10 <= len(ttn) <= 20:
+                flash("ТТН Нової Пошти — це 14 цифр (напр. 20450000000000)", "error")
+                return redirect(back)
+            db.execute("""UPDATE stock_requests SET ttn=?, supplier_note=?, price=?, status=?, np_checked_at=NULL
+                          WHERE id=?""", (ttn or None, supplier, price, "shipped" if ttn else "ordered", req_id))
+            db.commit()
+            if ttn:
+                err = refresh_np(db, [_stock_req(db, req_id)], force=True, table="stock_requests")
+                if err:
+                    flash(err, "error")
+            flash(f"«{r['name']}»: " + (f"ТТН {ttn} збережено" if ttn else "позначено як замовлене"), "success")
+        elif action == "received":
+            qty = num(f.get("qty_received"), None) or r["qty"]
+            if qty <= 0:
+                flash("Кількість має бути більше нуля", "error")
+                return redirect(back)
+            db.execute("""UPDATE stock_requests SET status='received', supplier_note=?, price=?, received_at=?, qty=?
+                          WHERE id=?""", (supplier, price, A.now_iso(), qty, req_id))
+            if r["warehouse_item_id"] and db.execute("SELECT 1 FROM warehouse_items WHERE id=?",
+                                                     (r["warehouse_item_id"],)).fetchone():
+                db.execute("UPDATE warehouse_items SET qty_on_hand = qty_on_hand + ? WHERE id=?", (qty, r["warehouse_item_id"]))
+                if price:
+                    db.execute("UPDATE warehouse_items SET unit_cost=? WHERE id=?", (price, r["warehouse_item_id"]))
+                db.execute("""INSERT INTO warehouse_transactions (item_id, qty_delta, type, reference, user_id, created_at)
+                              VALUES (?,?,?,?,?,?)""",
+                           (r["warehouse_item_id"], qty, "in",
+                            f"Закупівля №{req_id}" + (f", ТТН {r['ttn']}" if r["ttn"] else "") + (f", {supplier}" if supplier else ""),
+                            A.session.get("user_id"), A.now_iso()))
+            db.commit()
+            A.notify_all(f"✅ На склад надійшло: {r['name']} — {qty:g} {r['unit'] or ''}")
+            flash(f"«{r['name']}»: отримано, {qty:g} {r['unit'] or ''} додано на склад", "success")
+        elif action == "refresh":
+            err = refresh_np(db, [r], force=True, table="stock_requests")
+            flash(err or "Статус оновлено", "error" if err else "success")
+        elif action == "cancel":
+            db.execute("DELETE FROM stock_requests WHERE id=? AND status!='received'", (req_id,))
+            db.commit()
+            flash("Заявку скасовано", "success")
+        else:
+            abort(400)
+        return redirect(back)
+
     @app.route("/procurement")
     @login_required
     @role_required("purchaser", "warehouse")
     def procurement_list():
         db = get_db()
-        raw = db.execute("""SELECT oi.*, o.number, c.name AS client_name FROM order_items oi
-                            JOIN orders o ON o.id=oi.order_id LEFT JOIN clients c ON c.id=o.client_id
-                            WHERE oi.blank_status IN ('to_buy','ordered','shipped')
-                               OR (oi.blank_status='received' AND oi.ttn IS NOT NULL
-                                   AND oi.production_order_id IS NULL)
-                            ORDER BY CASE oi.blank_status WHEN 'to_buy' THEN 0 WHEN 'ordered' THEN 1
-                                     WHEN 'shipped' THEN 2 ELSE 3 END, oi.id""").fetchall()
-        err = refresh_np(db, raw)
-        if err:
-            flash(err, "error")
-            raw_ids = [r["id"] for r in raw]
-        else:
-            raw_ids = [r["id"] for r in raw]
+        sql_items = """SELECT oi.*, o.number, c.name AS client_name FROM order_items oi
+                       JOIN orders o ON o.id=oi.order_id LEFT JOIN clients c ON c.id=o.client_id
+                       WHERE oi.blank_status IN ('to_buy','ordered','shipped')
+                          OR (oi.blank_status='received' AND oi.ttn IS NOT NULL AND oi.production_order_id IS NULL)
+                       ORDER BY CASE oi.blank_status WHEN 'to_buy' THEN 0 WHEN 'ordered' THEN 1
+                                WHEN 'shipped' THEN 2 ELSE 3 END, oi.id"""
+        week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        sql_stock = """SELECT sr.*, w.qty_on_hand, w.min_qty, w.sku FROM stock_requests sr
+                       LEFT JOIN warehouse_items w ON w.id=sr.warehouse_item_id
+                       WHERE sr.status!='received' OR sr.received_at>=?
+                       ORDER BY CASE sr.status WHEN 'to_buy' THEN 0 WHEN 'ordered' THEN 1 WHEN 'shipped' THEN 2 ELSE 3 END, sr.id"""
+        errs = [refresh_np(db, db.execute(sql_items).fetchall()),
+                refresh_np(db, db.execute(sql_stock, (week_ago,)).fetchall(), table="stock_requests")]
+        for e in {e for e in errs if e}:
+            flash(e, "error")
         rows = []
-        for iid in raw_ids:
-            it = _item(db, iid)
+        for it in db.execute(sql_items).fetchall():
             d = dict(it)
             d["blank_label"], d["blank_color"] = BLANK_STATUSES.get(it["blank_status"], (it["blank_status"], "#9aa1ad"))
             d["due_text"] = due_text(it)
             rows.append(d)
-        return render_template("procurement.html", active="procurement", rows=rows,
+        stock = []
+        for it in db.execute(sql_stock, (week_ago,)).fetchall():
+            d = dict(it)
+            d["label"], d["color"] = BLANK_STATUSES.get(it["status"], (it["status"], "#9aa1ad"))
+            if it["status"] == "to_buy":
+                d["label"] = "Треба купити"
+            elif it["status"] == "received":
+                d["label"] = "Отримано на склад"
+            d["sum"] = round(it["price"] * it["qty"], 2) if it["price"] is not None else None
+            stock.append(d)
+        return render_template("procurement.html", active="procurement", rows=rows, stock=stock,
                                np_ready=bool(A.get_setting(db, "np_api_key", "")))
 
     # -------------------------------------------------- технолог: техпроцес
@@ -917,9 +1095,12 @@ def register(A):
         rows = [(i["code"] or "", f"{i['name']} {i['drawing_no'] or ''}".strip(), f"{i['quantity']:g} {i['unit']}",
                  i["blank_note"] or "", due_text(i), BLANK_STATUSES[i["blank_status"]][0] if i["blank_status"] in BLANK_STATUSES else "")
                 for i in items]
-        return _pdf_table("ЗАЯВКА НА ЗАКУПІВЛЮ ЗАГОТОВОК",
+        for r in db.execute("SELECT * FROM stock_requests WHERE status IN ('to_buy','ordered') ORDER BY id").fetchall():
+            rows.append(("Склад", r["name"], f"{r['qty']:g} {r['unit'] or ''}", r["note"] or "", "—",
+                         "Треба купити" if r["status"] == "to_buy" else "Замовлено"))
+        return _pdf_table("ЗАЯВКА НА ЗАКУПІВЛЮ",
                           [f"Дата: {datetime.date.today().strftime('%d.%m.%Y')}", f"Позицій: {len(rows)}"],
-                          ["Шифр", "Деталь", "Деталей", "Що купити (заготовка)", "Термін", "Стан"], rows,
+                          ["Шифр", "Деталь / матеріал", "К-сть", "Що купити / примітка", "Термін", "Стан"], rows,
                           [16, 34, 82, 100, 160, 178],
                           footer_lines=["Склав (склад): ____________________", "Прийняв (постачальник): ____________________"])
 

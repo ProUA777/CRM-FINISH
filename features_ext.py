@@ -401,7 +401,7 @@ def register(A):
 
     @app.route("/warehouse/purchase")
     @login_required
-    @role_required("warehouse", "production", "viewer")
+    @role_required("warehouse", "production", "viewer", "purchaser")
     def purchase_request():
         return render_template("purchase.html", active="warehouse", items=low_stock_items(get_db()))
 
@@ -447,6 +447,12 @@ def register(A):
         lines = _chosen_lines(db)
         if not lines:
             flash("Оберіть хоча б одну позицію з кількістю більше нуля", "error")
+            return redirect(url_for("purchase_request"))
+        if hasattr(A, "create_stock_requests"):
+            # заявка йде постачальнику: у Telegram і в його розділ «Закупівля»
+            n, ok, msg = A.create_stock_requests(db, lines)
+            flash(f"Заявку ({n} поз.) передано постачальнику в розділ «Закупівля»" + ("" if ok else f"; Telegram: {msg}"),
+                  "success" if ok else "error")
             return redirect(url_for("purchase_request"))
         text = "🛒 Заявка на закупівлю:\n" + "\n".join(
             f"• {it['name']} — {qty:g} {it['unit']}" for it, qty in lines)
