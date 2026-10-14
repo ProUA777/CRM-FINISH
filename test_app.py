@@ -5559,3 +5559,87 @@ def test_orders_migration_adds_columns_to_old_db(client):
     cols = {r[1] for r in con.execute("PRAGMA table_info(order_items)")}
     assert {"price", "currency", "purchase_cost"} <= cols
     assert "payment_terms" in {r[1] for r in con.execute("PRAGMA table_info(orders)")}
+
+
+def test_ai_calc_retries_and_fallback_models(client, monkeypatch):
+    m = client._app_module
+    import requests as _rq
+    from unittest import mock
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    good = {"content": [{"type": "tool_use", "id": "t1", "name": "cost_estimate", "input": {
+        "weight_kg": 1, "material_price_per_kg": 60, "turning_hours": 0.2, "turning_rate_per_hour": 800,
+        "milling_hours": 0, "milling_rate_per_hour": 900, "machine_hours": 0, "machine_rate_per_hour": 0,
+        "quantity": 1, "margin_pct": 20, "operations_description": "Опис."}}]}
+    calls = []
+
+    def resp(code, body):
+        r = mock.Mock(); r.status_code = code; r.json.return_value = body; r.text = str(body); return r
+
+    seq = [resp(529, {"error": {"message": "Overloaded"}}), resp(200, good)]
+    def fake(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"]); return seq.pop(0)
+    with mock.patch("requests.post", side_effect=fake):
+        out = m.ai_estimate_cost_params("вал", "k")
+    assert out["status"] == "ok" and len(calls) == 2 and calls[0] != calls[1]
+
+    calls.clear()
+    def boom(url, headers=None, json=None, timeout=None):
+        calls.append(1); raise _rq.exceptions.Timeout()
+    with mock.patch("requests.post", side_effect=boom):
+        with pytest.raises(m.AICalcError) as e:
+            m.ai_estimate_cost_params("вал", "k")
+    assert len(calls) == 3 and "не відповів" in str(e.value)
+
+    calls.clear()
+    with mock.patch("requests.post", side_effect=lambda *a, **k: calls.append(1) or resp(401, {})):
+        with pytest.raises(m.AICalcError) as e:
+            m.ai_estimate_cost_params("вал", "k")
+    assert len(calls) == 1 and "API-ключ" in str(e.value)
+
+    with mock.patch("requests.post", side_effect=lambda *a, **k: resp(400, {"error": {"message": "Your credit balance is too low"}})):
+        with pytest.raises(m.AICalcError) as e:
+            m.ai_estimate_cost_params("вал", "k")
+    assert "закінчились кошти" in str(e.value)
+
+
+def test_purchase_request_add_any_item_and_new(client, monkeypatch):
+    m = client._app_module
+    tg = []
+    monkeypatch.setattr(m, "send_telegram_to", lambda chat, t: tg.append(t) or (True, "OK"))
+    login(client, "sklad", "sklad123")
+    db = _raw_db(client)
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('purchaser_chat_id', '9')"); db.commit()
+    ok_item = db.execute("SELECT * FROM warehouse_items WHERE qty_on_hand > min_qty ORDER BY id LIMIT 1").fetchone()
+    t = client.get("/warehouse/purchase").get_data(as_text=True)
+    assert "Додати позицію в заявку" in t and ok_item["name"] in t
+    post(client, "/warehouse/purchase/add", {"item_id": ok_item["id"], "qty": "7", "note": "про запас"})
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Коло Ст45 Ø60", "unit": "м", "qty": "3"})
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "", "qty": "3"})
+    post(client, "/warehouse/purchase/add", {"item_id": ok_item["id"], "qty": "0"})
+    rows = _raw_db(client).execute("SELECT * FROM stock_requests ORDER BY id").fetchall()
+    assert [(r["name"], r["qty"], r["unit"]) for r in rows] == [(ok_item["name"], 7, ok_item["unit"]), ("Коло Ст45 Ø60", 3, "м")]
+    assert rows[1]["warehouse_item_id"] is None and len(tg) == 2 and "Коло Ст45" in tg[1]
+    t = client.get("/warehouse/purchase").get_data(as_text=True)
+    assert "Уже передано постачальнику" in t and "Коло Ст45 Ø60" in t
+    client.get("/logout")
+    login(client, "postach", "postach123")
+    assert "Коло Ст45 Ø60" in client.get("/procurement").get_data(as_text=True)
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Хак", "qty": "1"})
+    assert _raw_db(client).execute("SELECT COUNT(*) FROM stock_requests WHERE name='Хак'").fetchone()[0] == 0
+    # нова позиція без складу: «отримано» не ламається
+    rid = rows[1]["id"]
+    post(client, f"/procurement/stock/{rid}", {"action": "received", "qty_received": "3"})
+    assert _raw_db(client).execute("SELECT status FROM stock_requests WHERE id=?", (rid,)).fetchone()[0] == "received"
+
+
+def test_ai_ping_button(client):
+    from unittest import mock
+    login(client)
+    r200 = mock.Mock(status_code=200)
+    with mock.patch("requests.post", return_value=r200):
+        r = post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-x", "test": "1"}, follow_redirects=True)
+    assert "ШІ на зв" in r.get_data(as_text=True)
+    r401 = mock.Mock(status_code=401); r401.json.return_value = {}; r401.text = ""
+    with mock.patch("requests.post", return_value=r401):
+        r = post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-x", "test": "1"}, follow_redirects=True)
+    assert "Невірний API-ключ" in r.get_data(as_text=True)

@@ -77,7 +77,33 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 {% if current_user['role'] in ('admin','warehouse','production') %}<div style="padding:12px;display:flex;gap:8px">
 <button class="btn btn-primary" formaction="{{ url_for('purchase_export') }}">⬇ Excel</button>
 <button class="btn" formaction="{{ url_for('purchase_telegram') }}">✈ Передати постачальнику (Telegram + «Закупівля»)</button></div>{% endif %}</form>
-{% else %}<div class="card empty" style="padding:24px">Усі залишки в нормі 👍</div>{% endif %}""")
+{% else %}<div class="card empty" style="padding:24px">Усі залишки в нормі 👍</div>{% endif %}
+{% if current_user['role'] in ('admin','warehouse','production') %}
+<div class="card" style="padding:16px;margin-top:16px" id="purchase-add">
+<div style="font-weight:700;margin-bottom:4px">+ Додати позицію в заявку</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Будь-яка позиція зі складу (навіть якщо залишок ще в нормі) або нова, якої на складі немає. Одразу йде постачальнику.</div>
+<form method="post" action="{{ url_for('purchase_add_item') }}" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<div class="field" style="grid-column:span 2"><label>Позиція зі складу</label><select name="item_id" onchange="document.getElementById('pa-new').style.display=this.value?'none':'contents'">
+<option value="">— нова позиція (вписати назву) —</option>
+{% for w in warehouse_all() %}<option value="{{ w['id'] }}">{{ w['name'] }} (є {{ '%g'|format(w['qty_on_hand']) }} {{ w['unit'] }})</option>{% endfor %}</select></div>
+<div id="pa-new" style="display:contents">
+<div class="field"><label>Назва нової позиції</label><input type="text" name="name" placeholder="напр. Коло Ст45 Ø60"></div>
+<div class="field"><label>Од.</label><input type="text" name="unit" value="шт"></div></div>
+<div class="field"><label>Кількість *</label><input type="number" step="any" min="0" name="qty" required></div>
+<div class="field" style="grid-column:span 2"><label>Примітка</label><input type="text" name="note" placeholder="розмір, марка, терміново тощо"></div>
+<div><button class="btn btn-primary">✈ Додати й передати постачальнику</button></div>
+</form></div>
+{% endif %}
+{% set pend = stock_pending() %}{% if pend %}
+<div class="card table-wrap" style="margin-top:16px"><div style="padding:12px 14px;font-weight:700">Уже передано постачальнику</div>
+<table><tr><th>Позиція</th><th>К-сть</th><th>Стан</th><th>ТТН / статус НП</th><th>Ціна</th></tr>
+{% for r in pend %}<tr><td>{{ r['name'] }}{% if r['note'] %}<br><span style="font-size:11.5px;color:var(--text-dim)">{{ r['note'] }}</span>{% endif %}</td>
+<td>{{ '%g'|format(r['qty']) }} {{ r['unit'] or '' }}</td>
+<td>{{ {'to_buy':'Треба купити','ordered':'Замовлено','shipped':'В дорозі'}.get(r['status'], r['status']) }}</td>
+<td>{{ r['ttn'] or '—' }}{% if r['np_status'] %}<br><span style="font-size:11.5px;color:var(--text-dim)">{{ r['np_status'] }}</span>{% endif %}</td>
+<td>{{ ('%.2f'|format(r['price']) ~ ' грн') if r['price'] is not none else '—' }}</td></tr>{% endfor %}</table></div>
+{% endif %}""")
 
 QUALITY_LIST = _page("Контроль якості", "Контроль якості", "Перевірки та облік браку за 30 днів", """
 <div style="display:flex;gap:12px;margin-bottom:12px"><div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">Перевірено<b>{{ checked }}</b></div>

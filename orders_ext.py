@@ -348,8 +348,21 @@ def register(A):
             except Exception:
                 return []
 
+        def warehouse_all():
+            try:
+                return get_db().execute("SELECT id, name, unit, qty_on_hand FROM warehouse_items ORDER BY name").fetchall()
+            except Exception:
+                return []
+
+        def stock_pending():
+            try:
+                return get_db().execute("""SELECT * FROM stock_requests WHERE status!='received'
+                                           ORDER BY id DESC LIMIT 50""").fetchall()
+            except Exception:
+                return []
+
         return dict(orders_attention=orders_attention, routing_library=routing_library,
-                    BLANK_STATUSES=BLANK_STATUSES)
+                    BLANK_STATUSES=BLANK_STATUSES, warehouse_all=warehouse_all, stock_pending=stock_pending)
 
     # ------------------------------------------------------------------ orders
     @app.route("/orders")
@@ -695,6 +708,41 @@ def register(A):
         return len(ids), ok, msg
 
     A.create_stock_requests = create_stock_requests
+
+    @app.route("/warehouse/purchase/add", methods=["POST"])
+    @login_required
+    @role_required("warehouse", "production")
+    def purchase_add_item():
+        """Додати в заявку постачальнику будь-яку позицію: зі складу (навіть якщо
+        залишок ще в нормі) або нову, якої на складі взагалі немає."""
+        db = get_db()
+        f = request.form
+        qty = num(f.get("qty"), None)
+        if qty is None or qty <= 0:
+            flash("Вкажіть кількість більше нуля", "error")
+            return redirect(url_for("purchase_request"))
+        note = (f.get("note") or "").strip()[:300]
+        item = None
+        if (f.get("item_id") or "").isdigit():
+            item = db.execute("SELECT * FROM warehouse_items WHERE id=?", (int(f.get("item_id")),)).fetchone()
+        name = item["name"] if item else (f.get("name") or "").strip()[:200]
+        unit = item["unit"] if item else ((f.get("unit") or "шт").strip()[:20] or "шт")
+        if not name:
+            flash("Оберіть позицію зі складу або впишіть назву нової", "error")
+            return redirect(url_for("purchase_request"))
+        if item:
+            note = note or f"Залишок {item['qty_on_hand']:g}, мін. {item['min_qty']:g}"
+        db.execute("""INSERT INTO stock_requests (warehouse_item_id, name, unit, qty, note, status, created_by, created_at)
+                      VALUES (?,?,?,?,?,'to_buy',?,?)""",
+                   (item["id"] if item else None, name, unit, qty, note or None, A.session.get("user_id"), A.now_iso()))
+        db.commit()
+        text = (f"🛒 Заявка складу на закупівлю:\n• {name} — {qty:g} {unit}" + (f" ({note})" if note else "")
+                + f"\nПісля закупівлі впишіть ТТН і ціну: {base_url(db)}/procurement")
+        chat = A.get_setting(db, "purchaser_chat_id", "")
+        ok, msg = A.send_telegram_to(chat, text) if chat else A.send_telegram_notification(text)
+        flash(f"«{name}» — {qty:g} {unit} додано в заявку постачальнику" + ("" if ok else " (Telegram не надіслано: перевірте налаштування)"),
+              "success" if ok else "error")
+        return redirect(url_for("purchase_request"))
 
     def _stock_req(db, req_id):
         r = db.execute("SELECT * FROM stock_requests WHERE id=?", (req_id,)).fetchone()

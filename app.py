@@ -2284,6 +2284,38 @@ def ai_calc_blank_check(params):
     return warnings
 
 
+AI_CALC_TIMEOUT_SECONDS = 90
+
+
+def ai_ping(api_key):
+    """Швидка перевірка перед роботою/показом: ключ, інтернет, доступна модель."""
+    if not api_key:
+        return False, "Спочатку введи API-ключ Anthropic"
+    import requests as _requests
+    last = ""
+    for model in AI_CALC_FALLBACK_MODELS:
+        try:
+            r = _requests.post("https://api.anthropic.com/v1/messages",
+                               headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                                        "content-type": "application/json"},
+                               json={"model": model, "max_tokens": 5,
+                                     "messages": [{"role": "user", "content": "ping"}]}, timeout=20)
+        except Exception as e:
+            return False, f"Немає з'єднання з Anthropic API (перевір інтернет): {e}"
+        if r.status_code == 200:
+            return True, f"✅ ШІ на зв'язку (модель {model}) — калькулятор готовий до роботи"
+        try:
+            last = r.json().get("error", {}).get("message", "") or r.text[:200]
+        except Exception:
+            last = r.text[:200]
+        if r.status_code in (401, 403):
+            return False, "Невірний API-ключ Anthropic (або ключ заблоковано)"
+        if "credit balance" in last.lower():
+            return False, "На рахунку Anthropic закінчились кошти — поповни баланс у console.anthropic.com (Billing)"
+    return False, f"Anthropic API зараз недоступний: {last}"
+AI_CALC_FALLBACK_MODELS = ["claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+
+
 def ai_estimate_cost_params(description, api_key, model="claude-sonnet-5", images=None,
                              continue_messages=None, answer=None):
     """Викликає Anthropic Messages API, щоб перетворити текстовий опис і/або
@@ -2441,39 +2473,59 @@ def _ai_calc_call_api(messages, tools, tool_choice, api_key, model, _requests, _
     прийом підтримують не всі моделі/режими, і на практиці API почав
     повертати помилку 400 "This model does not support assistant message
     prefill" - тому перейшли на tool_choice, який працює завжди.)"""
-    try:
-        resp = _requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": 3072,
-                "system": AI_CALC_SYSTEM_PROMPT,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": tool_choice,
-            },
-            timeout=45,
-        )
-    except _requests.exceptions.Timeout:
-        raise AICalcError("Anthropic API не відповів за 45 секунд — спробуй ще раз")
-    except _requests.exceptions.RequestException as e:
-        raise AICalcError(f"Не вдалось з'єднатися з Anthropic API: {e}")
-
-    if resp.status_code == 401:
-        raise AICalcError("Невірний API-ключ Anthropic — перевір його на сторінці «Налаштування»")
-    if resp.status_code == 429:
-        raise AICalcError("Перевищено ліміт запитів до Anthropic API — спробуй за хвилину")
-    if resp.status_code != 200:
+    # Надійність (після збою на показі): довший таймаут, повтор при тимчасових
+    # збоях (перевантаження 529/5xx, обрив, таймаут) і резервні моделі, якщо
+    # основна недоступна. Помилки ключа/ліміту/запиту повторювати марно.
+    models = [model] + [m for m in AI_CALC_FALLBACK_MODELS if m != model]
+    resp, last_error = None, None
+    for attempt, current in enumerate(models[:3]):
+        if attempt:
+            time.sleep(min(2 * attempt, 4))
+        try:
+            resp = _requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": current,
+                    "max_tokens": 3072,
+                    "system": AI_CALC_SYSTEM_PROMPT,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                },
+                timeout=AI_CALC_TIMEOUT_SECONDS,
+            )
+        except _requests.exceptions.Timeout:
+            last_error = f"Anthropic API не відповів за {AI_CALC_TIMEOUT_SECONDS} секунд"
+            resp = None
+            continue
+        except _requests.exceptions.RequestException as e:
+            last_error = f"Не вдалось з'єднатися з Anthropic API (перевір інтернет): {e}"
+            resp = None
+            continue
+        if resp.status_code == 200:
+            break
+        if resp.status_code in (401, 403):
+            raise AICalcError("Невірний API-ключ Anthropic (або ключ заблоковано) — перевір його на сторінці «Налаштування»")
+        if resp.status_code == 429:
+            raise AICalcError("Перевищено ліміт запитів до Anthropic API — спробуй за хвилину")
         try:
             err_msg = resp.json().get("error", {}).get("message", resp.text[:200])
         except Exception:
             err_msg = resp.text[:200]
+        if "credit balance" in (err_msg or "").lower():
+            raise AICalcError("На рахунку Anthropic закінчились кошти — поповни баланс у console.anthropic.com (Billing)")
+        model_problem = resp.status_code == 404 or (resp.status_code == 400 and "model" in (err_msg or "").lower())
+        if resp.status_code in (500, 502, 503, 504, 529) or model_problem:
+            last_error = f"Anthropic API тимчасово недоступний ({resp.status_code}): {err_msg}"
+            continue
         raise AICalcError(f"Anthropic API повернув помилку ({resp.status_code}): {err_msg}")
+    if resp is None or resp.status_code != 200:
+        raise AICalcError((last_error or "Anthropic API не відповів") + ". Спробуй ще раз за хвилину.")
 
     try:
         data = resp.json()
@@ -6355,6 +6407,7 @@ SETTINGS_HTML = """
           <input type="password" name="anthropic_api_key" value="{{ settings.get('anthropic_api_key','') }}" placeholder="sk-ant-...">
         </div>
         <button class="btn btn-sm btn-primary" type="submit">Зберегти</button>
+        <button class="btn btn-sm" type="submit" name="test" value="1">Зберегти й перевірити зв'язок з ШІ</button>
       </form>
       <form method="post" action="{{ url_for('settings_save') }}" style="margin-top:16px;"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="form" value="ai_prices">
@@ -10186,7 +10239,11 @@ def settings_save():
     elif f.get("form") == "anthropic":
         set_setting(db, "anthropic_api_key", f.get("anthropic_api_key", "").strip())
         db.commit()
-        flash("API-ключ Anthropic збережено", "success")
+        if f.get("test"):
+            ok, msg = ai_ping(get_setting(db, "anthropic_api_key", ""))
+            flash(msg, "success" if ok else "error")
+        else:
+            flash("API-ключ Anthropic збережено", "success")
     return redirect(url_for("settings_page"))
 
 
