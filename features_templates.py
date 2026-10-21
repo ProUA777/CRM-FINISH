@@ -84,14 +84,14 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Будь-яка позиція зі складу (навіть якщо залишок ще в нормі) або нова, якої на складі немає. Одразу йде постачальнику.</div>
 <form method="post" action="{{ url_for('purchase_add_item') }}" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end">
 <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-<div class="field" style="grid-column:span 2"><label>Позиція зі складу</label><select name="item_id" onchange="document.getElementById('pa-new').style.display=this.value?'none':'contents'">
+<div class="field" style="grid-column:1/-1"><label>Позиція зі складу</label><select name="item_id" onchange="document.getElementById('pa-new').style.display=this.value?'none':'contents'">
 <option value="">— нова позиція (вписати назву) —</option>
 {% for w in warehouse_all() %}<option value="{{ w['id'] }}">{{ w['name'] }} (є {{ '%g'|format(w['qty_on_hand']) }} {{ w['unit'] }})</option>{% endfor %}</select></div>
 <div id="pa-new" style="display:contents">
 <div class="field"><label>Назва нової позиції</label><input type="text" name="name" placeholder="напр. Коло Ст45 Ø60"></div>
 <div class="field"><label>Од.</label><input type="text" name="unit" value="шт"></div></div>
 <div class="field"><label>Кількість *</label><input type="number" step="any" min="0" name="qty" required></div>
-<div class="field" style="grid-column:span 2"><label>Примітка</label><input type="text" name="note" placeholder="розмір, марка, терміново тощо"></div>
+<div class="field" style="grid-column:1/-1"><label>Примітка</label><input type="text" name="note" placeholder="розмір, марка, терміново тощо"></div>
 <div><button class="btn btn-primary">✈ Додати й передати постачальнику</button></div>
 </form></div>
 {% endif %}
