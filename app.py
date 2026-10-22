@@ -866,7 +866,7 @@ def migrate_schema(db):
         "users": [("work_center_id", "INTEGER")],
         "machines": [("work_center_id", "INTEGER")],
         "work_centers": [("mtc_host", "TEXT"), ("mtc_port", "INTEGER DEFAULT 8082"),
-                         ("mtc_enabled", "INTEGER DEFAULT 0")],
+                         ("mtc_enabled", "INTEGER DEFAULT 0"), ("mtc_q_port", "INTEGER")],
     }
     for table, columns in expected_columns.items():
         table_exists = db.execute(
@@ -5240,6 +5240,7 @@ MACHINES_HTML = """
           <div class="field"><label>IP-адреса верстата</label><input type="text" name="mtc_host" value="{{ m['mtc_host'] or '' }}" placeholder="напр. 192.168.10.2" autocomplete="off"></div>
           <div class="field"><label>Порт</label><input type="text" name="mtc_port" value="{{ m['mtc_port'] or 8082 }}"></div>
         </div>
+        <div class="field"><label>Порт збору даних Haas (значення налаштування 143 на стійці)</label><input type="text" name="mtc_q_port" value="{{ m['mtc_q_port'] or 5051 }}" inputmode="numeric"></div>
         <div class="field"><label>Робочий центр (для плану й журналу)</label>
           <select name="work_center_id">
             {% if not m['work_center_id'] %}<option value="new">+ Окремий для цього верстата</option>{% endif %}
@@ -5248,7 +5249,7 @@ MACHINES_HTML = """
           </select></div>
         <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm btn-primary">Зберегти й перевірити зв'язок</button>
           {% if L.connected %}<button class="btn btn-sm btn-ghost" name="action" value="disconnect" onclick="return confirm('Відключити телеметрію?')">Відключити</button>{% endif %}</div>
-        <div style="font-size:11px;color:var(--text-dim)">Haas: порт 8082, на стійці має бути ввімкнено MTConnect. Перевірка: на ПК з CRM відкрийте http://IP:8082/current.</div>
+        <div style="font-size:11px;color:var(--text-dim)">Haas: порт 8082, на стійці має бути ввімкнено MTConnect. Перевірка: на ПК з CRM відкрийте http://IP:8082/current. Навантаження шпинделя йде через порт із налаштування 143.</div>
       </form>
     </details>
     {% endif %}
@@ -5318,7 +5319,7 @@ MACHINE_LIVE_BLOCK_HTML = """
 </div>
 {% if L.load is none and L.load_source == 'unavailable' %}
 <div class="mx-hint">
-  <div>Навантаження шпинделя Haas віддає лише через Q-команди. На стійці: <b>Settings → налаштування 143 «Machine Data Collect» = On</b>{% if is_admin %}, порт 5051 не блокувати{% endif %}.</div>
+  <div>Навантаження шпинделя Haas віддає лише через окремий порт збору даних. На стійці: <b>НАСТРОЙКИ → налаштування 143 «Сбор данных по станку»</b> — там має бути номер порту{% if is_admin %} (зараз CRM питає порт <b>{{ L.q_port }}</b>; якщо на стійці інше число, впишіть його в «Налаштувати телеметрію»){% endif %}.</div>
   {% if is_admin %}{% if L.q_error %}<div class="mx-qerr">Остання спроба: {{ L.q_error }}</div>{% endif %}
   <form method="post" action="{{ url_for('machine_qtest', machine_id=m['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm" type="submit">Перевірити зараз</button></form>{% endif %}
 </div>{% endif %}
@@ -8490,7 +8491,8 @@ def machine_live(db, m):
     t = db.execute("SELECT * FROM machine_telemetry WHERE work_center_id=?", (m["work_center_id"],)).fetchone()
     live = {"connected": True, "wc_id": m["work_center_id"], "wc_name": m["wc_name"],
             "mtc": bool(m["mtc_enabled"] and m["mtc_host"]),
-            "address": f"{m['mtc_host']}:{m['mtc_port'] or 8082}" if m["mtc_host"] else None}
+            "address": f"{m['mtc_host']}:{m['mtc_port'] or 8082}" if m["mtc_host"] else None,
+            "q_port": (m["mtc_q_port"] if "mtc_q_port" in m.keys() else None) or 5051}
     if not t:
         live.update(status="offline", label=MACHINE_STATUS_LABELS["offline"], seen="даних ще не було", demo=False)
         return live
@@ -8589,7 +8591,7 @@ def machine_live(db, m):
 
 
 def _machines_with_live(db):
-    rows = db.execute("""SELECT m.*, w.name AS wc_name, w.mtc_host, w.mtc_port, w.mtc_enabled,
+    rows = db.execute("""SELECT m.*, w.name AS wc_name, w.mtc_host, w.mtc_port, w.mtc_q_port, w.mtc_enabled,
                                 w.capacity_hours_per_day AS wc_capacity
                          FROM machines m LEFT JOIN work_centers w ON w.id=m.work_center_id
                          ORDER BY m.category, m.model""").fetchall()
@@ -8632,11 +8634,12 @@ def machine_qtest(machine_id):
     if not is_admin():
         abort(403)
     db = get_db()
-    row = db.execute("""SELECT w.mtc_host FROM machines m JOIN work_centers w ON w.id=m.work_center_id
+    row = db.execute("""SELECT w.mtc_host, w.mtc_q_port FROM machines m JOIN work_centers w ON w.id=m.work_center_id
                         WHERE m.id=?""", (machine_id,)).fetchone()
     if not row or not row["mtc_host"]:
         flash("Спершу підключіть телеметрію верстата (IP-адреса).", "error")
         return redirect(url_for("machines_list"))
+    HAAS_Q_PORTS[row["mtc_host"]] = row["mtc_q_port"] or 5051
     value = haas_q_spindle_load(row["mtc_host"], force=True)
     if value is not None:
         flash(f"Зв'язок є: навантаження шпинделя зараз {value:g}%. На картці воно з'явиться за 15 секунд.", "success")
@@ -8701,9 +8704,10 @@ def machine_connect(machine_id):
     host = (f.get("mtc_host") or "").strip()
     try:
         port = int(f.get("mtc_port") or 8082)
+        q_port = int(f.get("mtc_q_port") or 5051)
     except ValueError:
-        port = 0
-    if host and (not MTC_HOST_RE.match(host) or not 1 <= port <= 65535):
+        port = q_port = 0
+    if host and (not MTC_HOST_RE.match(host) or not 1 <= port <= 65535 or not 1 <= q_port <= 65535):
         flash("Перевірте IP-адресу (без http://) і порт", "error")
         return redirect(url_for("machines_list") + f"#machine-{machine_id}")
     if wc_choice == "new" or (not wc_choice and not m["work_center_id"]):
@@ -8718,7 +8722,11 @@ def machine_connect(machine_id):
         wc_id = m["work_center_id"]
     db.execute("UPDATE machines SET work_center_id=? WHERE id=?", (wc_id, machine_id))
     if host:
-        db.execute("UPDATE work_centers SET mtc_host=?, mtc_port=?, mtc_enabled=1 WHERE id=?", (host, port, wc_id))
+        db.execute("UPDATE work_centers SET mtc_host=?, mtc_port=?, mtc_q_port=?, mtc_enabled=1 WHERE id=?",
+                   (host, port, q_port, wc_id))
+        if HAAS_Q_PORTS.get(host) != q_port:
+            _HAAS_Q_FAIL.pop(host, None)  # порт змінили - пробуємо одразу
+        HAAS_Q_PORTS[host] = q_port
     db.commit()
     if not host:
         flash(f"«{m['model']}» прив'язано до робочого центру. Дані з'являться, коли верстат передасть телеметрію.", "success")
@@ -10857,6 +10865,7 @@ def parse_mtconnect_current(xml_text):
 
 
 _HAAS_Q_FAIL = {}   # host -> (час невдалої спроби, причина українською)
+HAAS_Q_PORTS = {}   # host -> порт збору даних (налаштування 143 на стійці), за замовчуванням 5051
 HAAS_Q_RETRY_SECONDS = 120
 
 
@@ -10865,7 +10874,7 @@ def haas_q_last_error(host):
     return v[1] if v else None
 
 
-def haas_q_spindle_load(host, port=5051, timeout=1.5, force=False):
+def haas_q_spindle_load(host, port=None, timeout=1.5, force=False):
     """Навантаження шпинделя Haas через Ethernet Q-команди: ?Q600 1098 читає
     системну змінну #1098 (навантаження шпинделя, %). MTConnect-агент Haas
     цієї величини не передає. Потрібно: на стійці налаштування 143
@@ -10873,6 +10882,7 @@ def haas_q_spindle_load(host, port=5051, timeout=1.5, force=False):
     смикаємо верстат повторно 2 хвилини, а причину видно в haas_q_last_error.
     Повертає число або None."""
     import socket
+    port = port or HAAS_Q_PORTS.get(host) or 5051
     prev = _HAAS_Q_FAIL.get(host)
     if prev and not force and time.time() - prev[0] < HAAS_Q_RETRY_SECONDS:
         return None
@@ -10895,7 +10905,8 @@ def haas_q_spindle_load(host, port=5051, timeout=1.5, force=False):
         _HAAS_Q_FAIL.pop(host, None)
         return round(value, 1)
     except ConnectionRefusedError:
-        reason = f"порт {port} закритий: на стійці вимкнено налаштування 143 (Machine Data Collect)"
+        reason = (f"порт {port} закритий: на стійці налаштування 143 вимкнене або в ньому інший порт "
+                  "(вкажіть той самий порт у CRM: «Налаштувати телеметрію»)")
     except (socket.timeout, TimeoutError):
         reason = f"порт {port} не відповідає (тайм-аут): перевірте налаштування 143 і брандмауер"
     except ValueError:
@@ -10932,10 +10943,11 @@ def poll_machines_once():
     results = {}
     with app.app_context():
         db = get_db()
-        rows = db.execute("SELECT id, mtc_host, mtc_port FROM work_centers "
+        rows = db.execute("SELECT id, mtc_host, mtc_port, mtc_q_port FROM work_centers "
                           "WHERE mtc_enabled=1 AND mtc_host IS NOT NULL AND mtc_host!=''").fetchall()
         for wc in rows:
             try:
+                HAAS_Q_PORTS[wc["mtc_host"]] = wc["mtc_q_port"] or 5051
                 data = fetch_mtconnect(wc["mtc_host"], wc["mtc_port"] or 8082)
                 data["source"] = "mtconnect"
                 record_telemetry(db, wc["id"], data)

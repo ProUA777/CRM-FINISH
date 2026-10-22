@@ -5790,7 +5790,9 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
         conn.close()
     threading.Thread(target=serve, daemon=True).start()
     m._HAAS_Q_FAIL.clear()
-    assert m.haas_q_spindle_load("127.0.0.1", port=port) == 37.5
+    m.HAAS_Q_PORTS["127.0.0.1"] = port  # порт із налаштування 143, збережений у CRM
+    assert m.haas_q_spindle_load("127.0.0.1") == 37.5
+    m.HAAS_Q_PORTS.pop("127.0.0.1")
     srv.close()
     # недоступний порт - None і пауза на 10 хв без повторних спроб
     assert m.haas_q_spindle_load("127.0.0.1", port=1, timeout=0.3) is None
@@ -5828,5 +5830,13 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
     m._HAAS_Q_FAIL["192.168.10.2"] = (0, "порт 5051 не відповідає (тайм-аут)")
     r = post(client, f"/machines/{mid}/qtest", {}, follow_redirects=True)
     assert "Навантаження не отримано: порт 5051 не відповідає" in r.get_data(as_text=True)
+    # порт збору даних (налаштування 143) задається в CRM, напр. 10001
+    assert 'name="mtc_q_port" value="5051"' in t
+    post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "mtc_q_port": "10001"})
+    assert _raw_db(client).execute("SELECT w.mtc_q_port FROM machines m JOIN work_centers w ON w.id=m.work_center_id WHERE m.id=?", (mid,)).fetchone()[0] == 10001
+    assert m.HAAS_Q_PORTS["192.168.10.2"] == 10001 and "192.168.10.2" not in m._HAAS_Q_FAIL
+    assert 'name="mtc_q_port" value="10001"' in client.get("/machines").get_data(as_text=True)
+    r = post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "mtc_q_port": "99999"}, follow_redirects=True)
+    assert "Перевірте IP-адресу" in r.get_data(as_text=True)
     login(client, "maister", "prod123")
     assert post(client, f"/machines/{mid}/qtest", {}).status_code == 403
