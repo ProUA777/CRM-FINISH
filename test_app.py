@@ -5861,3 +5861,37 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
     assert "Перевірте IP-адресу" in r.get_data(as_text=True)
     login(client, "maister", "prod123")
     assert post(client, f"/machines/{mid}/qtest", {}).status_code == 403
+
+
+def test_sidebar_links_open_for_every_role(client):
+    """У меню кожної ролі - лише розділи, які їй відкриваються (без «немає прав»)."""
+    import re as _re2
+    from werkzeug.security import generate_password_hash
+    db = _raw_db(client)
+    db.execute("INSERT INTO users (username,password_hash,full_name,role,active) VALUES ('perehliad',?,'Перегляд','viewer',1)",
+               (generate_password_hash("viewer123"),))
+    db.commit()
+    users = [("admin", "admin123"), ("oleh", "manager123"), ("tehnolog", "tehnolog123"), ("postach", "postach123"),
+             ("maister", "prod123"), ("tokar", "tokar123"), ("sklad", "sklad123"), ("servis", "servis123"),
+             ("buh", "buh12345"), ("perehliad", "viewer123")]
+    dead = {}
+    for u, p in users:
+        client.get("/logout")
+        login(client, u, p)
+        home = client.get("/").get_data(as_text=True)
+        nav = home[home.find('<nav class="nav">'):home.find("</nav>")]
+        links = _re2.findall(r'href="(/[^"]*)"', nav)
+        assert links, u
+        for link in links:
+            r = client.get(link, follow_redirects=True)
+            body = r.get_data(as_text=True)
+            if r.status_code != 200 or "немає прав" in body or "Доступно лише" in body:
+                dead.setdefault(u, []).append(link)
+    assert dead == {}
+    # «Перегляд» не бачить у меню закритих розділів
+    client.get("/logout")
+    login(client, "perehliad", "viewer123")
+    home = client.get("/").get_data(as_text=True)
+    nav = home[home.find('<nav class="nav">'):home.find("</nav>")]
+    for hidden in ("/clients", "/deals", "/calculator", '"/warehouse"', "/service", '"/production"'):
+        assert hidden not in nav, hidden

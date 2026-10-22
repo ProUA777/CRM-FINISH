@@ -3514,17 +3514,17 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
         {% if not foreman_wc_id %}
         <a href="{{ url_for('machines_list') }}" class="{{ 'active' if active=='machines' }}"><span class="icon">⬢</span> Наше обладнання</a>
         {% endif %}
-        {% if role in ('admin','production','sales','viewer','technologist') %}
+        {% if role in ('admin','production','sales','technologist') %}
         <a href="{{ url_for('production_list') }}" class="{{ 'active' if active=='production' }}"><span class="icon">⚙</span> {{ 'Моя дільниця' if foreman_wc_id else 'Виробничі замовлення' }}</a>
-        {% if not foreman_wc_id %}
+        {% endif %}
+        {% if not foreman_wc_id and role in ('admin','production','sales','viewer') %}
         <a href="{{ url_for('production_board') }}" class="{{ 'active' if active=='board' }}"><span class="icon">▦</span> Завантаження верстатів</a>
         {% endif %}
         {% if role in ('admin','production','sales') %}
         <a href="{{ url_for('work_centers_list') }}" class="{{ 'active' if active=='telemetry' }}"><span class="icon">📡</span> Верстати онлайн</a>
         {% endif %}
-        {% if not foreman_wc_id %}
+        {% if not foreman_wc_id and role in ('admin','production','sales','viewer') %}
         <a href="{{ url_for('quality_list') }}" class="{{ 'active' if active=='quality' }}"><span class="icon">✔</span> Контроль якості</a>
-        {% endif %}
         {% endif %}
         {% if role in ('admin','production') %}
         <a href="{{ url_for('shift_log_list') }}" class="{{ 'active' if active=='shift_log' }}"><span class="icon">📋</span> Змінний журнал</a>
@@ -3534,11 +3534,13 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       {% if role in ('admin','warehouse','production','viewer','service','purchaser') %}
       <details class="nav-group" data-g="stock" {{ 'open' if active in ('warehouse','purchase','service') }}>
         <summary>Склад і сервіс</summary>
-        {% if role in ('admin','warehouse','production','viewer','purchaser') %}
+        {% if role in ('admin','warehouse','production','purchaser') %}
         <a href="{{ url_for('warehouse_list') }}" class="{{ 'active' if active=='warehouse' }}"><span class="icon">▤</span> Склад</a>
+        {% endif %}
+        {% if role in ('admin','warehouse','production','viewer','purchaser') %}
         <a href="{{ url_for('purchase_request') }}" class="{{ 'active' if active=='purchase' }}"><span class="icon">🛒</span> Заявка на закупівлю</a>
         {% endif %}
-        {% if role in ('admin','service','viewer') %}
+        {% if role in ('admin','service') %}
         <a href="{{ url_for('service_list') }}" class="{{ 'active' if active=='service' }}"><span class="icon">✚</span> Рекламації та доробки</a>
         {% endif %}
       </details>
@@ -3547,10 +3549,12 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       {% if role in ('admin','sales','viewer','production') %}
       <details class="nav-group" data-g="sales" {{ 'open' if active in ('deals','calculator','clients','tasks','calendar','reorder','parts') }}>
         <summary>Клієнти й угоди</summary>
-        {% if role in ('admin','sales','viewer') %}
+        {% if role in ('admin','sales') %}
         <a href="{{ url_for('deals_board') }}" class="{{ 'active' if active=='deals' }}"><span class="icon">◧</span> Угоди</a>
         <a href="{{ url_for('cost_calculator') }}" class="{{ 'active' if active=='calculator' }}"><span class="icon">🧮</span> Калькулятор вартості</a>
         <a href="{{ url_for('clients_list') }}" class="{{ 'active' if active=='clients' }}"><span class="icon">◈</span> Клієнти</a>
+        {% endif %}
+        {% if role in ('admin','sales','viewer') %}
         <a href="{{ url_for('tasks_list') }}" class="{{ 'active' if active=='tasks' }}"><span class="icon">☑</span> Задачі</a>
         <a href="{{ url_for('calendar_view') }}" class="{{ 'active' if active=='calendar' }}"><span class="icon">📅</span> Календар</a>
         {% endif %}
