@@ -861,7 +861,7 @@ def migrate_schema(db):
                               ("notes", "TEXT"), ("created_at", "TEXT"), ("updated_at", "TEXT")],
         "machine_telemetry": [
             ("power_on_hours", "REAL"), ("motion_hours", "REAL"), ("part_count", "INTEGER"),
-            ("program_name", "TEXT"), ("mode", "TEXT"), ("source", "TEXT DEFAULT 'generic'"),
+            ("program_name", "TEXT"), ("mode", "TEXT"), ("source", "TEXT DEFAULT 'generic'"), ("extra", "TEXT"),
         ],
         "users": [("work_center_id", "INTEGER")],
         "machines": [("work_center_id", "INTEGER")],
@@ -5140,6 +5140,12 @@ MACHINES_HTML = """
 .mx-specs{font-size:12px;color:var(--text-dim);display:flex;gap:12px;flex-wrap:wrap}
 .mx-foot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 16px;border-top:1px solid var(--border)}
 .mx-prog{font-family:monospace;font-size:15px;font-weight:700}
+.mx-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px;font-size:12.5px}
+.mx-facts div{display:flex;justify-content:space-between;gap:8px;border-bottom:1px dashed var(--border);padding-bottom:3px}
+.mx-facts span{color:var(--text-dim)}
+.mx-raw{font-size:11.5px;max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px 8px;margin-top:6px}
+.mx-raw div{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid var(--border);padding:2px 0}
+.mx-raw span{color:var(--text-dim);word-break:break-all}
 </style>
 <div class="toolbar">
   <div class="mx-sum">
@@ -5167,8 +5173,11 @@ MACHINES_HTML = """
         <div><span style="font-size:11px;color:var(--text-dim)">Програма</span><div class="mx-prog" data-role="program">{{ L.program or '—' }}</div></div>
         <div style="text-align:right"><span style="font-size:11px;color:var(--text-dim)">Режим</span><div data-role="mode" style="font-weight:600">{{ L.mode or '—' }}</div></div>
       </div>
-      <div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim)"><span>Навантаження шпинделя</span><span data-role="loadtxt">{{ (L.load ~ '%') if L.load is not none else '—' }}</span></div>
+      <div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim)"><span>Навантаження шпинделя</span><span data-role="loadtxt">{{ (L.load ~ '%') if L.load is not none else ('не передається' if L.mtc and L.raw and L.status == 'running' else '—') }}</span></div>
         <div class="mx-load"><i data-role="load" style="width:{{ L.load or 0 }}%"></i></div></div>
+      {% if L.messages %}<div style="border:1px solid #e5534b;border-radius:10px;padding:8px 10px;font-size:13px;color:#e5534b" data-role="messages">{% for msg in L.messages %}<div>{{ msg }}</div>{% endfor %}</div>{% endif %}
+      {% if L.facts %}<div class="mx-facts" data-role="facts">{% for f in L.facts %}<div><span>{{ f[0] }}</span><b>{{ f[1] }}</b></div>{% endfor %}</div>{% endif %}
+      {% if L.block %}<div style="font-family:monospace;font-size:12px;color:var(--text-dim);overflow-x:auto;white-space:nowrap" title="Поточний блок програми">{{ L.block }}</div>{% endif %}
       <div class="mx-kpis">
         <div><span>Сьогодні в роботі</span><b data-role="today">{{ L.today_h if L.today_h is defined else 0 }} год</b></div>
         <div><span>За 7 днів</span><b data-role="week">{{ L.week_h if L.week_h is defined else 0 }} год</b></div>
@@ -5176,6 +5185,9 @@ MACHINES_HTML = """
       </div>
       {% if L.daily %}<div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim);margin-bottom:4px"><span>Години роботи, 14 днів</span><span>завантаження {{ L.availability }}%</span></div>
         <div class="mx-bars">{% for d in L.daily %}<i style="height:{{ d.pct }}%" title="{{ d.date }}: {{ d.hours }} год"></i>{% endfor %}</div></div>{% endif %}
+      {% if is_admin and L.raw %}<details><summary style="cursor:pointer;font-size:12px;color:var(--accent-2)">Що передає верстат ({{ L.raw|length }} значень)</summary>
+        <div class="mx-raw">{% for k, v in L.raw %}<div><span>{{ k }}</span><b>{{ v }}</b></div>{% endfor %}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Якщо потрібної величини (навантаження, деталі) немає в картці, але вона є в цьому списку, сфотографуйте список — підключимо її.</div></details>{% endif %}
       <div style="font-size:11.5px;color:var(--text-dim)">Дільниця: {{ L.wc_name }}{% if L.address %} · MTConnect {{ L.address }}{% endif %}{% if L.alarms_week %} · <span style="color:#e5534b">аварій за тиждень: {{ L.alarms_week }}</span>{% endif %}</div>
     {% else %}
       <div style="font-size:13px;color:var(--text-dim)">Підключіть верстат, і тут з'явиться: працює він чи стоїть, яка програма, навантаження шпинделя, лічильник деталей і години роботи.</div>
@@ -5237,6 +5249,8 @@ MACHINES_HTML = """
         if (L.today_h != null) set('today', L.today_h + ' год');
         if (L.week_h != null) set('week', L.week_h + ' год');
         set('parts', L.parts != null ? L.parts : '—');
+        var fb = card.querySelector('[data-role=facts]');
+        if (fb && L.facts) { fb.innerHTML = ''; L.facts.forEach(function(f){ var d=document.createElement('div'); var s=document.createElement('span'); s.textContent=f[0]; var b=document.createElement('b'); b.textContent=f[1]; d.appendChild(s); d.appendChild(b); fb.appendChild(d); }); }
       });
       ['running','idle','alarm','offline'].forEach(function(k){ var e = document.getElementById('sum-' + k); if (e) e.textContent = sum[k]; });
     }).catch(function(){});
@@ -8405,6 +8419,36 @@ def machine_live(db, m):
                 program=t["program_name"] if status != "offline" else None, mode=t["mode"],
                 load=round(t["spindle_load_pct"]) if t["spindle_load_pct"] is not None and status == "running" else None,
                 parts=t["part_count"])
+    # додаткові дані, які передає сам верстат (MTConnect): оберти, подача, інструмент...
+    ex = {}
+    try:
+        ex = json.loads(t["extra"]) if "extra" in t.keys() and t["extra"] else {}
+    except ValueError:
+        ex = {}
+    facts = []
+    if status != "offline" and ex:
+        def fmt(v, unit=""):
+            return (f"{v:g}" if isinstance(v, (int, float)) else str(v)) + unit
+        if ex.get("rpm") is not None:
+            facts.append(["Оберти шпинделя", fmt(round(ex["rpm"]), " об/хв")])
+        if ex.get("feed") is not None:
+            facts.append(["Подача", fmt(round(ex["feed"]), " мм/хв")])
+        if ex.get("tool"):
+            facts.append(["Інструмент", "T" + str(ex["tool"]).lstrip("Tt")])
+        if ex.get("feed_ovr") is not None:
+            facts.append(["Корекція подачі", fmt(round(ex["feed_ovr"]), "%")])
+        if ex.get("spindle_ovr") is not None:
+            facts.append(["Корекція обертів", fmt(round(ex["spindle_ovr"]), "%")])
+        if ex.get("rapid_ovr") is not None:
+            facts.append(["Прискорені ходи", fmt(round(ex["rapid_ovr"]), "%")])
+        if ex.get("line"):
+            facts.append(["Рядок програми", str(ex["line"])])
+        if ex.get("door"):
+            facts.append(["Двері", {"OPEN": "відчинені", "CLOSED": "зачинені"}.get(str(ex["door"]).upper(), str(ex["door"]))])
+        if (ex.get("estop") or "").upper() == "TRIGGERED":
+            facts.append(["Аварійна кнопка", "НАТИСНУТА"])
+    live.update(facts=facts, messages=(ex.get("messages") or []) if status != "offline" else [],
+                raw=ex.get("raw") or [], block=ex.get("block") if status != "offline" else None)
     stats = get_machine_runtime_stats(db, m["work_center_id"], m["wc_capacity"] or 8)
     if stats:
         mx = max([d["hours"] for d in stats["daily"]] + [1])
@@ -8440,7 +8484,12 @@ def machines_list():
 def machines_live_json():
     """Для автооновлення сторінки «Наше обладнання» без перезавантаження."""
     db = get_db()
-    return jsonify({str(c["m"]["id"]): c["live"] for c in _machines_with_live(db)})
+    out = {}
+    for c in _machines_with_live(db):
+        live = dict(c["live"])
+        live.pop("raw", None)  # повний перелік показуємо лише на сторінці адміну
+        out[str(c["m"]["id"])] = live
+    return jsonify(out)
 
 
 @app.route("/machines/<int:machine_id>/connect", methods=["POST"])
@@ -10429,6 +10478,9 @@ def record_telemetry(db, work_center_id, data):
            motion_hours, power_on_hours, part_count, recorded_at) VALUES (?,?,?,?,?,?,?)""",
         (work_center_id, status, spindle_load, motion_hours, power_on_hours, part_count, now_iso()),
     )
+    if "extra" in data:
+        db.execute("UPDATE machine_telemetry SET extra=? WHERE work_center_id=?",
+                   (json.dumps(data["extra"], ensure_ascii=False)[:20000] if data["extra"] else None, work_center_id))
     db.commit()
     # Сповіщаємо лише про ЗМІНУ стану: раніше аварія слала повідомлення при
     # кожному опитуванні (кожні кілька секунд), що засмічувало Telegram.
@@ -10452,8 +10504,19 @@ def _xml_local(tag):
     return tag.split("}")[-1] if "}" in tag else tag
 
 
+def _mtc_num(text):
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_mtconnect_current(xml_text):
-    """Розбирає відповідь MTConnect /current незалежно від версії/namespace.
+    """Розбирає відповідь MTConnect /current незалежно від версії/namespace й
+    виробника. Різні стійки (Haas, Fanuc, Mazak) називають ті самі величини
+    по-різному, тому шукаємо за типом елемента, компонентом (шпиндель/вісь/
+    траєкторія) і назвою. Усе прочитане також повертається в "extra" -
+    щоб на картці верстата було видно, що саме він передає.
     Повертає словник для record_telemetry (без source)."""
     import xml.etree.ElementTree as ET
     root = ET.fromstring(xml_text)
@@ -10461,43 +10524,103 @@ def parse_mtconnect_current(xml_text):
     part_count = spindle_load = None
     fault = False
     found = 0
-    for el in root.iter():
-        tag = _xml_local(el.tag)
-        text = (el.text or "").strip()
-        if text.upper() in ("UNAVAILABLE", ""):
-            text_val = None
-        else:
-            text_val = text
-        ident = ((el.get("name") or "") + " " + (el.get("dataItemId") or "")).lower()
-        if tag == "Execution":
-            execution = text_val or execution
-            found += 1
-        elif tag == "ControllerMode":
-            mode = text_val or mode
-            found += 1
-        elif tag == "Program":
-            program = text_val or program
-            found += 1
-        elif tag in ("PartCount", "PartCountAct"):
-            if text_val is not None:
-                try:
-                    part_count = int(float(text_val))
-                except ValueError:
-                    pass
-            found += 1
-        elif tag == "Load" and "spindle" in ident or (tag == "Load" and ident.strip().startswith("sload")):
-            if text_val is not None:
-                try:
-                    spindle_load = float(text_val)
-                except ValueError:
-                    pass
-        elif tag == "Fault":
-            fault = True
-            found += 1
+    extra = {"rpm": None, "feed": None, "feed_ovr": None, "spindle_ovr": None, "rapid_ovr": None,
+             "tool": None, "line": None, "block": None, "door": None, "estop": None, "availability": None,
+             "messages": [], "raw": []}
+    streams = [el for el in root.iter() if _xml_local(el.tag) == "ComponentStream"] or [root]
+    containers = {"Samples", "Events", "Condition", "ComponentStream", "DeviceStream", "Streams"}
+    for cs in streams:
+        comp_type = (cs.get("component") or "").lower()
+        comp_name = (cs.get("name") or cs.get("componentId") or "").strip()
+        cn = comp_name.lower()
+        spindle_comp = comp_type in ("rotary", "spindle") and (cn.startswith("s") or "spindle" in cn or cn in ("c1",))
+        for el in cs.iter():
+            tag = _xml_local(el.tag)
+            if tag in containers:
+                continue
+            text = (el.text or "").strip()
+            val = None if text.upper() in ("UNAVAILABLE", "") else text
+            did = (el.get("dataItemId") or "")
+            ident = ((el.get("name") or "") + " " + did).lower()
+            sub = (el.get("subType") or "").upper()
+            if tag in ("Normal", "Warning", "Fault", "Unavailable"):
+                # стан (Condition): Fault - аварія, Warning - попередження
+                if tag == "Fault":
+                    fault = True
+                    found += 1
+                if tag in ("Fault", "Warning") and (val or el.get("nativeCode")):
+                    msg = (val or "") + (f" [{el.get('nativeCode')}]" if el.get("nativeCode") else "")
+                    extra["messages"].append(("Аварія: " if tag == "Fault" else "Увага: ") + msg.strip())
+                continue
+            if len(extra["raw"]) < 150:
+                key = f"{comp_name or comp_type}/{tag}" + (f" ({did})" if did else "")
+                extra["raw"].append([key, (val if val is not None else "—")[:60]])
+            if val is None:
+                if tag == "Execution":
+                    found += 1
+                continue
+            num = _mtc_num(val)
+            spindle_ident = ("spindle" in ident or ident.strip().startswith("s") or "sload" in ident or "s1" in ident)
+            if tag == "Execution":
+                execution = val
+                found += 1
+            elif tag == "ControllerMode":
+                mode = val
+                found += 1
+            elif tag in ("Program", "ActiveProgram") and not program:
+                program = val
+                found += 1
+            elif tag in ("PartCount", "PartCountAct") or (("partcount" in ident or "part_count" in ident)
+                                                              and tag not in ("PartCountTarget",)):
+                if num is not None and "target" not in ident and sub not in ("TARGET", "REMAINING", "BAD", "REJECT"):
+                    part_count = int(num)
+                found += 1
+            elif tag in ("Load", "SpindleLoad") and (spindle_comp or (spindle_ident and "load" in ident) or tag == "SpindleLoad"):
+                if num is not None:
+                    spindle_load = num
+            elif tag in ("RotaryVelocity", "SpindleSpeed") and (spindle_comp or spindle_ident or tag == "SpindleSpeed"):
+                if sub == "OVERRIDE":
+                    extra["spindle_ovr"] = num
+                elif sub in ("PROGRAMMED", "COMMANDED"):
+                    if extra["rpm"] is None:
+                        extra["rpm"] = num
+                else:
+                    extra["rpm"] = num
+            elif tag == "RotaryVelocityOverride":
+                extra["spindle_ovr"] = num
+            elif tag == "PathFeedrate":
+                if sub == "OVERRIDE":
+                    extra["feed_ovr"] = num
+                elif sub == "RAPID":
+                    extra["rapid_ovr"] = num
+                elif sub in ("PROGRAMMED", "COMMANDED"):
+                    if extra["feed"] is None:
+                        extra["feed"] = num
+                else:
+                    extra["feed"] = num
+            elif tag == "PathFeedrateOverride":
+                if sub == "RAPID":
+                    extra["rapid_ovr"] = num
+                else:
+                    extra["feed_ovr"] = num
+            elif tag in ("ToolNumber", "ToolAssetId", "ToolId") or ("tool" in ident and tag in ("Tool", "ToolGroup")):
+                extra["tool"] = val
+            elif tag in ("LineNumber", "Line"):
+                extra["line"] = val
+            elif tag == "Block":
+                extra["block"] = val[:80]
+            elif tag == "DoorState":
+                extra["door"] = val
+            elif tag == "EmergencyStop":
+                extra["estop"] = val
+            elif tag == "Availability":
+                extra["availability"] = val
+            elif tag == "Message" and val:
+                extra["messages"].append(val[:120])
     if not found:
         raise ValueError("У відповіді немає жодного відомого MTConnect-елемента (Execution, Program, PartCount)")
     exe = (execution or "").upper()
-    if fault:
+    if fault or (extra["estop"] or "").upper() == "TRIGGERED":
         status = "alarm"
     elif exe == "ACTIVE":
         status = "running"
@@ -10505,8 +10628,9 @@ def parse_mtconnect_current(xml_text):
         status = "idle"
     else:
         status = "offline"
+    extra["messages"] = extra["messages"][:5]
     return {"status": status, "program_name": program, "mode": mode,
-            "part_count": part_count, "spindle_load_pct": spindle_load}
+            "part_count": part_count, "spindle_load_pct": spindle_load, "extra": extra}
 
 
 def fetch_mtconnect(host, port, timeout=4):

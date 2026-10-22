@@ -5643,3 +5643,61 @@ def test_ai_ping_button(client):
     with mock.patch("requests.post", return_value=r401):
         r = post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-x", "test": "1"}, follow_redirects=True)
     assert "Невірний API-ключ" in r.get_data(as_text=True)
+
+
+HAAS_LIKE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:1.3">
+ <Streams><DeviceStream name="HAAS" uuid="x">
+  <ComponentStream component="Device" name="HAAS" componentId="dev"><Events>
+   <Availability dataItemId="avail">AVAILABLE</Availability><EmergencyStop dataItemId="estop">ARMED</EmergencyStop></Events></ComponentStream>
+  <ComponentStream component="Rotary" name="S" componentId="s1"><Samples>
+   <RotaryVelocity dataItemId="S1speed" subType="ACTUAL">2847</RotaryVelocity>
+   <Load dataItemId="S1load">37.5</Load></Samples>
+   <Events><RotaryVelocityOverride dataItemId="Sovr">100</RotaryVelocityOverride></Events></ComponentStream>
+  <ComponentStream component="Rotary" name="C" componentId="c"><Samples><Load dataItemId="Cload">5</Load></Samples></ComponentStream>
+  <ComponentStream component="Linear" name="X" componentId="x"><Samples><Load dataItemId="Xload">12</Load></Samples></ComponentStream>
+  <ComponentStream component="Path" name="path" componentId="p1">
+   <Samples><PathFeedrate dataItemId="Fact" subType="ACTUAL">1200</PathFeedrate></Samples>
+   <Events><Execution dataItemId="exec">ACTIVE</Execution><ControllerMode dataItemId="mode">AUTOMATIC</ControllerMode>
+    <Program dataItemId="pgm">TEST_4.nc</Program><PartCount dataItemId="PartCountAct">991</PartCount>
+    <ToolNumber dataItemId="tool">5</ToolNumber><Line dataItemId="line">N120</Line>
+    <PathFeedrateOverride dataItemId="Fovr" subType="PROGRAMMED">90</PathFeedrateOverride>
+    <Block dataItemId="block">G01 X10. Y20. F1200</Block></Events>
+   <Condition><Warning dataItemId="logic" nativeCode="1021" type="LOGIC_PROGRAM">Low coolant</Warning></Condition>
+  </ComponentStream>
+  <ComponentStream component="Door" name="door" componentId="d"><Events><DoorState dataItemId="door">CLOSED</DoorState></Events></ComponentStream>
+ </DeviceStream></Streams></MTConnectStreams>"""
+
+
+def test_mtconnect_parser_reads_haas_like_spindle_parts_and_extras(client):
+    m = client._app_module
+    d = m.parse_mtconnect_current(HAAS_LIKE_XML)
+    assert d["status"] == "running" and d["program_name"] == "TEST_4.nc" and d["mode"] == "AUTOMATIC"
+    assert d["spindle_load_pct"] == 37.5 and d["part_count"] == 991  # не навантаження осі C/X
+    ex = d["extra"]
+    assert ex["rpm"] == 2847 and ex["feed"] == 1200 and ex["tool"] == "5" and ex["line"] == "N120"
+    assert ex["feed_ovr"] == 90 and ex["spindle_ovr"] == 100 and ex["door"] == "CLOSED"
+    assert any("Low coolant" in msg for msg in ex["messages"]) and len(ex["raw"]) > 10
+    # аварійна кнопка = аварія
+    d2 = m.parse_mtconnect_current(HAAS_LIKE_XML.replace(">ARMED<", ">TRIGGERED<"))
+    assert d2["status"] == "alarm"
+    # ім'я компонента шпинделя може бути інакшим: шукаємо за назвою
+    alt = HAAS_LIKE_XML.replace('component="Rotary" name="S" componentId="s1"', 'component="Rotary" name="Main" componentId="m1"')
+    assert m.parse_mtconnect_current(alt)["spindle_load_pct"] == 37.5
+
+
+def test_machine_card_shows_extra_machine_data(client, monkeypatch):
+    m = client._app_module
+    monkeypatch.setattr(m, "notify_all", lambda t: None)
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    db.execute("INSERT INTO machines (category, model, in_stock) VALUES ('5-осьовий обробний центр','HAAS UMC 750',1)")
+    db.commit()
+    mid = db.execute("SELECT id FROM machines WHERE model='HAAS UMC 750'").fetchone()["id"]
+    monkeypatch.setattr(m, "fetch_mtconnect", lambda host, port, timeout=4: m.parse_mtconnect_current(HAAS_LIKE_XML))
+    post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "work_center_id": "new"})
+    t = client.get("/machines").get_data(as_text=True)
+    assert "2847 об/хв" in t and "1200 мм/хв" in t and "T5" in t and "Low coolant" in t and "38%" in t
+    assert "Що передає верстат" in t and "S1load" in t
+    live = client.get("/machines/live.json").get_json()[str(mid)]
+    assert live["parts"] == 991 and "raw" not in live and ["Оберти шпинделя", "2847 об/хв"] in live["facts"]
