@@ -863,7 +863,7 @@ def migrate_schema(db):
             ("power_on_hours", "REAL"), ("motion_hours", "REAL"), ("part_count", "INTEGER"),
             ("program_name", "TEXT"), ("mode", "TEXT"), ("source", "TEXT DEFAULT 'generic'"),
         ],
-        "users": [("work_center_id", "INTEGER"), ("ui_mode", "TEXT DEFAULT 'large'")],
+        "users": [("work_center_id", "INTEGER")],
         "machines": [("work_center_id", "INTEGER")],
         "work_centers": [("mtc_host", "TEXT"), ("mtc_port", "INTEGER DEFAULT 8082"),
                          ("mtc_enabled", "INTEGER DEFAULT 0")],
@@ -3256,16 +3256,9 @@ BASE_HTML = """
   // CSS zoom (не font-size): весь наявний CSS написаний у px, а не rem,
   // тому саме zoom коректно масштабує все пропорційно без переписування
   // стилів.
-  // Зручний режим (за замовчуванням, для старших працівників): усе крупніше -
-  // 120% на комп'ютері, 110% на телефоні. Власний вибір масштабу
-  // (селектор унизу меню) має пріоритет.
-  window.CRM_DEFAULT_SCALE = {{ '120' if (not current_user or (current_user['ui_mode'] or 'large') == 'large') else '100' }};
-  if (window.innerWidth <= 820 && window.CRM_DEFAULT_SCALE > 100) window.CRM_DEFAULT_SCALE = 110;
   (function(){
-    try { if (location.search.indexOf('reset_scale=1') >= 0) localStorage.removeItem('crm_ui_scale'); } catch (e) {}
-    var scale = null;
-    try { scale = localStorage.getItem('crm_ui_scale'); } catch (e) {}
-    document.documentElement.style.zoom = ((scale || window.CRM_DEFAULT_SCALE) / 100);
+    var scale = localStorage.getItem('crm_ui_scale') || '100';
+    document.documentElement.style.zoom = (scale / 100);
   })();
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -3280,7 +3273,7 @@ BASE_HTML = """
   --metal:linear-gradient(160deg,#3a3f47 0%,#23262c 45%,#2e3238 55%,#1a1c20 100%);
   --metal-light:#c7ccd1;
   --text:#e7e9ec;
-  --text-dim:#aab0ba;
+  --text-dim:#9aa0aa;
   --accent:#ff7a1a;
   --accent-2:#4fa8e0;
   --green:#3fae5c;
@@ -3366,9 +3359,6 @@ a{color:inherit;text-decoration:none;}
 .card{background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow);}
 .card-pad{padding:18px 20px;}
 .grid{display:grid; gap:18px;}
-.grid > *{min-width:0;}
-/* широкий вміст (таблиці, графіки) прокручується всередині своєї картки, а не розсуває всю сторінку */
-.content .card{max-width:100%; overflow-x:auto;}
 .grid-4{grid-template-columns:repeat(4,1fr);}
 .grid-3{grid-template-columns:repeat(3,1fr);}
 .grid-2{grid-template-columns:2fr 1fr;}
@@ -3492,25 +3482,9 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
 .filters select,.filters input{width:auto; min-width:140px;}
 ::-webkit-scrollbar{height:8px; width:8px;}
 ::-webkit-scrollbar-thumb{background:#3a3f47; border-radius:4px;}
-
-/* ---- Зручний режим: читабельність для старших працівників ---- */
-body.ui-large{line-height:1.5;}
-body.ui-large{--text-dim:#c0c6cf;}
-body.ui-large [style*="font-size:10px"],body.ui-large [style*="font-size:10.5px"],
-body.ui-large [style*="font-size:11px"],body.ui-large [style*="font-size:11.5px"]{font-size:12.5px !important;}
-body.ui-large .btn{min-height:40px;}
-body.ui-large .btn-sm{min-height:34px; font-size:13px; padding:6px 12px;}
-body.ui-large input[type=checkbox],body.ui-large input[type=radio]{width:20px !important; height:20px; accent-color:var(--accent);}
-body.ui-large .nav-group > summary{font-size:12px;}
-body.ui-large .nav a{font-size:14.5px;}
-body.ui-large .badge,body.ui-large .tag{font-size:12px;}
-body.ui-large table th{font-size:12px;}
-body.ui-large label{font-size:12.5px;}
-body.ui-large a:focus-visible,body.ui-large button:focus-visible,body.ui-large input:focus-visible,
-body.ui-large select:focus-visible,body.ui-large textarea:focus-visible{outline:3px solid var(--accent); outline-offset:2px;}
 </style>
 </head>
-<body class="{{ 'ui-large' if (not current_user or (current_user['ui_mode'] or 'large') == 'large') }}">
+<body>
 {% if current_user %}
 <div class="layout">
   <div class="nav-overlay" onclick="document.body.classList.remove('nav-open')"></div>
@@ -3622,22 +3596,19 @@ body.ui-large select:focus-visible,body.ui-large textarea:focus-visible{outline:
           <option value="90">90%</option>
           <option value="100">100%</option>
           <option value="110">110%</option>
-          <option value="120">120%</option>
           <option value="125">125%</option>
-          <option value="140">140%</option>
         </select>
       </div>
     </div>
   </aside>
   <script>
     (function(){
-      var saved = null;
-      try { saved = localStorage.getItem('crm_ui_scale'); } catch (e) {}
+      var saved = localStorage.getItem('crm_ui_scale') || '100';
       var sel = document.getElementById('ui-scale-select');
-      if (sel) sel.value = String(saved || window.CRM_DEFAULT_SCALE);
+      if (sel) sel.value = saved;
     })();
     function setUiScale(value) {
-      try { localStorage.setItem('crm_ui_scale', value); } catch (e) {}
+      localStorage.setItem('crm_ui_scale', value);
       document.documentElement.style.zoom = (value / 100);
     }
     document.addEventListener('click', function(e){
@@ -3850,7 +3821,7 @@ DASHBOARD_HTML = """
 {% endif %}
 
 <div class="section-title"><span class="accent-dot"></span> Угоди за етапами</div>
-<div class="card card-pad"><div style="overflow-x:auto;"><div style="min-width:620px;">
+<div class="card card-pad">
   <div style="display:flex; align-items:flex-end; gap:6px; height:150px;">
     {% for key,label,color in STAGES %}
     {% set cnt = funnel.get(key,0) %}
@@ -3862,10 +3833,10 @@ DASHBOARD_HTML = """
   </div>
   <div style="display:flex; gap:6px; margin-top:8px;">
     {% for key,label,color in STAGES %}
-    <div style="flex:1; min-width:0; font-size:10px; color:var(--text-dim); text-align:center; line-height:1.2;">{{ label }}</div>
+    <div style="flex:1; font-size:10px; color:var(--text-dim); text-align:center; line-height:1.2;">{{ label }}</div>
     {% endfor %}
   </div>
-</div></div></div>
+</div>
 
 
 <div class="grid grid-2" style="margin-top:22px;">
@@ -6071,18 +6042,6 @@ MY_PROFILE_HTML = """
       <div class="stat">Логін<b>{{ current_user['username'] }}</b></div>
       <div class="stat">Роль<b>{{ role_title(current_user) }}</b></div>
     </div>
-    <div class="section-title"><span class="accent-dot"></span> Вигляд програми</div>
-    <form method="post" id="ui-mode-form"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="form" value="ui_mode">
-      <label style="display:flex; gap:10px; align-items:center; font-size:15px; margin-bottom:8px;">
-        <input type="radio" name="ui_mode" value="large" {{ 'checked' if (current_user['ui_mode'] or 'large')=='large' }} style="width:auto;"> Великий шрифт і кнопки (зручніше читати)
-      </label>
-      <label style="display:flex; gap:10px; align-items:center; font-size:15px; margin-bottom:12px;">
-        <input type="radio" name="ui_mode" value="normal" {{ 'checked' if current_user['ui_mode']=='normal' }} style="width:auto;"> Звичайний розмір
-      </label>
-      <button class="btn btn-primary" type="submit">Зберегти вигляд</button>
-      <p style="font-size:12.5px; color:var(--text-dim); margin-bottom:0;">Налаштування діє на всіх ваших пристроях. Тонко підібрати розмір можна селектором «Масштаб» унизу меню.</p>
-    </form>
   </div>
 </div>
 {% endblock %}
@@ -8902,13 +8861,6 @@ def my_profile():
     користувача, а змінити його потім було неможливо без прямого
     доступу до бази даних — реальна прогалина для 'чесно робочої' CRM."""
     user = get_current_user()
-    if request.method == "POST" and request.form.get("form") == "ui_mode":
-        mode = "normal" if request.form.get("ui_mode") == "normal" else "large"
-        db = get_db()
-        db.execute("UPDATE users SET ui_mode=? WHERE id=?", (mode, user["id"]))
-        db.commit()
-        flash("Вигляд збережено: " + ("великий шрифт" if mode == "large" else "звичайний розмір"), "success")
-        return redirect(url_for("my_profile", reset_scale=1))
     if request.method == "POST":
         f = request.form
         current_password = f.get("current_password", "")

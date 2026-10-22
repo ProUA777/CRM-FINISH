@@ -5643,20 +5643,3 @@ def test_ai_ping_button(client):
     with mock.patch("requests.post", return_value=r401):
         r = post(client, "/settings/save", {"form": "anthropic", "anthropic_api_key": "sk-ant-x", "test": "1"}, follow_redirects=True)
     assert "Невірний API-ключ" in r.get_data(as_text=True)
-
-
-def test_large_ui_mode_default_and_toggle(client):
-    login(client)
-    t = client.get("/").get_data(as_text=True)
-    assert 'class="ui-large"' in t and "CRM_DEFAULT_SCALE = 120" in t
-    t = client.get("/login").get_data(as_text=True)
-    r = post(client, "/my-profile", {"form": "ui_mode", "ui_mode": "normal"})
-    assert r.status_code == 302 and "reset_scale=1" in r.headers["Location"]
-    t = client.get("/").get_data(as_text=True)
-    assert 'class="ui-large"' not in t and "CRM_DEFAULT_SCALE = 100" in t
-    post(client, "/my-profile", {"form": "ui_mode", "ui_mode": "large"})
-    assert 'class="ui-large"' in client.get("/").get_data(as_text=True)
-    # пароль змінюється як і раніше
-    r = post(client, "/my-profile", {"current_password": "wrong", "new_password": "abcdef1", "confirm_password": "abcdef1"},
-             follow_redirects=True)
-    assert "невірно" in r.get_data(as_text=True)

@@ -59,7 +59,7 @@ ORDER_FORM = _page("Замовлення", "{{ 'Замовлення № ' ~ ord
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
  <div class="field"><label>№ замовлення (шифр) *</label><input type="text" name="number" required placeholder="напр. 193-6" value="{{ fv.get('number') or (order['number'] if order else '') }}"></div>
  <div class="field"><label>Дата записки</label><input type="date" name="doc_date" value="{{ fv.get('doc_date') or (order['doc_date'] if order else today) }}"></div>
- <div class="field" style="grid-column:1/-1"><label>Замовник (одержувач) *</label><select name="client_id" required><option value="">— оберіть —</option>
+ <div class="field" style="grid-column:span 2"><label>Замовник (одержувач) *</label><select name="client_id" required><option value="">— оберіть —</option>
  {% for c in clients %}<option value="{{ c['id'] }}" {{ 'selected' if (fv.get('client_id')|string)==(c['id']|string) or (order and order['client_id']==c['id']) }}>{{ c['name'] }}</option>{% endfor %}</select>
  <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Немає в списку? <a href="{{ url_for('client_new') }}" target="_blank" style="color:var(--accent-2)">Додати клієнта</a> і оновіть сторінку.</div></div>
 </div>
