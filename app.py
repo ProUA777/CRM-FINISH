@@ -1704,7 +1704,14 @@ def get_machine_runtime_stats(db, work_center_id, capacity_hours_per_day=8):
         if start_val is None and end_val is None:
             hours = 0.0
         elif start_val is None:
-            hours = 0.0  # немає даних до цього дня — не вигадуємо приріст
+            # верстат підключили цього дня: рахуємо від першого показника за день
+            first = db.execute(
+                """SELECT motion_hours FROM machine_telemetry_log
+                   WHERE work_center_id=? AND recorded_at>=? AND recorded_at<=? AND motion_hours IS NOT NULL
+                   ORDER BY recorded_at ASC LIMIT 1""",
+                (work_center_id, day_start, day_end),
+            ).fetchone()
+            hours = max(round(end_val - first["motion_hours"], 1), 0.0) if first and end_val is not None else 0.0
         else:
             hours = max(round((end_val or start_val) - start_val, 1), 0.0)
         daily.append({"date": day.strftime("%d.%m"), "hours": hours})
@@ -5132,17 +5139,60 @@ MACHINES_HTML = """
 @keyframes mxp{0%{box-shadow:0 0 0 0 rgba(255,255,255,.35)}70%{box-shadow:0 0 0 8px rgba(255,255,255,0)}100%{box-shadow:0 0 0 0 rgba(255,255,255,0)}}
 .mx-body{padding:4px 16px 14px;flex:1;display:flex;flex-direction:column;gap:10px}
 .mx-title{font-size:18px;font-weight:700;margin:0}.mx-cat{font-size:11.5px;color:var(--text-dim)}
+.mx-card{container-type:inline-size}
+.mx-cols{display:grid;grid-template-columns:1fr;gap:12px}.mx-col{display:flex;flex-direction:column;gap:12px;min-width:0}
+@container (min-width:620px){.mx-cols{grid-template-columns:1fr 1fr;gap:12px 22px}}
+@media (min-width:1180px){.mx-card.wide{grid-column:span 2}}
+.mx-lbl{font-size:11px;color:var(--text-dim);letter-spacing:.02em}
+.mx-row{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.mx-prow{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.mx-prog{font-family:ui-monospace,Consolas,monospace;font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mx-chip{font-size:11.5px;font-weight:600;padding:3px 10px;border-radius:999px;border:1px solid var(--border);white-space:nowrap;color:var(--text-dim)}
+.mx-gauges{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;text-align:center}
+.mx-g{position:relative;display:flex;flex-direction:column;align-items:center;gap:2px;--gc:#3fb27f}
+.mx-g.g-mid{--gc:#e8a33d}.mx-g.g-hi{--gc:#e5534b}.mx-g.g-rpm{--gc:#4c9be8}
+.mx-g svg{width:100%;max-width:104px;aspect-ratio:1;display:block;transform:rotate(135deg)}
+.mx-g circle{fill:none;stroke-width:9;stroke-linecap:round}
+.mx-g .trk{stroke:var(--border);stroke-dasharray:75 100}
+.mx-g .val{stroke:var(--gc);transition:stroke-dasharray .6s ease}
+.mx-g .dsk{fill:rgba(167,139,250,.10);stroke:rgba(167,139,250,.55);stroke-width:2}
+.mx-gv{position:absolute;top:0;left:0;right:0;aspect-ratio:1;max-width:104px;margin:0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}
+.mx-gv b{font-size:21px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.mx-gv small{font-size:10.5px;color:var(--text-dim);margin-top:3px}
+.mx-gl{font-size:11px;color:var(--text-dim);line-height:1.25;margin-top:-6px}
+.mx-hint{border:1px dashed #e8a33d;border-radius:10px;padding:8px 10px;font-size:12.5px;line-height:1.45;display:flex;flex-direction:column;gap:6px}
+.mx-hint form{margin:0}.mx-qerr{color:#e8a33d;font-size:12px}
+.mx-sec{display:flex;flex-direction:column;gap:6px}
+.mx-cyc{display:flex;align-items:baseline;gap:10px}.mx-cyc b{font-size:22px;font-weight:800;font-variant-numeric:tabular-nums}
+.mx-cyc span{font-size:12.5px;color:var(--text-dim)}
+.mx-track{height:8px;background:var(--border);border-radius:5px;overflow:hidden}
+.mx-track i{display:block;height:100%;background:#4c9be8;border-radius:5px;transition:width .6s ease}
+.mx-track.over i{background:#e8a33d}
+.mx-axes{display:flex;gap:8px;align-items:flex-end}
+.mx-axes .ax{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;max-width:52px}
+.mx-axes .ax b{font-size:11.5px;font-variant-numeric:tabular-nums}
+.mx-axes .ax span{font-size:12px;font-weight:700;color:var(--text-dim)}
+.mx-axes .ax-t{width:100%;height:48px;background:var(--border);border-radius:6px;display:flex;align-items:flex-end;overflow:hidden}
+.mx-axes .ax-t i{display:block;width:100%;background:#3fb27f;border-radius:6px 6px 0 0;transition:height .6s ease}
+.mx-axes .mid .ax-t i{background:#e8a33d}.mx-axes .hi .ax-t i{background:#e5534b}
+.mx-chips{display:flex;gap:6px;flex-wrap:wrap}
+.mx-chips span{font-size:12px;padding:4px 10px;border-radius:999px;background:rgba(125,133,144,.12);color:var(--text-dim)}
+.mx-chips span b{color:var(--text)}.mx-chips span.warn{background:rgba(232,163,61,.16)}.mx-chips span.warn b{color:#e8a33d}
+.mx-det{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:8px}
+.mx-det div{background:rgba(125,133,144,.08);border-radius:10px;padding:6px 10px;min-width:0}
+.mx-det span{display:block;font-size:10.5px;color:var(--text-dim)}.mx-det b{font-size:13.5px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mx-block{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--text-dim);overflow-x:auto;white-space:nowrap;padding:6px 8px;border-radius:8px;background:rgba(125,133,144,.08)}
+.mx-msgs{border:1px solid #e5534b;border-radius:10px;padding:8px 10px;font-size:13px;color:#e5534b}
 .mx-kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.mx-kpis div{background:var(--bg-soft,rgba(255,255,255,.03));border-radius:10px;padding:8px 10px}
+.mx-kpis div{background:rgba(125,133,144,.08);border-radius:10px;padding:8px 10px}
 .mx-kpis span{display:block;font-size:11px;color:var(--text-dim)}.mx-kpis b{font-size:16px}
-.mx-load{height:8px;background:var(--border);border-radius:5px;overflow:hidden}.mx-load i{display:block;height:100%;background:linear-gradient(90deg,#3fb27f,#e8a33d 70%,#e5534b)}
-.mx-bars{display:flex;align-items:flex-end;gap:3px;height:42px}.mx-bars i{flex:1;background:#4c9be8;border-radius:2px 2px 0 0;min-height:2px;opacity:.85}
-.mx-specs{font-size:12px;color:var(--text-dim);display:flex;gap:12px;flex-wrap:wrap}
+.mx-bars{display:flex;align-items:flex-end;gap:3px;height:46px}.mx-bars i{flex:1;background:#4c9be8;border-radius:3px 3px 0 0;min-height:2px;opacity:.85}
+.mx-bars i:last-child{opacity:1;background:#3fb27f}
+.mx-empty{font-size:12px;color:var(--text-dim);padding:10px;border-radius:10px;background:rgba(125,133,144,.08)}
+.mx-specs{font-size:12px;color:var(--text-dim);display:flex;gap:6px 14px;flex-wrap:wrap}
 .mx-foot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 16px;border-top:1px solid var(--border)}
-.mx-prog{font-family:monospace;font-size:15px;font-weight:700}
-.mx-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px;font-size:12.5px}
-.mx-facts div{display:flex;justify-content:space-between;gap:8px;border-bottom:1px dashed var(--border);padding-bottom:3px}
-.mx-facts span{color:var(--text-dim)}
+.mx-off{font-size:12.5px;color:var(--text-dim)}
+.mx-meta{font-size:11.5px;color:var(--text-dim)}
 .mx-raw{font-size:11.5px;max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px 8px;margin-top:6px}
 .mx-raw div{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid var(--border);padding:2px 0}
 .mx-raw span{color:var(--text-dim);word-break:break-all}
@@ -5159,7 +5209,7 @@ MACHINES_HTML = """
 </div>
 <div class="mx-grid">
 {% for c in cards %}{% set m = c.m %}{% set L = c.live %}
-<div class="mx-card" id="machine-{{ m['id'] }}" data-id="{{ m['id'] }}">
+<div class="mx-card{{ ' wide' if L.connected and L.mtc and not L.demo }}" id="machine-{{ m['id'] }}" data-id="{{ m['id'] }}">
   <div class="mx-band st-{{ L.status if L.connected else 'none' }}" data-role="band">
     <div class="st"><span class="mx-dot"></span><span data-role="label">{{ L.label if L.connected else 'Телеметрія не підключена' }}</span></div>
     <div style="font-size:11.5px;color:var(--text-dim)" data-role="seen">{{ L.seen if L.connected else '' }}</div>
@@ -5169,31 +5219,16 @@ MACHINES_HTML = """
       <h3 class="mx-title">{{ m['model'] }}</h3>
       {% if m['description'] %}<div style="font-size:12.5px;color:var(--text-dim)">{{ m['description'] }}</div>{% endif %}</div>
     {% if L.connected %}
-      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
-        <div><span style="font-size:11px;color:var(--text-dim)">Програма</span><div class="mx-prog" data-role="program">{{ L.program or '—' }}</div></div>
-        <div style="text-align:right"><span style="font-size:11px;color:var(--text-dim)">Режим</span><div data-role="mode" style="font-weight:600">{{ L.mode or '—' }}</div></div>
-      </div>
-      <div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim)"><span>Навантаження шпинделя</span><span data-role="loadtxt">{{ (L.load ~ '%') if L.load is not none else ('немає даних: увімкніть на стійці налаштування 143' if L.load_source == 'unavailable' and L.status == 'running' else '—') }}</span></div>
-        <div class="mx-load"><i data-role="load" style="width:{{ L.load or 0 }}%"></i></div></div>
-      {% if L.messages %}<div style="border:1px solid #e5534b;border-radius:10px;padding:8px 10px;font-size:13px;color:#e5534b" data-role="messages">{% for msg in L.messages %}<div>{{ msg }}</div>{% endfor %}</div>{% endif %}
-      {% if L.facts %}<div class="mx-facts" data-role="facts">{% for f in L.facts %}<div><span>{{ f[0] }}</span><b>{{ f[1] }}</b></div>{% endfor %}</div>{% endif %}
-      {% if L.block %}<div style="font-family:monospace;font-size:12px;color:var(--text-dim);overflow-x:auto;white-space:nowrap" title="Поточний блок програми">{{ L.block }}</div>{% endif %}
-      <div class="mx-kpis">
-        <div><span>Сьогодні в роботі</span><b data-role="today">{{ L.today_h if L.today_h is defined else 0 }} год</b></div>
-        <div><span>За 7 днів</span><b data-role="week">{{ L.week_h if L.week_h is defined else 0 }} год</b></div>
-        <div><span>Деталей (лічильник)</span><b data-role="parts">{{ L.parts if L.parts is not none else '—' }}</b></div>
-      </div>
-      {% if L.daily %}<div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim);margin-bottom:4px"><span>Години роботи, 14 днів</span><span>завантаження {{ L.availability }}%</span></div>
-        <div class="mx-bars">{% for d in L.daily %}<i style="height:{{ d.pct }}%" title="{{ d.date }}: {{ d.hours }} год"></i>{% endfor %}</div></div>{% endif %}
+      <div class="mx-sec" style="gap:12px" data-role="live">{% include "machine_live_block.html" %}</div>
       {% if is_admin and L.raw %}<details><summary style="cursor:pointer;font-size:12px;color:var(--accent-2)">Що передає верстат ({{ L.raw|length }} значень)</summary>
         <div class="mx-raw">{% for k, v in L.raw %}<div><span>{{ k }}</span><b>{{ v }}</b></div>{% endfor %}</div>
-        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Якщо потрібної величини (навантаження, деталі) немає в картці — збережіть файл нижче і надішліть розробнику.</div></details>{% endif %}
-      {% if is_admin and L.mtc %}<a class="btn btn-sm" href="{{ url_for('machine_diagnostics', machine_id=m['id']) }}">⬇ Зберегти дані верстата у файл</a>{% endif %}
-      <div style="font-size:11.5px;color:var(--text-dim)">Дільниця: {{ L.wc_name }}{% if L.address %} · MTConnect {{ L.address }}{% endif %}{% if L.alarms_week %} · <span style="color:#e5534b">аварій за тиждень: {{ L.alarms_week }}</span>{% endif %}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Якщо потрібної величини немає в картці — збережіть файл кнопкою нижче і надішліть розробнику.</div>
+        {% if L.mtc %}<a class="btn btn-sm" style="margin-top:6px" href="{{ url_for('machine_diagnostics', machine_id=m['id']) }}">⬇ Зберегти дані верстата у файл</a>{% endif %}</details>{% endif %}
     {% else %}
-      <div style="font-size:13px;color:var(--text-dim)">Підключіть верстат, і тут з'явиться: працює він чи стоїть, яка програма, навантаження шпинделя, лічильник деталей і години роботи.</div>
+      <div class="mx-off">Підключіть телеметрію, і тут буде видно стан, програму, оберти, лічильник деталей і години роботи.</div>
     {% endif %}
-    <div class="mx-specs"><span>⚡ {{ m['spindle_power'] or '—' }}</span><span>⬚ {{ m['work_area'] or '—' }}</span><span>◎ {{ m['accuracy'] or '—' }}</span></div>
+    {% set specs = [('Потужність', m['spindle_power']), ('Робоча зона', m['work_area']), ('Точність', m['accuracy'])]|selectattr(1)|list %}
+    {% if specs %}<div class="mx-specs">{% for k, v in specs %}<span>{{ k }}: <b style="color:var(--text)">{{ v }}</b></span>{% endfor %}</div>{% endif %}
   </div>
   <div class="mx-foot">
     {% if is_admin %}
@@ -5244,14 +5279,8 @@ MACHINES_HTML = """
         band.className = 'mx-band st-' + L.status;
         var set = function(role, v){ var e = card.querySelector('[data-role=' + role + ']'); if (e) e.textContent = v; };
         set('label', LBL[L.status] || L.status); set('seen', L.seen || '');
-        set('program', L.program || '—'); set('mode', L.mode || '—');
-        set('loadtxt', L.load != null ? L.load + '%' : '—');
-        var bar = card.querySelector('[data-role=load]'); if (bar) bar.style.width = (L.load || 0) + '%';
-        if (L.today_h != null) set('today', L.today_h + ' год');
-        if (L.week_h != null) set('week', L.week_h + ' год');
-        set('parts', L.parts != null ? L.parts : '—');
-        var fb = card.querySelector('[data-role=facts]');
-        if (fb && L.facts) { fb.innerHTML = ''; L.facts.forEach(function(f){ var d=document.createElement('div'); var s=document.createElement('span'); s.textContent=f[0]; var b=document.createElement('b'); b.textContent=f[1]; d.appendChild(s); d.appendChild(b); fb.appendChild(d); }); }
+        var box = card.querySelector('[data-role=live]');
+        if (box && L.html != null && !box.contains(document.activeElement)) box.innerHTML = L.html;
       });
       ['running','idle','alarm','offline'].forEach(function(k){ var e = document.getElementById('sum-' + k); if (e) e.textContent = sum[k]; });
     }).catch(function(){});
@@ -5260,6 +5289,64 @@ MACHINES_HTML = """
 })();
 </script>
 {% endblock %}
+"""
+
+MACHINE_LIVE_BLOCK_HTML = """
+<div class="mx-cols"><div class="mx-col">
+<div class="mx-prow">
+  <div style="min-width:0"><span class="mx-lbl">Програма</span><div class="mx-prog" title="{{ L.program or '' }}">{{ L.program or '—' }}</div></div>
+  {% if L.mode_txt %}<span class="mx-chip" title="{{ L.mode }}">{{ L.mode_txt }}</span>{% endif %}
+</div>
+<div class="mx-gauges">
+  {% set lp = L.load if L.load is not none else 0 %}
+  <div class="mx-g {{ 'g-hi' if lp >= 85 else ('g-mid' if lp >= 60 else '') }}" title="Навантаження шпинделя">
+    <svg viewBox="0 0 100 100" aria-hidden="true"><circle class="trk" cx="50" cy="50" r="40" pathLength="100"/><circle class="val" cx="50" cy="50" r="40" pathLength="100" style="stroke-dasharray:{{ '%.1f'|format(lp * 0.75) }} 100;{{ '' if L.load else 'stroke:transparent' }}"/></svg>
+    <div class="mx-gv"><b>{{ L.load if L.load is not none else '—' }}</b><small>{{ '%' if L.load is not none else 'немає даних' if L.load_source == 'unavailable' else '' }}</small></div>
+    <span class="mx-gl">Навантаження<br>шпинделя</span>
+  </div>
+  {% set rp = L.rpm_pct or 0 %}
+  <div class="mx-g g-rpm" title="Оберти шпинделя">
+    <svg viewBox="0 0 100 100" aria-hidden="true"><circle class="trk" cx="50" cy="50" r="40" pathLength="100"/><circle class="val" cx="50" cy="50" r="40" pathLength="100" style="stroke-dasharray:{{ '%.1f'|format(rp * 0.75) }} 100;{{ '' if rp else 'stroke:transparent' }}"/></svg>
+    <div class="mx-gv"><b>{{ L.rpm_txt or '—' }}</b><small>об/хв</small></div>
+    <span class="mx-gl">Оберти{% if L.rpm_max_txt %}<br>макс. {{ L.rpm_max_txt }}{% else %}<br>шпинделя{% endif %}</span>
+  </div>
+  <div class="mx-g" title="Лічильник деталей стійки">
+    <svg viewBox="0 0 100 100" aria-hidden="true" style="transform:none"><circle class="dsk" cx="50" cy="50" r="40"/></svg>
+    <div class="mx-gv"><b>{{ L.parts_txt or '—' }}</b><small>шт</small></div>
+    <span class="mx-gl">Деталей<br>(лічильник)</span>
+  </div>
+</div>
+{% if L.load is none and L.load_source == 'unavailable' %}
+<div class="mx-hint">
+  <div>Навантаження шпинделя Haas віддає лише через Q-команди. На стійці: <b>Settings → налаштування 143 «Machine Data Collect» = On</b>{% if is_admin %}, порт 5051 не блокувати{% endif %}.</div>
+  {% if is_admin %}{% if L.q_error %}<div class="mx-qerr">Остання спроба: {{ L.q_error }}</div>{% endif %}
+  <form method="post" action="{{ url_for('machine_qtest', machine_id=m['id']) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm" type="submit">Перевірити зараз</button></form>{% endif %}
+</div>{% endif %}
+{% if L.messages %}<div class="mx-msgs">{% for msg in L.messages %}<div>{{ msg }}</div>{% endfor %}</div>{% endif %}
+{% if L.cycle %}<div class="mx-sec">
+  <div class="mx-row"><span class="mx-lbl">Цикл деталі</span>{% if L.cycle.left %}<span class="mx-lbl">до кінця <b style="color:var(--text)">{{ L.cycle.left }}</b></span>{% endif %}</div>
+  <div class="mx-cyc"><b>{{ L.cycle.this or '—' }}</b>{% if L.cycle.last %}<span>попередній {{ L.cycle.last }}</span>{% endif %}{% if L.cycle.over %}<span style="color:#e8a33d">довше за попередній</span>{% endif %}</div>
+  {% if L.cycle.pct %}<div class="mx-track {{ 'over' if L.cycle.over }}"><i style="width:{{ L.cycle.pct }}%"></i></div>{% endif %}
+</div>{% endif %}
+</div><div class="mx-col">
+{% if L.axes %}<div class="mx-sec"><span class="mx-lbl">Навантаження осей</span>
+  <div class="mx-axes">{% for a in L.axes %}<div class="ax {{ 'hi' if a.value >= 80 else ('mid' if a.value >= 50 else '') }}" title="Вісь {{ a.axis }}: {{ a.value }}%"><b>{{ a.value }}%</b><div class="ax-t"><i style="height:{{ a.h }}%"></i></div><span>{{ a.axis }}</span></div>{% endfor %}</div>
+</div>{% endif %}
+{% if L.overrides %}<div class="mx-sec"><span class="mx-lbl">Корекції з пульта</span><div class="mx-chips">{% for o in L.overrides %}<span class="{{ 'warn' if o.warn }}">{{ o.label }} <b>{{ o.value }}%</b></span>{% endfor %}</div></div>{% endif %}
+{% if L.details %}<div class="mx-det">{% for d in L.details %}<div title="{{ d[1] }}"><span>{{ d[0] }}</span><b>{{ d[1] }}</b></div>{% endfor %}</div>{% endif %}
+{% if L.block %}<div class="mx-block" title="Поточний блок програми">{{ L.block }}</div>{% endif %}
+<div class="mx-kpis">
+  <div><span>Сьогодні в роботі</span><b>{{ L.today_h if L.today_h is defined else 0 }} год</b></div>
+  <div><span>За 7 днів</span><b>{{ L.week_h if L.week_h is defined else 0 }} год</b></div>
+  <div><span>Завантаження, 14 дн.</span><b>{{ L.availability if L.availability is defined else 0 }}%</b></div>
+</div>
+{% if L.daily %}<div class="mx-sec" style="gap:4px"><span class="mx-lbl">Години в роботі по днях</span>
+  {% if L.daily_empty %}<div class="mx-empty">Графік з'явиться, коли верстат попрацює з підключеною телеметрією.</div>
+  {% else %}<div class="mx-bars">{% for d in L.daily %}<i style="height:{{ d.pct }}%" title="{{ d.date }}: {{ d.hours }} год"></i>{% endfor %}</div>
+  <div class="mx-row mx-lbl"><span>{{ L.daily[0].date }}</span><span>сьогодні</span></div>{% endif %}
+</div>{% endif %}
+<div class="mx-meta">Дільниця: {{ L.wc_name }}{% if L.address %} · MTConnect {{ L.address }}{% endif %}{% if L.alarms_week %} · <span style="color:#e5534b">аварій за тиждень: {{ L.alarms_week }}</span>{% endif %}</div>
+</div></div>
 """
 
 MACHINE_FORM_HTML = """
@@ -6593,6 +6680,7 @@ app.jinja_loader = DictLoader({
     "tasks.html": TASKS_HTML,
     "calendar.html": CALENDAR_HTML,
     "machines.html": MACHINES_HTML,
+    "machine_live_block.html": MACHINE_LIVE_BLOCK_HTML,
     "machine_form.html": MACHINE_FORM_HTML,
     "service.html": SERVICE_HTML,
     "service_detail.html": SERVICE_DETAIL_HTML,
@@ -8391,6 +8479,10 @@ def task_toggle(task_id):
 MACHINE_STATUS_LABELS = {"running": "Працює", "idle": "Простій", "alarm": "Аварія", "offline": "Немає зв'язку"}
 
 
+MACHINE_MODE_LABELS = {"AUTOMATIC": "Автомат", "MANUAL": "Ручний", "MANUAL_DATA_INPUT": "MDI",
+                       "SEMI_AUTOMATIC": "Покроковий", "EDIT": "Редагування"}
+
+
 def machine_live(db, m):
     """Живий стан верстата для картки: телеметрія прив'язаного робочого центру."""
     if not m["work_center_id"]:
@@ -8426,55 +8518,73 @@ def machine_live(db, m):
         ex = json.loads(t["extra"]) if "extra" in t.keys() and t["extra"] else {}
     except ValueError:
         ex = {}
-    facts = []
-    if status != "offline" and ex:
-        def fmt(v, unit=""):
-            return (f"{v:g}" if isinstance(v, (int, float)) else str(v)) + unit
-        if ex.get("rpm") is not None:
-            facts.append(["Оберти шпинделя", fmt(round(ex["rpm"]), " об/хв")])
-        if ex.get("feed") is not None:
-            facts.append(["Подача", fmt(round(ex["feed"]), " мм/хв")])
+    on = status != "offline" and bool(ex)
+
+    def num(v):
+        return v if isinstance(v, (int, float)) else None
+
+    def grp(v):  # 5968 -> "5 968" (вузький нерозривний пробіл)
+        return f"{int(round(v)):,}".replace(",", "\u202f")
+
+    def mmss(sec):
+        sec = int(sec or 0)
+        return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+    rpm = num(ex.get("rpm")) if on else None
+    rpm_max = num(ex.get("rpm_max"))
+    live["rpm"] = round(rpm) if rpm is not None else None
+    live["rpm_txt"] = grp(rpm) if rpm is not None else None
+    live["rpm_max_txt"] = grp(rpm_max) if rpm_max else None
+    live["rpm_pct"] = max(0, min(100, int(rpm / rpm_max * 100))) if rpm is not None and rpm_max else None
+    live["parts_txt"] = grp(t["part_count"]) if t["part_count"] is not None else None
+    # корекції з пульта: 100% - норма, інше підсвічуємо
+    ovr = []
+    if on:
+        for key, label in (("feed_ovr", "Подача"), ("spindle_ovr", "Оберти"), ("rapid_ovr", "Швидкі ходи")):
+            v = num(ex.get(key))
+            if v is not None:
+                ovr.append({"label": label, "value": int(round(v)), "warn": key != "rapid_ovr" and round(v) != 100})
+    live["overrides"] = ovr
+    # цикл: поточний проти попереднього
+    cyc = None
+    if on and (ex.get("this_cycle") or ex.get("last_cycle")):
+        this_c, last_c, left = num(ex.get("this_cycle")) or 0, num(ex.get("last_cycle")) or 0, num(ex.get("cycle_left"))
+        cyc = {"this": mmss(this_c) if this_c else None, "last": mmss(last_c) if last_c else None,
+               "left": mmss(left) if left else None,
+               "pct": max(2, min(100, int(this_c / last_c * 100))) if this_c and last_c else None,
+               "over": bool(this_c and last_c and this_c > last_c * 1.05)}
+    live["cycle"] = cyc
+    loads = (ex.get("axis_loads") or {}) if on else {}
+    order = "XYZABCUVW"
+    live["axes"] = [{"axis": k, "value": int(round(loads[k])), "h": max(3, min(100, int(round(loads[k]))))}
+                    for k in sorted(loads, key=lambda a: order.find(a) if a in order else 99)]
+    details = []
+    if on:
         if ex.get("tool"):
-            facts.append(["Інструмент", "T" + str(ex["tool"]).lstrip("Tt")])
-        if ex.get("feed_ovr") is not None:
-            facts.append(["Корекція подачі", fmt(round(ex["feed_ovr"]), "%")])
-        if ex.get("spindle_ovr") is not None:
-            facts.append(["Корекція обертів", fmt(round(ex["spindle_ovr"]), "%")])
-        if ex.get("rapid_ovr") is not None:
-            facts.append(["Прискорені ходи", fmt(round(ex["rapid_ovr"]), "%")])
+            details.append(["Інструмент", "T" + str(ex["tool"]).lstrip("Tt")])
+        if num(ex.get("feed")) is not None:
+            details.append(["Подача", f"{grp(ex['feed'])} мм/хв"])
         if ex.get("line"):
-            facts.append(["Рядок програми", str(ex["line"])])
+            details.append(["Рядок програми", str(ex["line"])])
         if ex.get("door"):
-            facts.append(["Двері", {"OPEN": "відчинені", "CLOSED": "зачинені"}.get(str(ex["door"]).upper(), str(ex["door"]))])
+            details.append(["Двері", {"OPEN": "відчинені", "CLOSED": "зачинені"}.get(str(ex["door"]).upper(), str(ex["door"]))])
         if (ex.get("estop") or "").upper() == "TRIGGERED":
-            facts.append(["Аварійна кнопка", "НАТИСНУТА"])
-        def mmss(sec):
-            sec = int(sec or 0)
-            return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
-        if ex.get("this_cycle"):
-            facts.append(["Поточний цикл", mmss(ex["this_cycle"])])
-        if ex.get("last_cycle"):
-            facts.append(["Попередній цикл", mmss(ex["last_cycle"])])
-        if ex.get("cycle_left"):
-            facts.append(["До кінця циклу", mmss(ex["cycle_left"])])
+            details.append(["Аварійна кнопка", "НАТИСНУТА"])
         if ex.get("loops_left"):
-            facts.append(["Повторів залишилось", fmt(ex["loops_left"])])
-        loads = ex.get("axis_loads") or {}
-        if loads:
-            order = "XYZABCUVW"
-            facts.append(["Навантаження осей", " · ".join(f"{k} {loads[k]:g}%" for k in
-                                                         sorted(loads, key=lambda a: order.find(a) if a in order else 99))])
-        if ex.get("spindle_hours"):
-            facts.append(["Шпиндель усього", fmt(ex["spindle_hours"], " год")])
-    live.update(load_source=ex.get("load_source"))
-    live.update(facts=facts, messages=(ex.get("messages") or []) if status != "offline" else [],
+            details.append(["Повторів залишилось", f"{ex['loops_left']:g}" if num(ex["loops_left"]) is not None else str(ex["loops_left"])])
+        if num(ex.get("spindle_hours")):
+            details.append(["Шпиндель усього", f"{grp(ex['spindle_hours'])} год"])
+    live["details"] = details
+    live.update(load_source=ex.get("load_source"), q_error=ex.get("q_error"),
+                mode_txt=MACHINE_MODE_LABELS.get((t["mode"] or "").upper(), t["mode"]) if t["mode"] else None)
+    live.update(messages=(ex.get("messages") or []) if status != "offline" else [],
                 raw=ex.get("raw") or [], block=ex.get("block") if status != "offline" else None)
     stats = get_machine_runtime_stats(db, m["work_center_id"], m["wc_capacity"] or 8)
     if stats:
         mx = max([d["hours"] for d in stats["daily"]] + [1])
         live.update(today_h=stats["today_hours"], week_h=stats["week_hours"], availability=stats["availability_pct"],
                     alarms_week=stats["alarm_count_week"],
-                    daily=[{"date": d["date"], "hours": d["hours"], "pct": int(d["hours"] / mx * 100)} for d in stats["daily"]])
+                    daily=[{"date": d["date"], "hours": d["hours"], "pct": int(d["hours"] / mx * 100)} for d in stats["daily"]],
+                    daily_empty=not any(d["hours"] for d in stats["daily"]))
     return live
 
 
@@ -8508,8 +8618,31 @@ def machines_live_json():
     for c in _machines_with_live(db):
         live = dict(c["live"])
         live.pop("raw", None)  # повний перелік показуємо лише на сторінці адміну
+        if live.get("connected"):
+            live["html"] = render_template("machine_live_block.html", m=c["m"], L=c["live"])
         out[str(c["m"]["id"])] = live
     return jsonify(out)
+
+
+@app.route("/machines/<int:machine_id>/qtest", methods=["POST"])
+@login_required
+def machine_qtest(machine_id):
+    """Кнопка «Перевірити зараз»: одразу (без паузи між спробами) питає Haas
+    навантаження шпинделя через Q-команду і показує результат."""
+    if not is_admin():
+        abort(403)
+    db = get_db()
+    row = db.execute("""SELECT w.mtc_host FROM machines m JOIN work_centers w ON w.id=m.work_center_id
+                        WHERE m.id=?""", (machine_id,)).fetchone()
+    if not row or not row["mtc_host"]:
+        flash("Спершу підключіть телеметрію верстата (IP-адреса).", "error")
+        return redirect(url_for("machines_list"))
+    value = haas_q_spindle_load(row["mtc_host"], force=True)
+    if value is not None:
+        flash(f"Зв'язок є: навантаження шпинделя зараз {value:g}%. На картці воно з'явиться за 15 секунд.", "success")
+    else:
+        flash("Навантаження не отримано: " + (haas_q_last_error(row["mtc_host"]) or "невідома причина"), "error")
+    return redirect(url_for("machines_list") + f"#machine-{machine_id}")
 
 
 @app.route("/machines/<int:machine_id>/diagnostics.txt")
@@ -10576,7 +10709,7 @@ def parse_mtconnect_current(xml_text):
     part_count = spindle_load = None
     fault = False
     found = 0
-    extra = {"rpm": None, "feed": None, "feed_ovr": None, "spindle_ovr": None, "rapid_ovr": None,
+    extra = {"rpm": None, "rpm_max": None, "feed": None, "feed_ovr": None, "spindle_ovr": None, "rapid_ovr": None,
              "tool": None, "line": None, "block": None, "door": None, "estop": None, "availability": None,
              "this_cycle": None, "last_cycle": None, "cycle_left": None, "loops_left": None,
              "spindle_hours": None, "run_hours": None, "axis_loads": {},
@@ -10636,6 +10769,9 @@ def parse_mtconnect_current(xml_text):
                 # Haas: лічильник деталей M30 #1 приходить як Message
                 if num is not None and part_count is None:
                     part_count = int(num)
+            elif "maxpurchspindlesp" in ident or "maxspindlespeed" in ident or "spindlemaxspeed" in ident:
+                if num:  # Haas: максимальні оберти шпинделя - для шкали обертів
+                    extra["rpm_max"] = num
             elif tag == "AccumulatedTime" or "cycle" in ident and tag == "Message":
                 key = ("last_cycle" if ("lastcycle" in ident or "lcycle" in ident) else
                        "cycle_left" if ("remaining" in ident or "cyremtim" in ident) else
@@ -10720,18 +10856,27 @@ def parse_mtconnect_current(xml_text):
             "part_count": part_count, "spindle_load_pct": spindle_load, "extra": extra}
 
 
-_HAAS_Q_FAIL = {}
+_HAAS_Q_FAIL = {}   # host -> (час невдалої спроби, причина українською)
+HAAS_Q_RETRY_SECONDS = 120
 
 
-def haas_q_spindle_load(host, port=5051, timeout=1.5):
+def haas_q_last_error(host):
+    v = _HAAS_Q_FAIL.get(host)
+    return v[1] if v else None
+
+
+def haas_q_spindle_load(host, port=5051, timeout=1.5, force=False):
     """Навантаження шпинделя Haas через Ethernet Q-команди: ?Q600 1098 читає
     системну змінну #1098 (навантаження шпинделя, %). MTConnect-агент Haas
     цієї величини не передає. Потрібно: на стійці налаштування 143
     «Machine Data Collect» = ON (порт 5051). Якщо не відповідає - не
-    смикаємо верстат повторно 10 хвилин. Повертає число або None."""
+    смикаємо верстат повторно 2 хвилини, а причину видно в haas_q_last_error.
+    Повертає число або None."""
     import socket
-    if time.time() - _HAAS_Q_FAIL.get(host, 0) < 600:
+    prev = _HAAS_Q_FAIL.get(host)
+    if prev and not force and time.time() - prev[0] < HAAS_Q_RETRY_SECONDS:
         return None
+    text = ""
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.settimeout(timeout)
@@ -10743,15 +10888,22 @@ def haas_q_spindle_load(host, port=5051, timeout=1.5):
                 if not chunk:
                     break
                 data += chunk
-        text = data.decode("ascii", errors="ignore").strip().lstrip(">")
+        text = data.decode("ascii", errors="ignore").strip().lstrip(">").strip()
         value = _mtc_num(text.split(",")[-1]) if "," in text else _mtc_num(text)
         if value is None or not (0 <= value <= 300):
-            raise ValueError(text[:60])
+            raise ValueError(text)
         _HAAS_Q_FAIL.pop(host, None)
         return round(value, 1)
-    except Exception:
-        _HAAS_Q_FAIL[host] = time.time()
-        return None
+    except ConnectionRefusedError:
+        reason = f"порт {port} закритий: на стійці вимкнено налаштування 143 (Machine Data Collect)"
+    except (socket.timeout, TimeoutError):
+        reason = f"порт {port} не відповідає (тайм-аут): перевірте налаштування 143 і брандмауер"
+    except ValueError:
+        reason = (f"стійка відповіла незрозуміло: «{text[:60]}»" if text else "стійка нічого не відповіла на запит")
+    except OSError as e:
+        reason = f"помилка мережі: {e}"[:160]
+    _HAAS_Q_FAIL[host] = (time.time(), reason)
+    return None
 
 
 def fetch_mtconnect(host, port, timeout=4):
@@ -10771,6 +10923,7 @@ def fetch_mtconnect(host, port, timeout=4):
             data["extra"]["load_source"] = "Q600 #1098"
         else:
             data["extra"]["load_source"] = "unavailable"
+            data["extra"]["q_error"] = haas_q_last_error(host)
     return data
 
 

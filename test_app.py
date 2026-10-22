@@ -5431,7 +5431,7 @@ def test_machines_page_live_telemetry_and_connect(client, monkeypatch):
     m = client._app_module
     login(client, "admin", "admin123")
     t = client.get("/machines").get_data(as_text=True)
-    assert "Наше обладнання" in t and "працюють" in t and "Години роботи, 14 днів" in t
+    assert "Наше обладнання" in t and "працюють" in t and "Години в роботі по днях" in t
     data = client.get("/machines/live.json").get_json()
     assert data and any(v["connected"] for v in data.values())
     db = _raw_db(client)
@@ -5697,10 +5697,10 @@ def test_machine_card_shows_extra_machine_data(client, monkeypatch):
     monkeypatch.setattr(m, "fetch_mtconnect", lambda host, port, timeout=4: m.parse_mtconnect_current(HAAS_LIKE_XML))
     post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "work_center_id": "new"})
     t = client.get("/machines").get_data(as_text=True)
-    assert "2847 об/хв" in t and "1200 мм/хв" in t and "T5" in t and "Low coolant" in t and "38%" in t
+    assert "2\u202f847</b><small>об/хв" in t and "1\u202f200 мм/хв" in t and "T5" in t and "Low coolant" in t and "<b>38</b>" in t
     assert "Що передає верстат" in t and "S1load" in t
     live = client.get("/machines/live.json").get_json()[str(mid)]
-    assert live["parts"] == 991 and "raw" not in live and ["Оберти шпинделя", "2847 об/хв"] in live["facts"]
+    assert live["parts"] == 991 and "raw" not in live and live["rpm"] == 2847 and "mx-gauges" in live["html"]
 
 
 def test_mtconnect_messages_ignore_service_values_and_diagnostics_file(client, monkeypatch):
@@ -5738,7 +5738,9 @@ HAAS_NGC_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <Availability dataItemId="avail" name="Availability">AVAILABLE</Availability>
   <PathFeedrate dataItemId="mfdrate" name="MaximumFeedRate">21158.2</PathFeedrate>
   <PathFeedrateOverride dataItemId="smooth" name="Smoothness">1</PathFeedrateOverride>
-  <Message dataItemId="spindletime" name="SpindleTime">16476592</Message></Events></ComponentStream>
+  <Message dataItemId="spindletime" name="SpindleTime">16476592</Message>
+  <Message dataItemId="mainspspeedlimit" name="MainSpindleSpeedLimit">0</Message>
+  <Message dataItemId="maxpurchspindlesp" name="MaxPurchSpindleSpeed">12000</Message></Events></ComponentStream>
  <ComponentStream component="Controller" name="MachineController" componentId="c"><Samples>
   <AxisFeedrate dataItemId="rovrd" name="RapidOverride">50</AxisFeedrate>
   <PathFeedrate dataItemId="fdovrd" name="FeedrateOverride">120</PathFeedrate>
@@ -5770,7 +5772,7 @@ def test_mtconnect_haas_ngc_real_names(client):
     assert ex["rpm"] == 2500 and ex["spindle_ovr"] == 90 and ex["feed_ovr"] == 120 and ex["rapid_ovr"] == 50
     assert ex["feed"] is None  # MaximumFeedRate - не поточна подача
     assert ex["this_cycle"] == 95 and ex["last_cycle"] == 206 and ex["cycle_left"] == 111
-    assert ex["axis_loads"] == {"Z": 57, "X": 1, "B": 13} and ex["spindle_hours"] == 4576.8
+    assert ex["axis_loads"] == {"Z": 57, "X": 1, "B": 13} and ex["spindle_hours"] == 4576.8 and ex["rpm_max"] == 12000
     assert ex["messages"] == []
     d2 = m.parse_mtconnect_current(HAAS_NGC_XML.replace("NO ACTIVE ALARMS", "1010 TOOL CHANGER FAULT"))
     assert d2["extra"]["messages"] == ["Аварія: 1010 TOOL CHANGER FAULT"]
@@ -5792,7 +5794,7 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
     srv.close()
     # недоступний порт - None і пауза на 10 хв без повторних спроб
     assert m.haas_q_spindle_load("127.0.0.1", port=1, timeout=0.3) is None
-    assert "127.0.0.1" in m._HAAS_Q_FAIL
+    assert "127.0.0.1" in m._HAAS_Q_FAIL and "закритий" in m.haas_q_last_error("127.0.0.1")
     # картка: цикли, навантаження осей, підказка про налаштування 143
     monkeypatch.setattr(m, "notify_all", lambda t: None)
     login(client, "admin", "admin123")
@@ -5807,5 +5809,24 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
     monkeypatch.setattr(m, "fetch_mtconnect", fake_fetch)
     post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "work_center_id": "new"})
     t = client.get("/machines").get_data(as_text=True)
-    assert "1019" in t and "1:35" in t and "3:26" in t and "X 1% · Z 57% · B 13%" in t
-    assert "налаштування 143" in t and "21158 мм/хв" not in t and "2500 об/хв" in t
+    assert "1\u202f019" in t and "1:35" in t and "3:26" in t and "макс. 12\u202f000" in t
+    live = client.get("/machines/live.json").get_json()[str(mid)]
+    assert [(a["axis"], a["value"]) for a in live["axes"]] == [("X", 1), ("Z", 57), ("B", 13)]
+    assert "налаштування 143" in t and "21\u202f158" not in t and "2\u202f500</b><small>об/хв" in t
+    assert "Перевірити зараз" in t and "Остання спроба" not in t
+    # причина невдачі Q-команди видно адміну; кнопка перевірки дає відповідь одразу
+    d = fake_fetch("x", 1)
+    d["extra"]["q_error"] = "порт 5051 закритий: на стійці вимкнено налаштування 143 (Machine Data Collect)"
+    monkeypatch.setattr(m, "fetch_mtconnect", lambda host, port, timeout=4: d)
+    m.poll_machines_once()
+    t = client.get("/machines").get_data(as_text=True)
+    assert "Остання спроба: порт 5051 закритий" in t
+    monkeypatch.setattr(m, "haas_q_spindle_load", lambda host, force=False: 42.0)
+    r = post(client, f"/machines/{mid}/qtest", {}, follow_redirects=True)
+    assert "навантаження шпинделя зараз 42%" in r.get_data(as_text=True)
+    monkeypatch.setattr(m, "haas_q_spindle_load", lambda host, force=False: None)
+    m._HAAS_Q_FAIL["192.168.10.2"] = (0, "порт 5051 не відповідає (тайм-аут)")
+    r = post(client, f"/machines/{mid}/qtest", {}, follow_redirects=True)
+    assert "Навантаження не отримано: порт 5051 не відповідає" in r.get_data(as_text=True)
+    login(client, "maister", "prod123")
+    assert post(client, f"/machines/{mid}/qtest", {}).status_code == 403
