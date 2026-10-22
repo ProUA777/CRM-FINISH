@@ -5173,7 +5173,7 @@ MACHINES_HTML = """
         <div><span style="font-size:11px;color:var(--text-dim)">Програма</span><div class="mx-prog" data-role="program">{{ L.program or '—' }}</div></div>
         <div style="text-align:right"><span style="font-size:11px;color:var(--text-dim)">Режим</span><div data-role="mode" style="font-weight:600">{{ L.mode or '—' }}</div></div>
       </div>
-      <div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim)"><span>Навантаження шпинделя</span><span data-role="loadtxt">{{ (L.load ~ '%') if L.load is not none else ('не передається' if L.mtc and L.raw and L.status == 'running' else '—') }}</span></div>
+      <div><div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-dim)"><span>Навантаження шпинделя</span><span data-role="loadtxt">{{ (L.load ~ '%') if L.load is not none else ('немає даних: увімкніть на стійці налаштування 143' if L.load_source == 'unavailable' and L.status == 'running' else '—') }}</span></div>
         <div class="mx-load"><i data-role="load" style="width:{{ L.load or 0 }}%"></i></div></div>
       {% if L.messages %}<div style="border:1px solid #e5534b;border-radius:10px;padding:8px 10px;font-size:13px;color:#e5534b" data-role="messages">{% for msg in L.messages %}<div>{{ msg }}</div>{% endfor %}</div>{% endif %}
       {% if L.facts %}<div class="mx-facts" data-role="facts">{% for f in L.facts %}<div><span>{{ f[0] }}</span><b>{{ f[1] }}</b></div>{% endfor %}</div>{% endif %}
@@ -8448,6 +8448,25 @@ def machine_live(db, m):
             facts.append(["Двері", {"OPEN": "відчинені", "CLOSED": "зачинені"}.get(str(ex["door"]).upper(), str(ex["door"]))])
         if (ex.get("estop") or "").upper() == "TRIGGERED":
             facts.append(["Аварійна кнопка", "НАТИСНУТА"])
+        def mmss(sec):
+            sec = int(sec or 0)
+            return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+        if ex.get("this_cycle"):
+            facts.append(["Поточний цикл", mmss(ex["this_cycle"])])
+        if ex.get("last_cycle"):
+            facts.append(["Попередній цикл", mmss(ex["last_cycle"])])
+        if ex.get("cycle_left"):
+            facts.append(["До кінця циклу", mmss(ex["cycle_left"])])
+        if ex.get("loops_left"):
+            facts.append(["Повторів залишилось", fmt(ex["loops_left"])])
+        loads = ex.get("axis_loads") or {}
+        if loads:
+            order = "XYZABCUVW"
+            facts.append(["Навантаження осей", " · ".join(f"{k} {loads[k]:g}%" for k in
+                                                         sorted(loads, key=lambda a: order.find(a) if a in order else 99))])
+        if ex.get("spindle_hours"):
+            facts.append(["Шпиндель усього", fmt(ex["spindle_hours"], " год")])
+    live.update(load_source=ex.get("load_source"))
     live.update(facts=facts, messages=(ex.get("messages") or []) if status != "offline" else [],
                 raw=ex.get("raw") or [], block=ex.get("block") if status != "offline" else None)
     stats = get_machine_runtime_stats(db, m["work_center_id"], m["wc_capacity"] or 8)
@@ -10559,6 +10578,8 @@ def parse_mtconnect_current(xml_text):
     found = 0
     extra = {"rpm": None, "feed": None, "feed_ovr": None, "spindle_ovr": None, "rapid_ovr": None,
              "tool": None, "line": None, "block": None, "door": None, "estop": None, "availability": None,
+             "this_cycle": None, "last_cycle": None, "cycle_left": None, "loops_left": None,
+             "spindle_hours": None, "run_hours": None, "axis_loads": {},
              "messages": [], "raw": []}
     streams = [el for el in root.iter() if _xml_local(el.tag) == "ComponentStream"] or [root]
     containers = {"Samples", "Events", "Condition", "ComponentStream", "DeviceStream", "Streams"}
@@ -10576,6 +10597,7 @@ def parse_mtconnect_current(xml_text):
             did = (el.get("dataItemId") or "")
             ident = ((el.get("name") or "") + " " + did).lower()
             sub = (el.get("subType") or "").upper()
+            is_ovr = sub == "OVERRIDE" or "override" in ident or "ovrd" in ident or "ovr" in ident.split()
             if tag in ("Normal", "Warning", "Fault", "Unavailable"):
                 # стан (Condition): Fault - аварія, Warning - попередження
                 if tag == "Fault":
@@ -10610,11 +10632,33 @@ def parse_mtconnect_current(xml_text):
                 if num is not None and "target" not in ident and sub not in ("TARGET", "REMAINING", "BAD", "REJECT"):
                     part_count = int(num)
                 found += 1
+            elif "m30counter1" in ident or ident.split()[-1:] == ["m30c1"]:
+                # Haas: лічильник деталей M30 #1 приходить як Message
+                if num is not None and part_count is None:
+                    part_count = int(num)
+            elif tag == "AccumulatedTime" or "cycle" in ident and tag == "Message":
+                key = ("last_cycle" if ("lastcycle" in ident or "lcycle" in ident) else
+                       "cycle_left" if ("remaining" in ident or "cyremtim" in ident) else
+                       "this_cycle" if ("thiscycle" in ident or "tcycle" in ident) else None)
+                if key and num is not None:
+                    extra[key] = num
+            elif "spindletime" in ident and num is not None:
+                extra["spindle_hours"] = round(num / 3600, 1)
+            elif "machineruntime" in ident and num is not None:
+                extra["run_hours"] = round(num / 3600, 1)
+            elif "loopsremaining" in ident or ident.split()[-1:] == ["lpremain"]:
+                extra["loops_left"] = num
+            elif "activealarms" in ident or ident.split()[-1:] == ["aalarms"]:
+                if val and "NO ACTIVE ALARM" not in val.upper():
+                    extra["messages"].append("Аварія: " + val[:150])
+            elif tag == "Load" and "_axis_" in ident and num is not None:
+                axis = ident.split()[-1].split("_axis_")[0][-1:].upper()
+                extra["axis_loads"][axis] = num
             elif tag in ("Load", "SpindleLoad") and (spindle_comp or (spindle_ident and "load" in ident) or tag == "SpindleLoad"):
                 if num is not None:
                     spindle_load = num
             elif tag in ("RotaryVelocity", "SpindleSpeed") and (spindle_comp or spindle_ident or tag == "SpindleSpeed"):
-                if sub == "OVERRIDE":
+                if is_ovr:
                     extra["spindle_ovr"] = num
                 elif sub in ("PROGRAMMED", "COMMANDED"):
                     if extra["rpm"] is None:
@@ -10623,8 +10667,14 @@ def parse_mtconnect_current(xml_text):
                     extra["rpm"] = num
             elif tag == "RotaryVelocityOverride":
                 extra["spindle_ovr"] = num
+            elif tag == "PathFeedrate" and ("maximum" in ident or "mfdrate" in ident):
+                pass  # максимальна подача верстата (налаштування), не поточна
+            elif tag == "AxisFeedrate" and (is_ovr or "rapid" in ident):
+                extra["rapid_ovr"] = num
             elif tag == "PathFeedrate":
-                if sub == "OVERRIDE":
+                if is_ovr and "rapid" in ident:
+                    extra["rapid_ovr"] = num
+                elif is_ovr:
                     extra["feed_ovr"] = num
                 elif sub == "RAPID":
                     extra["rapid_ovr"] = num
@@ -10633,6 +10683,8 @@ def parse_mtconnect_current(xml_text):
                         extra["feed"] = num
                 else:
                     extra["feed"] = num
+            elif tag == "PathFeedrateOverride" and not is_ovr and sub not in ("PROGRAMMED", "RAPID", "JOG"):
+                pass  # Haas: Smoothness, ContourTimeConstant тощо - налаштування, не корекція
             elif tag == "PathFeedrateOverride":
                 if sub == "RAPID":
                     extra["rapid_ovr"] = num
@@ -10668,6 +10720,40 @@ def parse_mtconnect_current(xml_text):
             "part_count": part_count, "spindle_load_pct": spindle_load, "extra": extra}
 
 
+_HAAS_Q_FAIL = {}
+
+
+def haas_q_spindle_load(host, port=5051, timeout=1.5):
+    """Навантаження шпинделя Haas через Ethernet Q-команди: ?Q600 1098 читає
+    системну змінну #1098 (навантаження шпинделя, %). MTConnect-агент Haas
+    цієї величини не передає. Потрібно: на стійці налаштування 143
+    «Machine Data Collect» = ON (порт 5051). Якщо не відповідає - не
+    смикаємо верстат повторно 10 хвилин. Повертає число або None."""
+    import socket
+    if time.time() - _HAAS_Q_FAIL.get(host, 0) < 600:
+        return None
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"?Q600 1098\r\n")
+            data = b""
+            end = time.time() + timeout
+            while time.time() < end and b"\n" not in data and len(data) < 512:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                data += chunk
+        text = data.decode("ascii", errors="ignore").strip().lstrip(">")
+        value = _mtc_num(text.split(",")[-1]) if "," in text else _mtc_num(text)
+        if value is None or not (0 <= value <= 300):
+            raise ValueError(text[:60])
+        _HAAS_Q_FAIL.pop(host, None)
+        return round(value, 1)
+    except Exception:
+        _HAAS_Q_FAIL[host] = time.time()
+        return None
+
+
 def fetch_mtconnect(host, port, timeout=4):
     if not MTC_HOST_RE.match(host or ""):
         raise ValueError("Некоректна адреса верстата")
@@ -10677,7 +10763,15 @@ def fetch_mtconnect(host, port, timeout=4):
     import urllib.request
     with urllib.request.urlopen(f"http://{host}:{port}/current", timeout=timeout) as resp:
         body = resp.read(3_000_000)
-    return parse_mtconnect_current(body.decode("utf-8", errors="replace").encode("utf-8"))
+    data = parse_mtconnect_current(body.decode("utf-8", errors="replace").encode("utf-8"))
+    if data.get("spindle_load_pct") is None and (data.get("extra") or {}).get("axis_loads") is not None:
+        q = haas_q_spindle_load(host)
+        if q is not None:
+            data["spindle_load_pct"] = q
+            data["extra"]["load_source"] = "Q600 #1098"
+        else:
+            data["extra"]["load_source"] = "unavailable"
+    return data
 
 
 def poll_machines_once():

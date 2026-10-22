@@ -5730,3 +5730,82 @@ def test_mtconnect_messages_ignore_service_values_and_diagnostics_file(client, m
     assert "===== /probe =====" in t and "192.168.10.2:8082/current" in t
     client.get("/logout"); login(client, "tokar", "tokar123")
     assert client.get(f"/machines/{mid}/diagnostics.txt").status_code == 403
+
+
+HAAS_NGC_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:1.2"><Streams><DeviceStream name="UMC-750" uuid="u">
+ <ComponentStream component="Device" name="UMC-750" componentId="d"><Events>
+  <Availability dataItemId="avail" name="Availability">AVAILABLE</Availability>
+  <PathFeedrate dataItemId="mfdrate" name="MaximumFeedRate">21158.2</PathFeedrate>
+  <PathFeedrateOverride dataItemId="smooth" name="Smoothness">1</PathFeedrateOverride>
+  <Message dataItemId="spindletime" name="SpindleTime">16476592</Message></Events></ComponentStream>
+ <ComponentStream component="Controller" name="MachineController" componentId="c"><Samples>
+  <AxisFeedrate dataItemId="rovrd" name="RapidOverride">50</AxisFeedrate>
+  <PathFeedrate dataItemId="fdovrd" name="FeedrateOverride">120</PathFeedrate>
+  <AccumulatedTime dataItemId="tcycle" name="ThisCycle">95</AccumulatedTime>
+  <AccumulatedTime dataItemId="lcycle" name="LastCycle">206</AccumulatedTime>
+  <AccumulatedTime dataItemId="cyremtim" name="CycleRemainingTime">111</AccumulatedTime>
+  <SpindleSpeed dataItemId="sspeed" name="SpindleSpeed">2500.0</SpindleSpeed>
+  <SpindleSpeed dataItemId="ssovrd" name="SpindleSpeedOverride">90</SpindleSpeed></Samples>
+  <Events><ControllerMode dataItemId="mode" name="Mode">AUTOMATIC</ControllerMode>
+  <Execution dataItemId="rstat" name="RunStatus">ACTIVE</Execution>
+  <Program dataItemId="ncprog" name="Program">TEST_4.nc</Program>
+  <Message dataItemId="m30c1" name="M30Counter1">1019</Message><Message dataItemId="m30c2" name="M30Counter2">7</Message>
+  <Message dataItemId="lpremain" name="LoopsRemaining">0</Message>
+  <Message dataItemId="macdsp1" name="MacroDispl1">0.0</Message>
+  <Message dataItemId="aalarms" name="ActiveAlarms">NO ACTIVE ALARMS</Message>
+  <EmergencyStop dataItemId="estop" name="EmergencyStop">ARMED</EmergencyStop></Events>
+  <Condition><Normal dataItemId="mcond" name="MachineCondition"/></Condition></ComponentStream>
+ <ComponentStream component="Axes" name="Axes" componentId="a"><Samples>
+  <Load dataItemId="z_axis_load" name="Z_Axis_Load">57.0</Load><Load dataItemId="x_axis_load" name="X_Axis_Load">1.0</Load>
+  <Load dataItemId="b_axis_load" name="B_Axis_Load">13.0</Load></Samples></ComponentStream>
+</DeviceStream></Streams></MTConnectStreams>"""
+
+
+def test_mtconnect_haas_ngc_real_names(client):
+    m = client._app_module
+    d = m.parse_mtconnect_current(HAAS_NGC_XML)
+    ex = d["extra"]
+    assert d["status"] == "running" and d["part_count"] == 1019 and d["spindle_load_pct"] is None
+    assert ex["rpm"] == 2500 and ex["spindle_ovr"] == 90 and ex["feed_ovr"] == 120 and ex["rapid_ovr"] == 50
+    assert ex["feed"] is None  # MaximumFeedRate - не поточна подача
+    assert ex["this_cycle"] == 95 and ex["last_cycle"] == 206 and ex["cycle_left"] == 111
+    assert ex["axis_loads"] == {"Z": 57, "X": 1, "B": 13} and ex["spindle_hours"] == 4576.8
+    assert ex["messages"] == []
+    d2 = m.parse_mtconnect_current(HAAS_NGC_XML.replace("NO ACTIVE ALARMS", "1010 TOOL CHANGER FAULT"))
+    assert d2["extra"]["messages"] == ["Аварія: 1010 TOOL CHANGER FAULT"]
+
+
+def test_haas_q_spindle_load_and_card(client, monkeypatch):
+    m = client._app_module
+    import socket, threading
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1); port = srv.getsockname()[1]
+
+    def serve():
+        conn, _ = srv.accept()
+        req = conn.recv(100)
+        conn.sendall(b">MACRO, 37.500000\r\n" if b"Q600 1098" in req else b">?\r\n")
+        conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    m._HAAS_Q_FAIL.clear()
+    assert m.haas_q_spindle_load("127.0.0.1", port=port) == 37.5
+    srv.close()
+    # недоступний порт - None і пауза на 10 хв без повторних спроб
+    assert m.haas_q_spindle_load("127.0.0.1", port=1, timeout=0.3) is None
+    assert "127.0.0.1" in m._HAAS_Q_FAIL
+    # картка: цикли, навантаження осей, підказка про налаштування 143
+    monkeypatch.setattr(m, "notify_all", lambda t: None)
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    db.execute("INSERT INTO machines (category, model, in_stock) VALUES ('5-осьовий обробний центр','HAAS UMC 750',1)"); db.commit()
+    mid = db.execute("SELECT id FROM machines WHERE model='HAAS UMC 750'").fetchone()["id"]
+
+    def fake_fetch(host, port, timeout=4):
+        d = m.parse_mtconnect_current(HAAS_NGC_XML)
+        d["extra"]["load_source"] = "unavailable"
+        return d
+    monkeypatch.setattr(m, "fetch_mtconnect", fake_fetch)
+    post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "work_center_id": "new"})
+    t = client.get("/machines").get_data(as_text=True)
+    assert "1019" in t and "1:35" in t and "3:26" in t and "X 1% · Z 57% · B 13%" in t
+    assert "налаштування 143" in t and "21158 мм/хв" not in t and "2500 об/хв" in t
