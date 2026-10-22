@@ -3396,6 +3396,9 @@ a{color:inherit;text-decoration:none;}
   .grid-4 .kpi-value{font-size:22px;}
   .grid[style*="repeat(5"]{grid-template-columns:repeat(2,1fr) !important;}
   .card-pad{padding:14px;}
+  .card-pad>table{display:block; overflow-x:auto;}
+  .funnel-cols{display:none !important;}
+  .funnel-rows{display:flex !important; flex-direction:column; gap:7px;}
   .filters,.filters form{width:100%; flex-wrap:wrap;}
   .filters select,.filters input{min-width:0 !important; flex:1 1 140px;}
   .toolbar .btn{flex:1 1 auto; justify-content:center;}
@@ -3417,6 +3420,8 @@ th{
 td{padding:12px 14px; border-bottom:1px solid rgba(255,255,255,.04); font-size:13.5px;}
 tr:hover td{background:rgba(255,255,255,.02);}
 .table-wrap{overflow-x:auto;}
+.grid>*{min-width:0;}
+.funnel-rows{display:none;}
 .badge{
   display:inline-block; padding:3px 9px; border-radius:20px; font-size:11.5px; font-weight:600;
   border:1px solid rgba(255,255,255,.15);
@@ -3829,6 +3834,16 @@ DASHBOARD_HTML = """
 
 <div class="section-title"><span class="accent-dot"></span> Угоди за етапами</div>
 <div class="card card-pad">
+  <div class="funnel-rows">
+    {% for key,label,color in STAGES %}{% set cnt = funnel.get(key,0) %}
+    <div style="display:grid; grid-template-columns:118px 1fr 26px; align-items:center; gap:8px;">
+      <span style="font-size:12.5px; color:var(--text-dim); line-height:1.2;">{{ label }}</span>
+      <span style="height:12px; border-radius:6px; background:rgba(125,133,144,.14); overflow:hidden;"><i style="display:block; height:100%; width:{{ (cnt / max_funnel * 100) if max_funnel else 0 }}%; min-width:{{ '4px' if cnt else '0' }}; background:{{ color }}; border-radius:6px;"></i></span>
+      <b style="font-size:13px; text-align:right;">{{ cnt }}</b>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="funnel-cols">
   <div style="display:flex; align-items:flex-end; gap:6px; height:150px;">
     {% for key,label,color in STAGES %}
     {% set cnt = funnel.get(key,0) %}
@@ -3840,8 +3855,9 @@ DASHBOARD_HTML = """
   </div>
   <div style="display:flex; gap:6px; margin-top:8px;">
     {% for key,label,color in STAGES %}
-    <div style="flex:1; font-size:10px; color:var(--text-dim); text-align:center; line-height:1.2;">{{ label }}</div>
+    <div style="flex:1; min-width:0; overflow-wrap:anywhere; font-size:10px; color:var(--text-dim); text-align:center; line-height:1.2;">{{ label }}</div>
     {% endfor %}
+  </div>
   </div>
 </div>
 

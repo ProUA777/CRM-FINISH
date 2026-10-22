@@ -106,7 +106,7 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 {% endif %}""")
 
 QUALITY_LIST = _page("Контроль якості", "Контроль якості", "Перевірки та облік браку за 30 днів", """
-<div style="display:flex;gap:12px;margin-bottom:12px"><div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">Перевірено<b>{{ checked }}</b></div>
+<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px"><div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">Перевірено<b>{{ checked }}</b></div>
 <div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">Брак<b>{{ defects }}</b></div><div class="card stat" style="padding:14px;display:flex;flex-direction:column;gap:4px">% браку<b id="defect-pct">{{ pct }}%</b></div>
 {% if current_user['role'] in ('admin','production') %}<a class="btn btn-primary" style="margin-left:auto;align-self:center" href="{{ url_for('quality_new') }}">+ Перевірка</a>{% endif %}</div>
 {% if by_wc %}<div class="card" style="padding:12px;margin-bottom:12px">{% for w in by_wc %}<span class="tag">{{ w['name'] }}: брак {{ w['d'] }} з {{ w['c'] }}</span> {% endfor %}</div>{% endif %}
