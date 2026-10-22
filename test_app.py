@@ -5785,14 +5785,29 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
 
     def serve():
         conn, _ = srv.accept()
-        req = conn.recv(100)
-        conn.sendall(b">MACRO, 37.500000\r\n" if b"Q600 1098" in req else b">?\r\n")
+        for _ in range(2):
+            req = conn.recv(100)
+            if not req:
+                break
+            conn.sendall(b">MACRO, 37.500000\r\n>" if b"Q600 1098" in req else
+                         b">MACRO, 71.0 >" if b"Q600 1094" in req else b">?\r\n")
         conn.close()
     threading.Thread(target=serve, daemon=True).start()
     m._HAAS_Q_FAIL.clear()
     m.HAAS_Q_PORTS["127.0.0.1"] = port  # порт із налаштування 143, збережений у CRM
-    assert m.haas_q_spindle_load("127.0.0.1") == 37.5
+    assert m.haas_q_read("127.0.0.1") == {"load": 37.5, "coolant": 71}
     m.HAAS_Q_PORTS.pop("127.0.0.1")
+    # справжня відповідь стійки NGC: після числа одразу запрошення ">"
+    for reply, want in ((b">MACRO, 0.0 >", 0.0), (b">MACRO, 61.000000\r\n>", 61.0), (b">?\r\n", None)):
+        s2 = socket.socket(); s2.bind(("127.0.0.1", 0)); s2.listen(1); p2 = s2.getsockname()[1]
+
+        def serve2(srv=s2, reply=reply):
+            c, _ = srv.accept(); c.recv(100); c.sendall(reply); c.close()
+        threading.Thread(target=serve2, daemon=True).start()
+        assert m.haas_q_spindle_load("127.0.0.1", port=p2, force=True) == want
+        s2.close()
+    assert "незрозуміло" in m.haas_q_last_error("127.0.0.1")
+    m._HAAS_Q_FAIL.clear()
     srv.close()
     # недоступний порт - None і пауза на 10 хв без повторних спроб
     assert m.haas_q_spindle_load("127.0.0.1", port=1, timeout=0.3) is None
@@ -5823,10 +5838,16 @@ def test_haas_q_spindle_load_and_card(client, monkeypatch):
     m.poll_machines_once()
     t = client.get("/machines").get_data(as_text=True)
     assert "Остання спроба: порт 5051 закритий" in t
-    monkeypatch.setattr(m, "haas_q_spindle_load", lambda host, force=False: 42.0)
+    monkeypatch.setattr(m, "haas_q_read", lambda host, force=False: {"load": 42.0, "coolant": 63})
     r = post(client, f"/machines/{mid}/qtest", {}, follow_redirects=True)
-    assert "навантаження шпинделя зараз 42%" in r.get_data(as_text=True)
-    monkeypatch.setattr(m, "haas_q_spindle_load", lambda host, force=False: None)
+    assert "навантаження шпинделя зараз 42%, рівень СОЖ 63%" in r.get_data(as_text=True)
+    # СОЖ на картці; низький рівень підсвічується
+    d2 = fake_fetch("x", 1); d2["spindle_load_pct"] = 40.0; d2["extra"].update(load_source="Q600 #1098", coolant=15)
+    monkeypatch.setattr(m, "fetch_mtconnect", lambda host, port, timeout=4: d2)
+    m.poll_machines_once()
+    t2 = client.get("/machines").get_data(as_text=True)
+    assert "Рівень СОЖ у баку" in t2 and "15% — долийте" in t2 and "<b>40</b>" in t2 and "Перевірити зараз" not in t2
+    monkeypatch.setattr(m, "haas_q_read", lambda host, force=False: None)
     m._HAAS_Q_FAIL["192.168.10.2"] = (0, "порт 5051 не відповідає (тайм-аут)")
     r = post(client, f"/machines/{mid}/qtest", {}, follow_redirects=True)
     assert "Навантаження не отримано: порт 5051 не відповідає" in r.get_data(as_text=True)

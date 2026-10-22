@@ -5168,6 +5168,7 @@ MACHINES_HTML = """
 .mx-track{height:8px;background:var(--border);border-radius:5px;overflow:hidden}
 .mx-track i{display:block;height:100%;background:#4c9be8;border-radius:5px;transition:width .6s ease}
 .mx-track.over i{background:#e8a33d}
+.mx-cool i{background:linear-gradient(90deg,#2aa1b3,#4cc3d9)}.mx-cool.mid i{background:#e8a33d}.mx-cool.low i{background:#e5534b}
 .mx-axes{display:flex;gap:8px;align-items:flex-end}
 .mx-axes .ax{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;max-width:52px}
 .mx-axes .ax b{font-size:11.5px;font-variant-numeric:tabular-nums}
@@ -5330,6 +5331,8 @@ MACHINE_LIVE_BLOCK_HTML = """
   {% if L.cycle.pct %}<div class="mx-track {{ 'over' if L.cycle.over }}"><i style="width:{{ L.cycle.pct }}%"></i></div>{% endif %}
 </div>{% endif %}
 </div><div class="mx-col">
+{% if L.coolant is not none %}<div class="mx-sec"><div class="mx-row"><span class="mx-lbl">Рівень СОЖ у баку</span><b style="{{ 'color:#e5534b' if L.coolant < 20 else ('color:#e8a33d' if L.coolant < 40 else '') }}">{{ L.coolant }}%{{ ' — долийте' if L.coolant < 20 }}</b></div>
+  <div class="mx-track mx-cool {{ 'low' if L.coolant < 20 else ('mid' if L.coolant < 40) }}"><i style="width:{{ [L.coolant, 2]|max }}%"></i></div></div>{% endif %}
 {% if L.axes %}<div class="mx-sec"><span class="mx-lbl">Навантаження осей</span>
   <div class="mx-axes">{% for a in L.axes %}<div class="ax {{ 'hi' if a.value >= 80 else ('mid' if a.value >= 50 else '') }}" title="Вісь {{ a.axis }}: {{ a.value }}%"><b>{{ a.value }}%</b><div class="ax-t"><i style="height:{{ a.h }}%"></i></div><span>{{ a.axis }}</span></div>{% endfor %}</div>
 </div>{% endif %}
@@ -8512,7 +8515,9 @@ def machine_live(db, m):
             pass
     live.update(status=status, label=MACHINE_STATUS_LABELS.get(status, status), seen=seen, demo=demo,
                 program=t["program_name"] if status != "offline" else None, mode=t["mode"],
-                load=round(t["spindle_load_pct"]) if t["spindle_load_pct"] is not None and status == "running" else None,
+                # верстат стоїть - справжній верстат чесно показує 0%, демо-дані не показуємо
+                load=round(t["spindle_load_pct"]) if t["spindle_load_pct"] is not None and (
+                    status == "running" or (status in ("idle", "alarm") and t["source"] == "mtconnect")) else None,
                 parts=t["part_count"])
     # додаткові дані, які передає сам верстат (MTConnect): оберти, подача, інструмент...
     ex = {}
@@ -8546,6 +8551,8 @@ def machine_live(db, m):
             if v is not None:
                 ovr.append({"label": label, "value": int(round(v)), "warn": key != "rapid_ovr" and round(v) != 100})
     live["overrides"] = ovr
+    cool = num(ex.get("coolant")) if status != "offline" else None
+    live["coolant"] = int(cool) if cool is not None else None
     # цикл: поточний проти попереднього
     cyc = None
     if on and (ex.get("this_cycle") or ex.get("last_cycle")):
@@ -8640,9 +8647,11 @@ def machine_qtest(machine_id):
         flash("Спершу підключіть телеметрію верстата (IP-адреса).", "error")
         return redirect(url_for("machines_list"))
     HAAS_Q_PORTS[row["mtc_host"]] = row["mtc_q_port"] or 5051
-    value = haas_q_spindle_load(row["mtc_host"], force=True)
-    if value is not None:
-        flash(f"Зв'язок є: навантаження шпинделя зараз {value:g}%. На картці воно з'явиться за 15 секунд.", "success")
+    q = haas_q_read(row["mtc_host"], force=True)
+    if q is not None:
+        cool = (f", рівень СОЖ {q['coolant']}%" if q.get("coolant") is not None
+                else ", рівень СОЖ стійка не віддає (можливо, немає датчика)")
+        flash(f"Зв'язок є: навантаження шпинделя зараз {q['load']:g}%{cool}. На картці з'явиться за 15 секунд.", "success")
     else:
         flash("Навантаження не отримано: " + (haas_q_last_error(row["mtc_host"]) or "невідома причина"), "error")
     return redirect(url_for("machines_list") + f"#machine-{machine_id}")
@@ -10874,13 +10883,41 @@ def haas_q_last_error(host):
     return v[1] if v else None
 
 
-def haas_q_spindle_load(host, port=None, timeout=1.5, force=False):
-    """Навантаження шпинделя Haas через Ethernet Q-команди: ?Q600 1098 читає
-    системну змінну #1098 (навантаження шпинделя, %). MTConnect-агент Haas
-    цієї величини не передає. Потрібно: на стійці налаштування 143
-    «Machine Data Collect» = ON (порт 5051). Якщо не відповідає - не
-    смикаємо верстат повторно 2 хвилини, а причину видно в haas_q_last_error.
-    Повертає число або None."""
+def _haas_q_ask(sock, var, timeout):
+    """Один запит ?Q600 <змінна>. Haas NGC відповідає ">MACRO, 37.5" і одразу
+    ставить запрошення ">" (буває "MACRO, 0.0 >"). Повертає (число|None, текст)."""
+    sock.sendall(f"?Q600 {var}\r\n".encode())
+    data = b""
+    end = time.time() + timeout
+    pat = _re.compile(r"MACRO\s*,\s*(-?\d+(?:\.\d*)?)\s*[\r\n>]", _re.I)
+    while time.time() < end and len(data) < 512:
+        text = data.decode("ascii", errors="ignore")
+        if pat.search(text) or ("\n" in text and "MACRO" not in text.upper() and text.strip(" >\r\n")):
+            break
+        try:
+            chunk = sock.recv(256)
+        except (socket_timeout_errors()):
+            break
+        if not chunk:
+            break
+        data += chunk
+    text = data.decode("ascii", errors="ignore").replace("\r", " ").replace("\n", " ").strip(" >")
+    found = (_re.search(r"MACRO\s*,\s*(-?\d+(?:\.\d*)?)", text, _re.I)
+             or _re.fullmatch(r"\s*(-?\d+(?:\.\d*)?)\s*", text))
+    return (float(found.group(1)) if found else None), text
+
+
+def socket_timeout_errors():
+    import socket
+    return (socket.timeout, TimeoutError)
+
+
+def haas_q_read(host, port=None, timeout=1.5, force=False):
+    """Читає з Haas через Ethernet Q-команди (порт = налаштування 143):
+    #1098 - навантаження шпинделя, %; #1094 - рівень СОЖ (якщо стоїть датчик).
+    MTConnect-агент Haas цих величин не передає. Якщо стійка не відповідає -
+    повторна спроба через 2 хвилини, причину видно в haas_q_last_error.
+    Повертає {"load": число, "coolant": число|None} або None."""
     import socket
     port = port or HAAS_Q_PORTS.get(host) or 5051
     prev = _HAAS_Q_FAIL.get(host)
@@ -10890,20 +10927,18 @@ def haas_q_spindle_load(host, port=None, timeout=1.5, force=False):
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.settimeout(timeout)
-            sock.sendall(b"?Q600 1098\r\n")
-            data = b""
-            end = time.time() + timeout
-            while time.time() < end and b"\n" not in data and len(data) < 512:
-                chunk = sock.recv(256)
-                if not chunk:
-                    break
-                data += chunk
-        text = data.decode("ascii", errors="ignore").strip().lstrip(">").strip()
-        value = _mtc_num(text.split(",")[-1]) if "," in text else _mtc_num(text)
-        if value is None or not (0 <= value <= 300):
-            raise ValueError(text)
+            value, text = _haas_q_ask(sock, 1098, timeout)
+            if value is None or not (0 <= value <= 300):
+                raise ValueError(text)
+            out = {"load": round(value, 1), "coolant": None}
+            try:  # рівень СОЖ - необов'язковий: без датчика стійка відповідає інакше
+                cool, _ = _haas_q_ask(sock, 1094, timeout)
+                if cool is not None and 0 <= cool <= 100:
+                    out["coolant"] = round(cool)
+            except OSError:
+                pass
         _HAAS_Q_FAIL.pop(host, None)
-        return round(value, 1)
+        return out
     except ConnectionRefusedError:
         reason = (f"порт {port} закритий: на стійці налаштування 143 вимкнене або в ньому інший порт "
                   "(вкажіть той самий порт у CRM: «Налаштувати телеметрію»)")
@@ -10917,6 +10952,12 @@ def haas_q_spindle_load(host, port=None, timeout=1.5, force=False):
     return None
 
 
+def haas_q_spindle_load(host, port=None, timeout=1.5, force=False):
+    """Лише навантаження шпинделя Haas, % (див. haas_q_read)."""
+    r = haas_q_read(host, port=port, timeout=timeout, force=force)
+    return r["load"] if r else None
+
+
 def fetch_mtconnect(host, port, timeout=4):
     if not MTC_HOST_RE.match(host or ""):
         raise ValueError("Некоректна адреса верстата")
@@ -10928,10 +10969,11 @@ def fetch_mtconnect(host, port, timeout=4):
         body = resp.read(3_000_000)
     data = parse_mtconnect_current(body.decode("utf-8", errors="replace").encode("utf-8"))
     if data.get("spindle_load_pct") is None and (data.get("extra") or {}).get("axis_loads") is not None:
-        q = haas_q_spindle_load(host)
+        q = haas_q_read(host)
         if q is not None:
-            data["spindle_load_pct"] = q
+            data["spindle_load_pct"] = q["load"]
             data["extra"]["load_source"] = "Q600 #1098"
+            data["extra"]["coolant"] = q["coolant"]
         else:
             data["extra"]["load_source"] = "unavailable"
             data["extra"]["q_error"] = haas_q_last_error(host)
