@@ -5701,3 +5701,32 @@ def test_machine_card_shows_extra_machine_data(client, monkeypatch):
     assert "Що передає верстат" in t and "S1load" in t
     live = client.get("/machines/live.json").get_json()[str(mid)]
     assert live["parts"] == 991 and "raw" not in live and ["Оберти шпинделя", "2847 об/хв"] in live["facts"]
+
+
+def test_mtconnect_messages_ignore_service_values_and_diagnostics_file(client, monkeypatch):
+    m = client._app_module
+    xml = HAAS_LIKE_XML.replace("</Events></ComponentStream>\n  <ComponentStream component=\"Door\"",
+        "<Message dataItemId=\"m1\">4</Message><Message dataItemId=\"m2\">false</Message></Events></ComponentStream>\n  <ComponentStream component=\"Door\"")
+    xml = xml.replace('<Warning dataItemId="logic" nativeCode="1021" type="LOGIC_PROGRAM">Low coolant</Warning>',
+                      '<Warning dataItemId="logic" nativeCode="1021" type="LOGIC_PROGRAM">Low coolant</Warning><Warning dataItemId="w2">0.0</Warning>')
+    ex = m.parse_mtconnect_current(xml)["extra"]
+    assert ex["messages"] == ["Увага: Low coolant [1021]"]
+    login(client, "admin", "admin123")
+    db = _raw_db(client)
+    db.execute("INSERT INTO machines (category, model, in_stock) VALUES ('5-осьовий обробний центр','HAAS UMC 750',1)"); db.commit()
+    mid = db.execute("SELECT id FROM machines WHERE model='HAAS UMC 750'").fetchone()["id"]
+    monkeypatch.setattr(m, "notify_all", lambda t: None)
+    monkeypatch.setattr(m, "fetch_mtconnect", lambda host, port, timeout=4: m.parse_mtconnect_current(xml))
+    post(client, f"/machines/{mid}/connect", {"mtc_host": "192.168.10.2", "mtc_port": "8082", "work_center_id": "new"})
+    import urllib.request, io
+
+    class R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=None: R(("<xml for %s/>" % url).encode()))
+    r = client.get(f"/machines/{mid}/diagnostics.txt")
+    t = r.get_data(as_text=True)
+    assert r.status_code == 200 and "attachment" in r.headers["Content-Disposition"]
+    assert "===== /probe =====" in t and "192.168.10.2:8082/current" in t
+    client.get("/logout"); login(client, "tokar", "tokar123")
+    assert client.get(f"/machines/{mid}/diagnostics.txt").status_code == 403

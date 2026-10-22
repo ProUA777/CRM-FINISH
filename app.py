@@ -5187,7 +5187,8 @@ MACHINES_HTML = """
         <div class="mx-bars">{% for d in L.daily %}<i style="height:{{ d.pct }}%" title="{{ d.date }}: {{ d.hours }} год"></i>{% endfor %}</div></div>{% endif %}
       {% if is_admin and L.raw %}<details><summary style="cursor:pointer;font-size:12px;color:var(--accent-2)">Що передає верстат ({{ L.raw|length }} значень)</summary>
         <div class="mx-raw">{% for k, v in L.raw %}<div><span>{{ k }}</span><b>{{ v }}</b></div>{% endfor %}</div>
-        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Якщо потрібної величини (навантаження, деталі) немає в картці, але вона є в цьому списку, сфотографуйте список — підключимо її.</div></details>{% endif %}
+        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Якщо потрібної величини (навантаження, деталі) немає в картці — збережіть файл нижче і надішліть розробнику.</div></details>{% endif %}
+      {% if is_admin and L.mtc %}<a class="btn btn-sm" href="{{ url_for('machine_diagnostics', machine_id=m['id']) }}">⬇ Зберегти дані верстата у файл</a>{% endif %}
       <div style="font-size:11.5px;color:var(--text-dim)">Дільниця: {{ L.wc_name }}{% if L.address %} · MTConnect {{ L.address }}{% endif %}{% if L.alarms_week %} · <span style="color:#e5534b">аварій за тиждень: {{ L.alarms_week }}</span>{% endif %}</div>
     {% else %}
       <div style="font-size:13px;color:var(--text-dim)">Підключіть верстат, і тут з'явиться: працює він чи стоїть, яка програма, навантаження шпинделя, лічильник деталей і години роботи.</div>
@@ -8492,6 +8493,38 @@ def machines_live_json():
     return jsonify(out)
 
 
+@app.route("/machines/<int:machine_id>/diagnostics.txt")
+@login_required
+def machine_diagnostics(machine_id):
+    """Файл для налаштування телеметрії: повний опис даних стійки (/probe -
+    назви, типи, одиниці) і поточні значення (/current). Адмін зберігає його
+    і надсилає розробнику, щоб точно підключити навантаження, деталі тощо."""
+    if not is_admin():
+        abort(403)
+    db = get_db()
+    m = db.execute("""SELECT m.model, w.mtc_host, w.mtc_port FROM machines m
+                      LEFT JOIN work_centers w ON w.id=m.work_center_id WHERE m.id=?""", (machine_id,)).fetchone()
+    if not m:
+        abort(404)
+    if not m["mtc_host"] or not MTC_HOST_RE.match(m["mtc_host"]):
+        flash("Для цього верстата не задано IP-адресу MTConnect", "error")
+        return redirect(url_for("machines_list"))
+    import urllib.request
+    parts = [f"Оснастка-Маркет: дані верстата {m['model']} ({m['mtc_host']}:{m['mtc_port'] or 8082}), {now_iso()}\n"]
+    for path in ("probe", "current"):
+        url = f"http://{m['mtc_host']}:{int(m['mtc_port'] or 8082)}/{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                body = resp.read(3_000_000).decode("utf-8", errors="replace")
+        except Exception as e:
+            body = f"ПОМИЛКА: {e}"
+        parts.append(f"\n===== /{path} =====\n{body}\n")
+    resp = app.response_class("".join(parts), mimetype="text/plain; charset=utf-8")
+    safe = _re.sub(r"[^A-Za-z0-9_-]+", "_", m["model"]) or "machine"
+    resp.headers["Content-Disposition"] = f'attachment; filename="mtconnect_{safe}.txt"'
+    return resp
+
+
 @app.route("/machines/<int:machine_id>/connect", methods=["POST"])
 @login_required
 def machine_connect(machine_id):
@@ -10548,11 +10581,13 @@ def parse_mtconnect_current(xml_text):
                 if tag == "Fault":
                     fault = True
                     found += 1
-                if tag in ("Fault", "Warning") and (val or el.get("nativeCode")):
-                    msg = (val or "") + (f" [{el.get('nativeCode')}]" if el.get("nativeCode") else "")
+                # текст попередження/аварії; службові числа й true/false не показуємо
+                meaningful = bool(val) and _mtc_num(val) is None and val.lower() not in ("true", "false")
+                if tag in ("Fault", "Warning") and (meaningful or el.get("nativeCode")):
+                    msg = (val if meaningful else "") + (f" [{el.get('nativeCode')}]" if el.get("nativeCode") else "")
                     extra["messages"].append(("Аварія: " if tag == "Fault" else "Увага: ") + msg.strip())
                 continue
-            if len(extra["raw"]) < 150:
+            if len(extra["raw"]) < 400:
                 key = f"{comp_name or comp_type}/{tag}" + (f" ({did})" if did else "")
                 extra["raw"].append([key, (val if val is not None else "—")[:60]])
             if val is None:
@@ -10615,8 +10650,8 @@ def parse_mtconnect_current(xml_text):
                 extra["estop"] = val
             elif tag == "Availability":
                 extra["availability"] = val
-            elif tag == "Message" and val:
-                extra["messages"].append(val[:120])
+            # Message-події Haas використовує для службових змінних (4, false, 0.0) -
+            # у повідомлення на картці їх не беремо, вони є в «Що передає верстат»
     if not found:
         raise ValueError("У відповіді немає жодного відомого MTConnect-елемента (Execution, Program, PartCount)")
     exe = (execution or "").upper()
