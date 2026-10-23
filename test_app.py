@@ -5962,3 +5962,33 @@ def test_deadlines_required_and_shown_to_every_role(client, monkeypatch):
                                  (po["id"],)).fetchone()[0]
     assert f"до {shown}" in client.get(f"/work-centers/{wc}/terminal").get_data(as_text=True)
     assert "термін здачі замовлення" in client.get("/production/board").get_data(as_text=True)
+
+
+def test_purchaser_sees_requests_inside_crm_bell_and_badge(client, monkeypatch):
+    """Заявка постачальнику видна в самій CRM: 🔔 і лічильник біля «Закупівля заготовок»."""
+    m = client._app_module
+    monkeypatch.setattr(m, "notify_all", lambda t: None)
+    monkeypatch.setattr(m, "send_telegram_notification", lambda t: (False, "off"))
+    login(client, "postach", "postach123")
+    t = client.get("/").get_data(as_text=True)
+    assert "Нові заявки на закупівлю" not in t
+    client.get("/logout"); login(client, "sklad", "sklad123")
+    page = client.get("/").get_data(as_text=True)
+    assert "Перевірити заготовки: 1" in page  # демо 193-6-2 чекає складу
+    soon = (_dt_mod.date.today() + _dt_mod.timedelta(days=1)).isoformat()
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Свердло Ø8", "qty": "10", "need_by": soon})
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Мітчик М6", "qty": "5", "need_by": _FUT})
+    client.get("/logout"); login(client, "postach", "postach123")
+    t = client.get("/").get_data(as_text=True)
+    assert "Нові заявки на закупівлю: 2 (термінових: 1)" in t
+    nav = t[t.find('<nav class="nav">'):t.find("</nav>")]
+    assert 'Закупівля заготовок <span class="badge badge-high">2</span>' in nav
+    db = _raw_db(client)
+    db.execute("UPDATE stock_requests SET need_by=? WHERE name='Мітчик М6'", ((_dt_mod.date.today() - _dt_mod.timedelta(days=2)).isoformat(),))
+    db.execute("UPDATE stock_requests SET status='shipped', ttn='20450000000001', np_status_code=7 WHERE name='Свердло Ø8'")
+    db.commit()
+    t = client.get("/").get_data(as_text=True)
+    assert "Закупівля прострочена: 1" in t and "Посилки у відділенні НП — заберіть: 1" in t
+    # технолог бачить свою чергу
+    client.get("/logout"); login(client, "tehnolog", "tehnolog123")
+    assert "Чекають техпроцесу: 1" in client.get("/").get_data(as_text=True)

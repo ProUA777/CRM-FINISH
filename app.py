@@ -3508,7 +3508,7 @@ form .actions{display:flex; gap:10px; margin-top:18px;}
       {% set role = current_user['role'] %}
       <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active=='dashboard' }}"><span class="icon">▣</span> Дашборд</a>
       {% if role in ('admin','sales','warehouse','technologist','purchaser','production','viewer') %}<a href="{{ url_for('orders_list') }}" class="{{ 'active' if active=='orders' }}"><span class="icon">📑</span> Замовлення{% if orders_attention() %} <span class="badge badge-high">{{ orders_attention() }}</span>{% endif %}</a>{% endif %}
-      {% if role in ('admin','warehouse','purchaser') %}<a href="{{ url_for('procurement_list') }}" class="{{ 'active' if active=='procurement' }}"><span class="icon">🚚</span> Закупівля заготовок</a>{% endif %}
+      {% if role in ('admin','warehouse','purchaser') %}<a href="{{ url_for('procurement_list') }}" class="{{ 'active' if active=='procurement' }}"><span class="icon">🚚</span> Закупівля заготовок{% if procurement_attention is defined and role in ('admin','purchaser') and procurement_attention() %} <span class="badge badge-high">{{ procurement_attention() }}</span>{% endif %}</a>{% endif %}
       {% if role in ('admin','technologist','production') %}<a href="{{ url_for('routings_list') }}" class="{{ 'active' if active=='routings' }}"><span class="icon">🧭</span> Техпроцеси</a>{% endif %}
 
       <details class="nav-group" data-g="prod" {{ 'open' if active in ('machines','production','board','quality','shift_log','telemetry') }}>

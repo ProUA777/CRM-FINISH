@@ -319,6 +319,78 @@ def register(A):
                 n += 1
         return n
 
+    # ------------------------------------------------------------------ сповіщення в самій CRM (🔔)
+    def flow_reminders(db, user):
+        """Нагадування по потоку замовлення для дзвіночка 🔔 - кожна роль бачить свою
+        чергу з терміновістю; Telegram лише дублює це назовні."""
+        r = user["role"]
+        today = datetime.date.today().isoformat()
+        soon = (datetime.date.today() + datetime.timedelta(days=3)).isoformat()
+        out = []
+
+        def add(text, url, level):
+            out.append({"text": text, "url": url, "level": level})
+
+        if r in ("admin", "purchaser"):
+            q_items = db.execute("""SELECT COUNT(*) n, SUM(oi.due_date < ?) late, SUM(oi.due_date <= ?) soon
+                                    FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                                    WHERE oi.blank_status='to_buy' AND o.status='active'""", (today, soon)).fetchone()
+            q_stock = db.execute("""SELECT COUNT(*) n, SUM(need_by < ?) late, SUM(need_by <= ?) soon
+                                    FROM stock_requests WHERE status='to_buy'""", (today, soon)).fetchone()
+            n = (q_items["n"] or 0) + (q_stock["n"] or 0)
+            late = (q_items["late"] or 0) + (q_stock["late"] or 0)
+            urgent = (q_items["soon"] or 0) + (q_stock["soon"] or 0) - late
+            if late:
+                add(f"Закупівля прострочена: {late}", "/procurement", "high")
+            if n:
+                add(f"Нові заявки на закупівлю: {n}" + (f" (термінових: {urgent})" if urgent else ""), "/procurement",
+                    "high" if urgent else "medium")
+            arrived = db.execute("""SELECT (SELECT COUNT(*) FROM order_items WHERE blank_status='shipped' AND np_status_code IN (7, 8))
+                                    + (SELECT COUNT(*) FROM stock_requests WHERE status='shipped' AND np_status_code IN (7, 8)) c""").fetchone()["c"]
+            if arrived:
+                add(f"Посилки у відділенні НП — заберіть: {arrived}", "/procurement", "high")
+        if r in ("admin", "warehouse"):
+            q = db.execute("""SELECT COUNT(*) n, SUM(oi.due_date <= ?) soon FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                              WHERE oi.blank_status='unchecked' AND oi.production_order_id IS NULL AND o.status='active'""",
+                           (soon,)).fetchone()
+            if q["n"]:
+                add(f"Перевірити заготовки: {q['n']}" + (f" (термінових: {q['soon']})" if q["soon"] else ""), "/orders",
+                    "high" if q["soon"] else "medium")
+        if r in ("admin", "technologist"):
+            q = db.execute("""SELECT COUNT(*) n, SUM(oi.due_date <= ?) soon FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                              WHERE oi.routing_id IS NULL AND oi.production_order_id IS NULL AND o.status='active'""",
+                           (soon,)).fetchone()
+            if q["n"]:
+                add(f"Чекають техпроцесу: {q['n']}" + (f" (термінових: {q['soon']})" if q["soon"] else ""), "/routings",
+                    "high" if q["soon"] else "medium")
+        if r in ("admin", "technologist", "production"):
+            q = db.execute("""SELECT COUNT(*) n FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                              WHERE oi.routing_id IS NOT NULL AND oi.blank_status IN ('in_stock','received')
+                                AND oi.production_order_id IS NULL AND o.status='active'""").fetchone()
+            if q["n"]:
+                add(f"Готові до запуску у виробництво: {q['n']}", "/orders", "medium")
+        if r in ("admin", "sales"):
+            q = db.execute("""SELECT COUNT(*) n FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                              LEFT JOIN production_orders po ON po.id=oi.production_order_id
+                              WHERE o.status='active' AND oi.due_date < ? AND COALESCE(po.status,'') != 'done'""",
+                           (today,)).fetchone()
+            if q["n"]:
+                add(f"Прострочені позиції замовлень: {q['n']}", "/orders", "high")
+        return out
+
+    _base_get_reminders = A.get_reminders
+
+    def get_reminders_with_flow(db, user):
+        base = _base_get_reminders(db, user)
+        if not user:
+            return base
+        try:
+            return flow_reminders(db, user) + base
+        except Exception:
+            return base
+
+    A.get_reminders = get_reminders_with_flow
+
     # ------------------------------------------------------------------ context
     @app.context_processor
     def inject_orders_helpers():
@@ -332,9 +404,6 @@ def register(A):
                 if r == "warehouse":
                     n = db.execute("SELECT COUNT(*) c FROM order_items WHERE blank_status IN ('unchecked','received') "
                                    "AND production_order_id IS NULL AND blank_status='unchecked'").fetchone()["c"]
-                elif r == "purchaser":
-                    n = db.execute("SELECT COUNT(*) c FROM order_items WHERE blank_status='to_buy'").fetchone()["c"]
-                    n += db.execute("SELECT COUNT(*) c FROM stock_requests WHERE status='to_buy'").fetchone()["c"]
                 elif r == "technologist":
                     n = db.execute("SELECT COUNT(*) c FROM order_items oi JOIN orders o ON o.id=oi.order_id "
                                    "WHERE oi.routing_id IS NULL AND oi.production_order_id IS NULL "
@@ -386,7 +455,17 @@ def register(A):
             except Exception:
                 return []
 
+        def procurement_attention():
+            try:
+                db = get_db()
+                return (db.execute("SELECT COUNT(*) c FROM order_items oi JOIN orders o ON o.id=oi.order_id "
+                                   "WHERE oi.blank_status='to_buy' AND o.status='active'").fetchone()["c"]
+                        + db.execute("SELECT COUNT(*) c FROM stock_requests WHERE status='to_buy'").fetchone()["c"])
+            except Exception:
+                return 0
+
         return dict(orders_attention=orders_attention, routing_library=routing_library, upcoming_deadlines=upcoming_deadlines,
+                    procurement_attention=procurement_attention,
                     BLANK_STATUSES=BLANK_STATUSES, warehouse_all=warehouse_all, stock_pending=stock_pending,
                     need_by_default=(datetime.date.today() + datetime.timedelta(days=3)).isoformat(),
                     today_iso=datetime.date.today().isoformat())
