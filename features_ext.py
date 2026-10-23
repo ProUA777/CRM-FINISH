@@ -450,7 +450,12 @@ def register(A):
             return redirect(url_for("purchase_request"))
         if hasattr(A, "create_stock_requests"):
             # заявка йде постачальнику: у Telegram і в його розділ «Закупівля»
-            n, ok, msg = A.create_stock_requests(db, lines)
+            try:
+                need_by = A.need_by_from(request.form)
+            except A.ValidationError as e:
+                flash(str(e), "error")
+                return redirect(url_for("purchase_request"))
+            n, ok, msg = A.create_stock_requests(db, lines, need_by)
             flash(f"Заявку ({n} поз.) передано постачальнику в розділ «Закупівля»" + ("" if ok else f"; Telegram: {msg}"),
                   "success" if ok else "error")
             return redirect(url_for("purchase_request"))
@@ -685,7 +690,7 @@ def register(A):
         days = [start + datetime.timedelta(days=i) for i in range(14)]
         wcs = db.execute("SELECT * FROM work_centers ORDER BY id").fetchall()
         ops = db.execute(
-            """SELECT op.*, po.id AS order_id, d.title AS deal_title FROM production_operations op
+            """SELECT op.*, po.id AS order_id, po.due_date, COALESCE(d.title, po.title) AS deal_title FROM production_operations op
                JOIN production_orders po ON po.id=op.production_order_id LEFT JOIN deals d ON d.id=po.deal_id
                WHERE op.status!='done' AND po.status!='cancelled'""").fetchall()
         cells, unscheduled = {}, []

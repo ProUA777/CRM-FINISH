@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS stock_requests (
     np_checked_at TEXT,
     created_by INTEGER,
     created_at TEXT NOT NULL,
-    received_at TEXT
+    received_at TEXT,
+    need_by TEXT
 );
 """
 
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS stock_requests (
 ORDERS_MIGRATIONS = {
     "orders": [("contact_person", "TEXT"), ("payment_terms", "TEXT"), ("delivery", "TEXT")],
     "order_items": [("price", "REAL"), ("currency", "TEXT DEFAULT 'UAH'"), ("purchase_cost", "REAL")],
+    "stock_requests": [("need_by", "TEXT")],
 }
 
 # Стан заготовки по позиції
@@ -275,7 +277,11 @@ def register(A):
         if item["batch_delivery"]:
             parts.append("партійно")
         if item["due_date"]:
-            parts.append(("до " if item["batch_delivery"] else "") + item["due_date"])
+            try:
+                shown = datetime.date.fromisoformat(item["due_date"][:10]).strftime("%d.%m.%Y")
+            except ValueError:
+                shown = item["due_date"]
+            parts.append("до " + shown)
         return ", ".join(parts) or "—"
 
     def enrich(db, items):
@@ -361,8 +367,29 @@ def register(A):
             except Exception:
                 return []
 
-        return dict(orders_attention=orders_attention, routing_library=routing_library,
-                    BLANK_STATUSES=BLANK_STATUSES, warehouse_all=warehouse_all, stock_pending=stock_pending)
+        def upcoming_deadlines(limit=8):
+            """Найближчі терміни по відкритих позиціях замовлень - для дашборду всіх ролей."""
+            try:
+                db = get_db()
+                rows = db.execute("""SELECT oi.*, o.number, c.name AS client_name FROM order_items oi
+                                     JOIN orders o ON o.id=oi.order_id LEFT JOIN clients c ON c.id=o.client_id
+                                     WHERE o.status='active' AND oi.due_date IS NOT NULL
+                                     ORDER BY oi.due_date, oi.id LIMIT 60""").fetchall()
+                out = []
+                for d in enrich(db, rows):
+                    if d["stage_key"] != "done":
+                        d["number"] = d.get("number")
+                        out.append(d)
+                    if len(out) >= limit:
+                        break
+                return out
+            except Exception:
+                return []
+
+        return dict(orders_attention=orders_attention, routing_library=routing_library, upcoming_deadlines=upcoming_deadlines,
+                    BLANK_STATUSES=BLANK_STATUSES, warehouse_all=warehouse_all, stock_pending=stock_pending,
+                    need_by_default=(datetime.date.today() + datetime.timedelta(days=3)).isoformat(),
+                    today_iso=datetime.date.today().isoformat())
 
     # ------------------------------------------------------------------ orders
     @app.route("/orders")
@@ -385,13 +412,15 @@ def register(A):
         orders = []
         for o in db.execute(sql, params).fetchall():
             items = enrich(db, db.execute("SELECT * FROM order_items WHERE order_id=? ORDER BY line_no", (o["id"],)).fetchall())
-            dues = [i["due_date"] for i in items if i["due_date"]]
+            dues = [i["due_date"] for i in items if i["due_date"] and i["stage_key"] != "done"]
             tot = {}
             for i in items:
                 if i["line_sum"] is not None:
                     tot[i["currency"] or "UAH"] = round(tot.get(i["currency"] or "UAH", 0) + i["line_sum"], 2)
             orders.append({"o": o, "items": items, "due": min(dues) if dues else None, "totals": tot,
                            "overdue": any(i["overdue"] for i in items)})
+        # найтерміновіші - зверху (без відкритих термінів - у кінці, новіші першими)
+        orders.sort(key=lambda e: (e["o"]["status"] != "active", e["due"] is None, e["due"] or "", -e["o"]["id"]))
         return render_template("orders_list.html", active="orders", orders=orders, q=q, show=show,
                                money=role() in MONEY_ROLES)
 
@@ -419,12 +448,13 @@ def register(A):
             qty = num(r.get("qty"), None)
             if qty is None or qty <= 0:
                 raise A.ValidationError(f"Позиція «{r['name']}»: кількість має бути більше нуля")
-            due = r.get("due") or None
-            if due:
-                try:
-                    datetime.date.fromisoformat(due)
-                except ValueError:
-                    raise A.ValidationError(f"Позиція «{r['name']}»: некоректна дата терміну")
+            due = r.get("due") or (form.get("due_all") or "").strip() or None
+            if not due:
+                raise A.ValidationError(f"Позиція «{r['name']}»: вкажіть термін — до якої дати потрібна деталь")
+            try:
+                datetime.date.fromisoformat(due)
+            except ValueError:
+                raise A.ValidationError(f"Позиція «{r['name']}»: некоректна дата терміну")
             price = num(r.get("price"), None) if (r.get("price") or "").strip() else None
             if price is not None and price < 0:
                 raise A.ValidationError(f"Позиція «{r['name']}»: ціна не може бути від'ємною")
@@ -519,7 +549,9 @@ def register(A):
             db.commit()
             o = db.execute("SELECT o.number, c.name FROM orders o LEFT JOIN clients c ON c.id=o.client_id WHERE o.id=?",
                            (oid,)).fetchone()
-            A.notify_all(f"📑 Нове замовлення {o['number']} ({o['name'] or ''}): позицій {n}.\n"
+            lines = "\n".join(f"• {i['code']} {i['name']} — {i['quantity']:g} {i['unit']}, {due_text(i)}" for i in
+                              db.execute("SELECT * FROM order_items WHERE order_id=? ORDER BY line_no", (oid,)).fetchall())
+            A.notify_all(f"📑 Нове замовлення {o['number']} ({o['name'] or ''}): позицій {n}.\n{lines}\n"
                          f"Склад — перевірити заготовки, технолог — техпроцеси.\n{base_url(db)}/orders/{oid}")
             flash("Замовлення створено. Склад і технолог бачать його у своїх чергах." +
                   (f" Техпроцес підставлено автоматично для {auto} поз. (така деталь уже робилась)." if auto else ""),
@@ -685,18 +717,35 @@ def register(A):
         return redirect(back)
 
     # -------------------------------------------------- заявки складу (матеріали) для постачальника
-    def create_stock_requests(db, lines):
+    def need_by_from(form):
+        """«Потрібно до» із форми складу: обов'язкова дата, не в минулому."""
+        v = (form.get("need_by") or "").strip()
+        try:
+            d = datetime.date.fromisoformat(v)
+        except ValueError:
+            raise A.ValidationError("Вкажіть, до якої дати потрібна закупівля")
+        if d < datetime.date.today():
+            raise A.ValidationError("Дата «Потрібно до» вже минула")
+        return d.isoformat()
+
+    A.need_by_from = need_by_from
+
+    def _need_by_txt(v):
+        return f"потрібно до {datetime.date.fromisoformat(v).strftime('%d.%m.%Y')}" if v else "термін не вказано"
+
+    def create_stock_requests(db, lines, need_by=None):
         """lines: [(warehouse_item_row, qty)] -> записи в «Закупівлі» постачальника
         і повідомлення йому в Telegram. Повертає (кількість, ok, msg)."""
         ids = []
         for it, qty in lines:
             db.execute("""INSERT INTO stock_requests (warehouse_item_id, name, unit, qty, note, status, price,
-                          created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                          created_by, created_at, need_by) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                        (it["id"], it["name"], it["unit"], qty, f"Залишок {it['qty_on_hand']:g}, мін. {it['min_qty']:g}",
-                        "to_buy", None, A.session.get("user_id"), A.now_iso()))
+                        "to_buy", None, A.session.get("user_id"), A.now_iso(), need_by))
             ids.append(db.execute("SELECT last_insert_rowid() id").fetchone()["id"])
         db.commit()
         text = ("🛒 Заявка складу на закупівлю:\n" + "\n".join(f"• {it['name']} — {qty:g} {it['unit']}" for it, qty in lines)
+                + f"\n⏰ {_need_by_txt(need_by)}"
                 + f"\nПісля закупівлі впишіть ТТН і ціну: {base_url(db)}/procurement")
         chat = A.get_setting(db, "purchaser_chat_id", "")
         if chat:
@@ -722,6 +771,11 @@ def register(A):
             flash("Вкажіть кількість більше нуля", "error")
             return redirect(url_for("purchase_request"))
         note = (f.get("note") or "").strip()[:300]
+        try:
+            need_by = need_by_from(f)
+        except A.ValidationError as e:
+            flash(str(e), "error")
+            return redirect(url_for("purchase_request") + "#purchase-add")
         item = None
         if (f.get("item_id") or "").isdigit():
             item = db.execute("SELECT * FROM warehouse_items WHERE id=?", (int(f.get("item_id")),)).fetchone()
@@ -732,11 +786,13 @@ def register(A):
             return redirect(url_for("purchase_request"))
         if item:
             note = note or f"Залишок {item['qty_on_hand']:g}, мін. {item['min_qty']:g}"
-        db.execute("""INSERT INTO stock_requests (warehouse_item_id, name, unit, qty, note, status, created_by, created_at)
-                      VALUES (?,?,?,?,?,'to_buy',?,?)""",
-                   (item["id"] if item else None, name, unit, qty, note or None, A.session.get("user_id"), A.now_iso()))
+        db.execute("""INSERT INTO stock_requests (warehouse_item_id, name, unit, qty, note, status, created_by, created_at,
+                      need_by) VALUES (?,?,?,?,?,'to_buy',?,?,?)""",
+                   (item["id"] if item else None, name, unit, qty, note or None, A.session.get("user_id"), A.now_iso(),
+                    need_by))
         db.commit()
         text = (f"🛒 Заявка складу на закупівлю:\n• {name} — {qty:g} {unit}" + (f" ({note})" if note else "")
+                + f"\n⏰ {_need_by_txt(need_by)}"
                 + f"\nПісля закупівлі впишіть ТТН і ціну: {base_url(db)}/procurement")
         chat = A.get_setting(db, "purchaser_chat_id", "")
         ok, msg = A.send_telegram_to(chat, text) if chat else A.send_telegram_notification(text)
@@ -822,12 +878,13 @@ def register(A):
                        WHERE oi.blank_status IN ('to_buy','ordered','shipped')
                           OR (oi.blank_status='received' AND oi.ttn IS NOT NULL AND oi.production_order_id IS NULL)
                        ORDER BY CASE oi.blank_status WHEN 'to_buy' THEN 0 WHEN 'ordered' THEN 1
-                                WHEN 'shipped' THEN 2 ELSE 3 END, oi.id"""
+                                WHEN 'shipped' THEN 2 ELSE 3 END, oi.due_date IS NULL, oi.due_date, oi.id"""
         week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
         sql_stock = """SELECT sr.*, w.qty_on_hand, w.min_qty, w.sku FROM stock_requests sr
                        LEFT JOIN warehouse_items w ON w.id=sr.warehouse_item_id
                        WHERE sr.status!='received' OR sr.received_at>=?
-                       ORDER BY CASE sr.status WHEN 'to_buy' THEN 0 WHEN 'ordered' THEN 1 WHEN 'shipped' THEN 2 ELSE 3 END, sr.id"""
+                       ORDER BY CASE sr.status WHEN 'to_buy' THEN 0 WHEN 'ordered' THEN 1 WHEN 'shipped' THEN 2 ELSE 3 END,
+                                sr.need_by IS NULL, sr.need_by, sr.id"""
         errs = [refresh_np(db, db.execute(sql_items).fetchall()),
                 refresh_np(db, db.execute(sql_stock, (week_ago,)).fetchall(), table="stock_requests")]
         for e in {e for e in errs if e}:
@@ -905,7 +962,8 @@ def register(A):
         A.schedule_production_order(db, po_id)
         db.execute("UPDATE order_items SET production_order_id=? WHERE id=?", (po_id, item_id))
         db.commit()
-        A.notify_all(f"🏭 У виробництво: {it['code']} — {it['name']}, {qty} {it['unit']} (виробниче №{po_id}).")
+        A.notify_all(f"🏭 У виробництво: {it['code']} — {it['name']}, {qty} {it['unit']} (виробниче №{po_id}), "
+                     f"термін {due_text(it)}.")
         flash(f"Запущено у виробництво: виробниче замовлення №{po_id}", "success")
         return redirect(back)
 
@@ -931,10 +989,10 @@ def register(A):
             sql += " AND (r.name LIKE ? OR r.drawing_no LIKE ? OR r.material LIKE ?)"
             params += [f"%{q}%"] * 3
         rows = db.execute(sql + " ORDER BY r.name", params).fetchall()
-        waiting = db.execute("""SELECT oi.id, oi.code, oi.name, oi.drawing_no, oi.order_id FROM order_items oi
+        waiting = db.execute("""SELECT oi.id, oi.code, oi.name, oi.drawing_no, oi.order_id, oi.due_date FROM order_items oi
                                 JOIN orders o ON o.id=oi.order_id
                                 WHERE oi.routing_id IS NULL AND oi.production_order_id IS NULL AND o.status='active'
-                                ORDER BY oi.id LIMIT 50""").fetchall()
+                                ORDER BY oi.due_date IS NULL, oi.due_date, oi.id LIMIT 50""").fetchall()
         return render_template("routings_list.html", active="routings", rows=rows, q=q, waiting=waiting, r=role())
 
     def _save_routing(db, routing=None):
@@ -1250,5 +1308,6 @@ def seed_orders_demo(A, db):
                  "Коло Ст45 Ø40 — 120 кг на складі", rids[0]))
     cur.execute("""INSERT INTO order_items (order_id, line_no, name, drawing_no, unit, quantity, due_date, batch_delivery,
                    code, blank_status, blank_note, routing_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (oid, 2, "Кронштейн пружини", "кр.322200.012", "шт", 400, None, 0, "193-6-2", "unchecked", None, None))
+                (oid, 2, "Кронштейн пружини", "кр.322200.012", "шт", 400,
+                 (datetime.date.today() + datetime.timedelta(days=35)).isoformat(), 0, "193-6-2", "unchecked", None, None))
     db.commit()

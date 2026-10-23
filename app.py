@@ -3421,6 +3421,8 @@ td{padding:12px 14px; border-bottom:1px solid rgba(255,255,255,.04); font-size:1
 tr:hover td{background:rgba(255,255,255,.02);}
 .table-wrap{overflow-x:auto;}
 .grid>*{min-width:0;}
+.due{display:inline-flex;align-items:center;gap:3px;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;background:rgba(125,133,144,.14);color:var(--text);white-space:nowrap}
+.due-late{background:rgba(229,83,75,.16);color:#e5534b}.due-soon{background:rgba(232,163,61,.18);color:#e8a33d}.due-none{color:var(--text-dim);font-weight:500}
 .funnel-rows{display:none;}
 .badge{
   display:inline-block; padding:3px 9px; border-radius:20px; font-size:11.5px; font-weight:600;
@@ -3777,6 +3779,20 @@ DASHBOARD_HTML = """
   </div>
 </div>
 {% endif %}
+{% if upcoming_deadlines is defined and current_user['role'] in ('admin','sales','warehouse','technologist','purchaser','production','viewer','accountant') %}{% set dl = upcoming_deadlines() %}{% if dl %}
+<div class="card card-pad" id="deadlines-card" style="margin-bottom:18px;">
+  <div class="section-title" style="margin-top:0;"><span class="accent-dot"></span> Найближчі терміни замовлень</div>
+  <div style="display:flex; flex-direction:column; gap:8px;">
+  {% for i in dl %}
+    <a href="{{ url_for('orders_detail', order_id=i.order_id) }}#item-{{ i.id }}" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; color:inherit; text-decoration:none; font-size:13px;">
+      {{ i.due_date|due }}
+      <b>{{ i.code }}</b><span style="flex:1; min-width:150px;">{{ i.name }} · {{ '%g'|format(i.quantity) }} {{ i.unit }} <span style="color:var(--text-dim);">{{ i.client_name or '' }}</span></span>
+      <span class="o-chip" style="font-size:11.5px; padding:2px 8px; border-radius:999px; border:1px solid {{ i.stage_color }}; color:{{ i.stage_color }};">{{ i.stage_label }}</span>
+    </a>
+  {% endfor %}
+  </div>
+</div>
+{% endif %}{% endif %}
 <div class="grid grid-4">
   <div class="card kpi">
     <div class="label">Відкриті угоди</div>
@@ -5482,11 +5498,12 @@ PRODUCTION_HTML = """
 </div>
 <div class="card table-wrap">
   <table>
-    <tr><th>№</th><th>Угода / клієнт</th><th>Верстат</th><th>Статус</th><th>Прогрес операцій</th><th>Плановий фініш</th></tr>
+    <tr><th>№</th><th>Угода / клієнт</th><th>Термін здачі</th><th>Верстат</th><th>Статус</th><th>Прогрес операцій</th><th>Плановий фініш</th></tr>
     {% for o in orders %}
     <tr onclick="window.location='{{ url_for('production_detail', order_id=o['id']) }}'" style="cursor:pointer;">
       <td>#{{ o['id'] }}</td>
       <td>{{ o['client_name'] or '—' }}<br><span style="color:var(--text-dim); font-size:11.5px;">{{ o['deal_title'] or '' }}</span></td>
+      <td>{{ o['due_date']|due(o['status']=='done') }}</td>
       <td>{{ o['machine_name'] or '—' }}</td>
       <td><span class="badge badge-{{ 'low' if o['status']=='done' else 'medium' }}">{{ dict(PRODUCTION_ORDER_STATUSES)[o['status']] }}</span></td>
       <td>
@@ -5496,7 +5513,7 @@ PRODUCTION_HTML = """
       <td>{{ o['planned_end'] or '—' }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="6" class="empty">Виробничих замовлень ще немає — вони створюються автоматично при переході угоди на стадію «Передоплата отримана»</td></tr>
+    <tr><td colspan="7" class="empty">Виробничих замовлень ще немає — вони створюються автоматично при переході угоди на стадію «Передоплата отримана»</td></tr>
     {% endfor %}
   </table>
 </div>
@@ -5513,7 +5530,7 @@ PRODUCTION_DETAIL_HTML = """
   <div class="stat-row">
     <div class="stat">Статус<b>{{ dict(PRODUCTION_ORDER_STATUSES)[order['status']] }}</b></div>
     <div class="stat">Кількість<b>{{ order['quantity'] }}</b></div>
-    <div class="stat">Плановий термін<b>{{ order['due_date'] or '—' }}</b></div>
+    <div class="stat">Термін здачі<b>{{ order['due_date']|due(order['status']=='done') }}</b></div>
   </div>
   <div style="display:flex; gap:8px;">
     {% if current_user['role'] in ('admin','sales','accountant') %}<a class="btn btn-sm" href="{{ url_for('production_costs') }}#order-{{ order['id'] }}">⚖ План/факт</a>{% endif %}
@@ -5666,6 +5683,7 @@ TERMINAL_HTML = """
       <div style="flex:1; min-width:240px;">
         <div style="font-size:11px; color:var(--text-dim);">{{ op.client_name or '—' }}</div>
         <div style="font-size:18px; font-weight:700; margin:2px 0;">{{ op.deal_title or ('Замовлення №' ~ op.production_order_id) }}</div>
+        <div style="margin:2px 0 4px;">{{ op.due_date|due }}</div>
         <div style="font-size:15px; font-weight:600; color:var(--accent-2);">{{ op.operation_name }}</div>
         <div style="font-size:11.5px; color:var(--text-dim); margin-top:4px;">
           Етап {{ op.step_order }} із {{ op.steps_total }} · {{ op.quantity }} шт. · норма {{ op.planned_hours|hm }}
@@ -9526,7 +9544,7 @@ def work_center_terminal(wc_id):
     if not wc:
         abort(404)
     ops = db.execute(
-        """SELECT op.*, po.quantity, COALESCE(d.title, po.title) as deal_title, c.name as client_name
+        """SELECT op.*, po.quantity, po.due_date, COALESCE(d.title, po.title) as deal_title, c.name as client_name
            FROM production_operations op
            JOIN production_orders po ON po.id=op.production_order_id
            LEFT JOIN deals d ON d.id=po.deal_id
@@ -10228,6 +10246,34 @@ def _public_url(db):
     if get_setting(db, "cf_enabled", "0") != "1":
         return None
     return (get_setting(db, "cf_public_url", "") or "").strip().rstrip("/") or None
+
+
+def due_info(value, done=False):
+    """Термін для показу всім ролям: (текст, клас). Клас: due-late / due-soon / due-ok / due-none."""
+    if not value:
+        return "без терміну", "due-none"
+    try:
+        d = datetime.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return str(value), "due-none"
+    left = (d - datetime.date.today()).days
+    txt = "до " + d.strftime("%d.%m.%Y")
+    if done:
+        return txt, "due-ok"
+    if left < 0:
+        return f"{txt} · прострочено {-left} дн.", "due-late"
+    if left == 0:
+        return f"{txt} · сьогодні", "due-soon"
+    if left <= 3:
+        return f"{txt} · ще {left} дн.", "due-soon"
+    return f"{txt} · ще {left} дн.", "due-ok"
+
+
+@app.template_filter("due")
+def _due_filter(value, done=False):
+    from markupsafe import Markup, escape
+    txt, cls = due_info(value, done)
+    return Markup(f'<span class="due {cls}" title="Термін виконання">⏰ {escape(txt)}</span>')
 
 
 @app.template_filter("hm")

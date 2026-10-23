@@ -39,11 +39,12 @@ ORDERS_LIST = _page("Замовлення", "Замовлення", "Служб�
 <div class="o-item">
  <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
   <h3>№ {{ o['number'] }} · {{ o['client_name'] or '—' }}</h3>
-  <div style="font-size:12.5px;color:var(--text-dim)">від {{ o['doc_date'] or '' }}{% if e.due %} · найближчий термін <span class="{{ 'o-late' if e.overdue }}">{{ e.due }}</span>{% endif %}{% if money and e.totals %} · <b style="color:var(--text)">{% for cur, v in e.totals.items() %}{{ v|money(cur) }}{% if not loop.last %} + {% endif %}{% endfor %}</b>{% endif %}{% if o['status']!='active' %} · <b>{{ 'закрито' if o['status']=='closed' else 'скасовано' }}</b>{% endif %}</div>
+  <div style="font-size:12.5px;color:var(--text-dim)">від {{ o['doc_date'] or '' }}{% if e.due %} · найближчий {{ e.due|due }}{% endif %}{% if money and e.totals %} · <b style="color:var(--text)">{% for cur, v in e.totals.items() %}{{ v|money(cur) }}{% if not loop.last %} + {% endif %}{% endfor %}</b>{% endif %}{% if o['status']!='active' %} · <b>{{ 'закрито' if o['status']=='closed' else 'скасовано' }}</b>{% endif %}</div>
  </div>
  <div style="margin-top:8px;display:grid;gap:6px">
  {% for i in e['items'] %}<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px">
   <b style="min-width:70px">{{ i.code }}</b><span style="flex:1;min-width:180px">{{ i.name }} <span style="color:var(--text-dim)">{{ i.drawing_no or '' }}</span> · {{ '%g'|format(i.quantity) }} {{ i.unit }}</span>
+  {{ i.due_date|due(i.stage_key=='done') }}
   <span class="o-chip" style="color:{{ i.stage_color }};border-color:{{ i.stage_color }}">{{ i.stage_label }}</span>
  </div>{% endfor %}
  </div>
@@ -69,8 +70,13 @@ ORDER_FORM = _page("Замовлення", "{{ 'Замовлення № ' ~ ord
  <div class="field"><label>Доставка</label><input type="text" name="delivery" placeholder="самовивіз / НП, адреса" value="{{ fv.get('delivery') or (order['delivery'] or '' if order else '') }}"></div>
 </div>
 <h3 style="margin:18px 0 8px;font-size:15px">Позиції</h3>
+<div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:8px">
+ <div class="field" style="margin:0"><label>Термін для всіх позицій</label><input type="date" id="due-all" name="due_all" value="{{ fv.get('due_all') or '' }}"></div>
+ <button type="button" class="btn btn-sm" onclick="var v=document.getElementById('due-all').value;if(!v){alert('Оберіть дату');return;}document.querySelectorAll('#item-rows input[type=date]').forEach(function(e){if(!e.value)e.value=v;})">Підставити в порожні</button>
+ <span style="font-size:11.5px;color:var(--text-dim)">Термін обов'язковий: його бачать склад, постачальник, технолог і верстатники.</span>
+</div>
 <div class="table-wrap"><table class="items-table" style="width:100%">
-<tr><th style="width:34px">№</th><th style="min-width:220px">Назва *</th><th style="min-width:150px">Креслення</th><th style="width:70px">Од.</th><th style="width:90px">К-сть *</th><th style="width:150px">Термін</th><th style="width:90px">Партійно</th><th style="width:120px">Шифр</th><th style="width:110px">Ціна за од.</th><th style="width:80px">Валюта</th><th style="width:40px"></th></tr>
+<tr><th style="width:34px">№</th><th style="min-width:220px">Назва *</th><th style="min-width:150px">Креслення</th><th style="width:70px">Од.</th><th style="width:90px">К-сть *</th><th style="width:150px">Термін *</th><th style="width:90px">Партійно</th><th style="width:120px">Шифр</th><th style="width:110px">Ціна за од.</th><th style="width:80px">Валюта</th><th style="width:40px"></th></tr>
 <tbody id="item-rows">
 {% for it in items %}<tr>
  <td class="ln">{{ loop.index }}<input type="hidden" name="items-{{ loop.index0 }}-id" value="{{ it['id'] }}"></td>
@@ -78,7 +84,7 @@ ORDER_FORM = _page("Замовлення", "{{ 'Замовлення № ' ~ ord
  <td><input type="text" name="items-{{ loop.index0 }}-drawing" value="{{ it['drawing_no'] or '' }}" placeholder="кр.322100.022"></td>
  <td><input type="text" name="items-{{ loop.index0 }}-unit" value="{{ it['unit'] or 'шт' }}"></td>
  <td><input name="items-{{ loop.index0 }}-qty" type="number" step="any" min="0" value="{{ '%g'|format(it['quantity']) }}" required></td>
- <td><input name="items-{{ loop.index0 }}-due" type="date" value="{{ it['due_date'] or '' }}"></td>
+ <td><input name="items-{{ loop.index0 }}-due" type="date" value="{{ it['due_date'] or '' }}" required></td>
  <td style="text-align:center"><input name="items-{{ loop.index0 }}-batch" type="checkbox" value="1" style="width:auto" {{ 'checked' if it['batch_delivery'] }}></td>
  <td><input type="text" name="items-{{ loop.index0 }}-code" value="{{ it['code'] or '' }}"></td>
  <td><input name="items-{{ loop.index0 }}-price" type="number" step="0.01" min="0" value="{{ '%g'|format(it['price']) if it['price'] is not none else '' }}"></td>
@@ -101,7 +107,7 @@ function addRow(){
    '<td><input type="text" name="items-'+i+'-drawing" placeholder="кр.322100.022"></td>'+
    '<td><input type="text" name="items-'+i+'-unit" value="шт"></td>'+
    '<td><input name="items-'+i+'-qty" type="number" step="any" min="0" required></td>'+
-   '<td><input name="items-'+i+'-due" type="date"></td>'+
+   '<td><input name="items-'+i+'-due" type="date" required value="'+(document.getElementById('due-all').value||'')+'"></td>'+
    '<td style="text-align:center"><input name="items-'+i+'-batch" type="checkbox" value="1" style="width:auto"></td>'+
    '<td><input type="text" name="items-'+i+'-code" placeholder="авто"></td>'+
    '<td><input name="items-'+i+'-price" type="number" step="0.01" min="0"></td>'+
@@ -141,7 +147,7 @@ ORDER_DETAIL = _page("Замовлення {{ order['number'] }}", "Замовл
   <h3>{{ i.code }} · {{ i.name }} <span style="color:var(--text-dim);font-weight:400">{{ i.drawing_no or '' }}</span></h3>
   <span class="o-chip" style="color:{{ i.stage_color }};border-color:{{ i.stage_color }}">{{ i.stage_label }}</span>
  </div>
- <div style="font-size:13px;color:var(--text-dim);margin-top:4px">{{ '%g'|format(i.quantity) }} {{ i.unit }} · термін: <span class="{{ 'o-late' if i.overdue }}">{{ i.due_text }}</span>{% if i.overdue %} (прострочено){% endif %}{% if money and i.price is not none %} · ціна {{ '%.2f'|format(i.price) }} {{ i.currency or 'UAH' }} за {{ i.unit }} · сума <b style="color:var(--text)">{{ i.line_sum|money(i.currency or 'UAH') }}</b>{% endif %}{% if money and i.purchase_cost %} · закупівля заготовки {{ i.purchase_cost|money('UAH') }}{% endif %}</div>
+ <div style="font-size:13px;color:var(--text-dim);margin-top:4px">{{ '%g'|format(i.quantity) }} {{ i.unit }} · {{ i.due_date|due(i.stage_key=='done') }}{% if i.batch_delivery %} (партіями){% endif %}{% if money and i.price is not none %} · ціна {{ '%.2f'|format(i.price) }} {{ i.currency or 'UAH' }} за {{ i.unit }} · сума <b style="color:var(--text)">{{ i.line_sum|money(i.currency or 'UAH') }}</b>{% endif %}{% if money and i.purchase_cost %} · закупівля заготовки {{ i.purchase_cost|money('UAH') }}{% endif %}</div>
 
  <div class="o-cols">
   <!-- СКЛАД -->
@@ -220,7 +226,7 @@ PROCUREMENT = _page("Закупівля заготовок", "Закупівля
   <span class="o-chip" style="color:{{ i.blank_color }};border-color:{{ i.blank_color }}">{{ i.blank_label }}</span>
  </div>
  <div style="font-size:13px;margin-top:6px"><b>Що купити:</b> {{ i.blank_note or '—' }}</div>
- <div style="font-size:12.5px;color:var(--text-dim);margin-top:2px">Деталей: {{ '%g'|format(i.quantity) }} {{ i.unit }} · замовник {{ i.client_name or '—' }} · термін {{ i.due_text }} · <a href="{{ url_for('orders_detail', order_id=i.order_id) }}#item-{{ i.id }}" style="color:var(--accent-2)">замовлення {{ i.number }}</a></div>
+ <div style="font-size:12.5px;color:var(--text-dim);margin-top:2px">Деталей: {{ '%g'|format(i.quantity) }} {{ i.unit }} · замовник {{ i.client_name or '—' }} · деталі потрібні {{ i.due_date|due }} · <a href="{{ url_for('orders_detail', order_id=i.order_id) }}#item-{{ i.id }}" style="color:var(--accent-2)">замовлення {{ i.number }}</a></div>
  {% if i.ttn %}<div style="font-size:13px;margin-top:6px">ТТН <b>{{ i.ttn }}</b>{% if i.np_status %} · {{ i.np_status }}{% endif %}{% if i.np_checked_at %} <span style="color:var(--text-dim);font-size:11.5px">(перевірено {{ i.np_checked_at[11:16] }})</span>{% endif %}</div>{% endif %}
  {% if i.blank_status != 'received' %}
  <form method="post" action="{{ url_for('order_item_purchase', item_id=i.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
@@ -242,7 +248,7 @@ PROCUREMENT = _page("Закупівля заготовок", "Закупівля
 <div class="o-item" id="stock-{{ s.id }}">
  <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
   <h3>{{ s.name }}{% if s.sku %} <span style="color:var(--text-dim);font-weight:400">{{ s.sku }}</span>{% endif %}</h3>
-  <span class="o-chip" style="color:{{ s.color }};border-color:{{ s.color }}">{{ s.label }}</span>
+  <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">{{ s.need_by|due(s.status=='received') }}<span class="o-chip" style="color:{{ s.color }};border-color:{{ s.color }}">{{ s.label }}</span></span>
  </div>
  <div style="font-size:13px;margin-top:6px"><b>Купити:</b> {{ '%g'|format(s.qty) }} {{ s.unit or '' }}{% if s.qty_on_hand is not none %} <span style="color:var(--text-dim)">· зараз на складі {{ '%g'|format(s.qty_on_hand) }}, мінімум {{ '%g'|format(s.min_qty or 0) }}</span>{% endif %}</div>
  {% if s.price is not none %}<div style="font-size:12.5px;margin-top:2px">Ціна {{ '%.2f'|format(s.price) }} грн за {{ s.unit or 'од.' }} · сума <b>{{ s.sum|money('UAH') }}</b>{% if s.supplier_note %} · {{ s.supplier_note }}{% endif %}</div>{% elif s.supplier_note %}<div style="font-size:12.5px;margin-top:2px">{{ s.supplier_note }}</div>{% endif %}
@@ -270,6 +276,7 @@ ROUTINGS_LIST = _page("Техпроцеси", "Бібліотека техпро
 <div style="font-weight:600;margin-bottom:8px">⏳ Чекають техпроцесу ({{ waiting|length }})</div>
 {% for w in waiting %}<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;margin-bottom:6px">
 <b style="min-width:70px">{{ w['code'] }}</b><span style="flex:1">{{ w['name'] }} <span style="color:var(--text-dim)">{{ w['drawing_no'] or '' }}</span></span>
+{{ w['due_date']|due }}
 <a class="btn btn-sm" href="{{ url_for('orders_detail', order_id=w['order_id']) }}#item-{{ w['id'] }}">Обрати готовий</a>
 {% if r in ('admin','technologist') %}<a class="btn btn-sm btn-primary" href="{{ url_for('routings_new', for_item=w['id'], name=w['name'], drawing=w['drawing_no'] or '') }}">+ Створити</a>{% endif %}
 </div>{% endfor %}</div>{% endif %}

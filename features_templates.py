@@ -74,7 +74,8 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 {% for i in items %}<tr><td><input type="hidden" name="item_id" value="{{ i['id'] }}"><input type="checkbox" name="pick_{{ i['id'] }}" value="1" checked></td>
 <td>{{ i['name'] }}</td><td>{{ i['qty_on_hand'] }} {{ i['unit'] }}</td><td>{{ i['min_qty'] }}</td>
 <td><input name="qty_{{ i['id'] }}" value="{{ i['suggested'] }}" style="width:90px"> {{ i['unit'] }}</td></tr>{% endfor %}</table>
-{% if current_user['role'] in ('admin','warehouse','production') %}<div style="padding:12px;display:flex;gap:8px">
+{% if current_user['role'] in ('admin','warehouse','production') %}<div style="padding:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+<div class="field" style="margin:0"><label>Потрібно до *</label><input type="date" name="need_by" value="{{ need_by_default }}" min="{{ today_iso }}" required></div>
 <button class="btn btn-primary" formaction="{{ url_for('purchase_export') }}">⬇ Excel</button>
 <button class="btn" formaction="{{ url_for('purchase_telegram') }}">✈ Передати постачальнику (Telegram + «Закупівля»)</button></div>{% endif %}</form>
 {% else %}<div class="card empty" style="padding:24px">Усі залишки в нормі 👍</div>{% endif %}
@@ -91,15 +92,17 @@ PURCHASE = _page("Заявка на закупівлю", "Заявка на за
 <div class="field"><label>Назва нової позиції</label><input type="text" name="name" placeholder="напр. Коло Ст45 Ø60"></div>
 <div class="field"><label>Од.</label><input type="text" name="unit" value="шт"></div></div>
 <div class="field"><label>Кількість *</label><input type="number" step="any" min="0" name="qty" required></div>
-<div class="field" style="grid-column:span 2"><label>Примітка</label><input type="text" name="note" placeholder="розмір, марка, терміново тощо"></div>
+<div class="field"><label>Потрібно до *</label><input type="date" name="need_by" value="{{ need_by_default }}" min="{{ today_iso }}" required></div>
+<div class="field" style="grid-column:span 2"><label>Примітка</label><input type="text" name="note" placeholder="розмір, марка тощо"></div>
 <div><button class="btn btn-primary">✈ Додати й передати постачальнику</button></div>
 </form></div>
 {% endif %}
 {% set pend = stock_pending() %}{% if pend %}
 <div class="card table-wrap" style="margin-top:16px"><div style="padding:12px 14px;font-weight:700">Уже передано постачальнику</div>
-<table><tr><th>Позиція</th><th>К-сть</th><th>Стан</th><th>ТТН / статус НП</th><th>Ціна</th></tr>
+<table><tr><th>Позиція</th><th>К-сть</th><th>Потрібно</th><th>Стан</th><th>ТТН / статус НП</th><th>Ціна</th></tr>
 {% for r in pend %}<tr><td>{{ r['name'] }}{% if r['note'] %}<br><span style="font-size:11.5px;color:var(--text-dim)">{{ r['note'] }}</span>{% endif %}</td>
 <td>{{ '%g'|format(r['qty']) }} {{ r['unit'] or '' }}</td>
+<td>{{ r['need_by']|due }}</td>
 <td>{{ {'to_buy':'Треба купити','ordered':'Замовлено','shipped':'В дорозі'}.get(r['status'], r['status']) }}</td>
 <td>{{ r['ttn'] or '—' }}{% if r['np_status'] %}<br><span style="font-size:11.5px;color:var(--text-dim)">{{ r['np_status'] }}</span>{% endif %}</td>
 <td>{{ ('%.2f'|format(r['price']) ~ ' грн') if r['price'] is not none else '—' }}</td></tr>{% endfor %}</table></div>
@@ -143,11 +146,12 @@ REORDER = _page("Повторні замовлення", "Повторні за�
 
 BOARD = _page("Дошка завантаження", "Завантаження верстатів", "14 днів: години проти потужності. Перетягніть операцію на іншу дату чи верстат", """
 <div style="display:flex;gap:8px;margin-bottom:12px"><a class="btn btn-sm" href="?start={{ prev_start }}">← Тиждень</a><a class="btn btn-sm" href="?start={{ next_start }}">Тиждень →</a></div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:8px">⏰ — термін здачі замовлення. Червоним — операція запланована пізніше терміну.</div>
 <div class="card table-wrap"><table id="board-table" style="font-size:12px"><tr><th>Верстат</th>{% for d in days %}<th>{{ d.strftime('%d.%m') }}</th>{% endfor %}</tr>
 {% for g in grid %}<tr><td><b>{{ g.wc['name'] }}</b></td>{% for c in g.cells %}
 <td class="board-cell" data-date="{{ c.date }}" data-wc="{{ g.wc['id'] }}" style="min-width:90px;vertical-align:top;background:{{ 'rgba(224,80,80,.18)' if c.over else 'transparent' }}">
 <div style="color:var(--text-dim)">{{ c.hours }} / {{ g.wc['capacity_hours_per_day'] }} г</div>
-{% for o in c['items'] %}<div class="board-op" {% if can_move and o['status']=='waiting' %}draggable="true"{% endif %} data-op="{{ o['id'] }}" style="background:var(--accent);color:#000;border-radius:4px;padding:2px 4px;margin:2px 0">№{{ o['order_id'] }} {{ o['operation_name'] }}</div>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div>
+{% for o in c['items'] %}<div class="board-op" {% if can_move and o['status']=='waiting' %}draggable="true"{% endif %} data-op="{{ o['id'] }}" {% set late = o['due_date'] and c.date|string > o['due_date'] %}title="{{ o['deal_title'] or '' }} · термін {{ o['due_date'] or 'не вказано' }}{{ ' · ПІЗНІШЕ ТЕРМІНУ' if late }}" style="background:{{ '#e5534b' if late else 'var(--accent)' }};color:#000;border-radius:4px;padding:2px 4px;margin:2px 0">№{{ o['order_id'] }} {{ o['operation_name'] }}{% if o['due_date'] %}<br><span style="font-size:10.5px;opacity:.8">⏰ {{ o['due_date'][8:10] }}.{{ o['due_date'][5:7] }}{{ ' !' if late }}</span>{% endif %}</div>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div>
 {% if unscheduled %}<div class="card" style="padding:12px;margin-top:12px"><b>Без дати / верстата:</b> {% for o in unscheduled %}<span class="tag">№{{ o['order_id'] }} {{ o['operation_name'] }}</span> {% endfor %}</div>{% endif %}
 <script>
 (function(){var tok=document.querySelector('meta[name=csrf-token]');var drag=null;

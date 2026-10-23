@@ -4560,7 +4560,7 @@ def test_purchase_request_export_and_telegram_fallback(client):
     assert ws.cell(2, 2).value == "Фреза" and ws.cell(2, 5).value == 18 and ws.cell(2, 8).value == 1800
     r = post(client, "/warehouse/purchase/export", {})
     assert r.status_code == 302
-    r = post(client, "/warehouse/purchase/telegram", {"item_id": item, "pick_%d" % item: "1", "qty_%d" % item: "5"},
+    r = post(client, "/warehouse/purchase/telegram", {"item_id": item, "pick_%d" % item: "1", "qty_%d" % item: "5", "need_by": _FUT},
              follow_redirects=True)
     assert "не налаштовані" in r.get_data(as_text=True)
     assert _raw_db(client).execute("SELECT qty FROM stock_requests WHERE warehouse_item_id=?", (item,)).fetchone()[0] == 5
@@ -5239,10 +5239,14 @@ def test_mtconnect_runtime_hours_computed(client, monkeypatch):
 
 
 # ----------------------------------------------------------------------------- потік замовлення
+import datetime as _dt_mod
+_FUT = (_dt_mod.date.today() + _dt_mod.timedelta(days=5)).isoformat()
+
+
 def _new_order(client, number="200-1", items=None):
     db = _raw_db(client)
     cid = db.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
-    data = {"number": number, "doc_date": "2026-10-12", "client_id": cid}
+    data = {"number": number, "doc_date": "2026-10-12", "client_id": cid, "due_all": "2026-12-01"}
     for i, it in enumerate(items or [{"name": "Упор", "drawing": "кр.1", "qty": "200", "batch": "1"},
                                      {"name": "Кронштейн", "drawing": "кр.2", "qty": "400", "due": "2026-11-01"}]):
         for k, v in it.items():
@@ -5265,7 +5269,7 @@ def test_orders_full_flow(client, monkeypatch):
     assert [i["code"] for i in items] == ["200-1-1", "200-1-2"] and items[0]["batch_delivery"] == 1
     assert any("Нове замовлення 200-1" in s for s in sent)
     page = client.get(f"/orders/{oid}").get_data(as_text=True)
-    assert "Чекає: заготовка, техпроцес" in page and "партійно" in page
+    assert "Чекає: заготовка, техпроцес" in page and "(партіями)" in page
     client.get("/logout")
 
     # склад: заготовки немає -> заявка постачальнику
@@ -5386,7 +5390,8 @@ def test_orders_auto_routing_by_drawing_and_edit(client):
     # редагування: додати позицію, змінити кількість
     cid = db.execute("SELECT client_id FROM orders WHERE id=?", (oid,)).fetchone()[0]
     post(client, f"/orders/{oid}/edit", {"number": "500-1", "client_id": cid, "items-0-id": it["id"], "items-0-name": "Упор",
-                                         "items-0-qty": "12", "items-1-name": "Шайба", "items-1-qty": "50"})
+                                         "items-0-qty": "12", "items-1-name": "Шайба", "items-1-qty": "50",
+                                         "due_all": "2026-12-01"})
     rows = _raw_db(client).execute("SELECT * FROM order_items WHERE order_id=? ORDER BY line_no", (oid,)).fetchall()
     assert len(rows) == 2 and rows[0]["quantity"] == 12 and rows[0]["id"] == it["id"] and rows[1]["code"] == "500-1-2"
 
@@ -5493,7 +5498,7 @@ def test_warehouse_purchase_request_goes_to_purchaser(client, monkeypatch):
     db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('purchaser_chat_id', '555')"); db.commit()
     low = db.execute("SELECT * FROM warehouse_items WHERE qty_on_hand <= min_qty ORDER BY id LIMIT 1").fetchone()
     assert low
-    post(client, "/warehouse/purchase/telegram", {"item_id": low["id"], f"pick_{low['id']}": "1", f"qty_{low['id']}": "10"})
+    post(client, "/warehouse/purchase/telegram", {"item_id": low["id"], f"pick_{low['id']}": "1", f"qty_{low['id']}": "10", "need_by": _FUT})
     assert tg and tg[0][0] == "555" and low["name"] in tg[0][1]
     req = _raw_db(client).execute("SELECT * FROM stock_requests WHERE warehouse_item_id=?", (low["id"],)).fetchone()
     assert req and req["status"] == "to_buy" and req["qty"] == 10
@@ -5523,12 +5528,12 @@ def test_order_prices_and_terms(client):
     login(client, "oleh", "manager123")
     db = _raw_db(client)
     cid = db.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
-    post(client, "/orders/new", {"number": "600-1", "client_id": cid, "contact_person": "Іван, 067",
+    post(client, "/orders/new", {"number": "600-1", "client_id": cid, "contact_person": "Іван, 067", "due_all": "2026-12-01",
                                  "payment_terms": "50% передоплата", "delivery": "НП Львів",
                                  "items-0-name": "Упор", "items-0-qty": "200", "items-0-price": "45.5", "items-0-currency": "UAH",
                                  "items-1-name": "Кронштейн", "items-1-qty": "10", "items-1-price": "-3"})
     assert _raw_db(client).execute("SELECT COUNT(*) FROM orders WHERE number='600-1'").fetchone()[0] == 0
-    post(client, "/orders/new", {"number": "600-1", "client_id": cid, "contact_person": "Іван, 067",
+    post(client, "/orders/new", {"number": "600-1", "client_id": cid, "contact_person": "Іван, 067", "due_all": "2026-12-01",
                                  "payment_terms": "50% передоплата", "delivery": "НП Львів",
                                  "items-0-name": "Упор", "items-0-qty": "200", "items-0-price": "45.5", "items-0-currency": "UAH",
                                  "items-1-name": "Кронштейн", "items-1-qty": "10", "items-1-price": "100", "items-1-currency": "USD"})
@@ -5612,10 +5617,10 @@ def test_purchase_request_add_any_item_and_new(client, monkeypatch):
     ok_item = db.execute("SELECT * FROM warehouse_items WHERE qty_on_hand > min_qty ORDER BY id LIMIT 1").fetchone()
     t = client.get("/warehouse/purchase").get_data(as_text=True)
     assert "Додати позицію в заявку" in t and ok_item["name"] in t
-    post(client, "/warehouse/purchase/add", {"item_id": ok_item["id"], "qty": "7", "note": "про запас"})
-    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Коло Ст45 Ø60", "unit": "м", "qty": "3"})
-    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "", "qty": "3"})
-    post(client, "/warehouse/purchase/add", {"item_id": ok_item["id"], "qty": "0"})
+    post(client, "/warehouse/purchase/add", {"item_id": ok_item["id"], "qty": "7", "note": "про запас", "need_by": _FUT})
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Коло Ст45 Ø60", "unit": "м", "qty": "3", "need_by": _FUT})
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "", "qty": "3", "need_by": _FUT})
+    post(client, "/warehouse/purchase/add", {"item_id": ok_item["id"], "qty": "0", "need_by": _FUT})
     rows = _raw_db(client).execute("SELECT * FROM stock_requests ORDER BY id").fetchall()
     assert [(r["name"], r["qty"], r["unit"]) for r in rows] == [(ok_item["name"], 7, ok_item["unit"]), ("Коло Ст45 Ø60", 3, "м")]
     assert rows[1]["warehouse_item_id"] is None and len(tg) == 2 and "Коло Ст45" in tg[1]
@@ -5895,3 +5900,65 @@ def test_sidebar_links_open_for_every_role(client):
     nav = home[home.find('<nav class="nav">'):home.find("</nav>")]
     for hidden in ("/clients", "/deals", "/calculator", '"/warehouse"', "/service", '"/production"'):
         assert hidden not in nav, hidden
+
+
+def test_deadlines_required_and_shown_to_every_role(client, monkeypatch):
+    """Термін обов'язковий у замовленні та заявці складу і видний усім ролям."""
+    m = client._app_module
+    tg = []
+    monkeypatch.setattr(m, "notify_all", lambda t: tg.append(t))
+    monkeypatch.setattr(m, "send_telegram_to", lambda chat, t: (tg.append(t), (True, "ok"))[1])
+    monkeypatch.setattr(m, "send_telegram_notification", lambda t: (tg.append(t), (True, "ok"))[1])
+    login(client)
+    db = _raw_db(client)
+    cid = db.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
+    # без терміну замовлення не зберігається
+    r = post(client, "/orders/new", {"number": "700-1", "client_id": cid, "items-0-name": "Вал", "items-0-qty": "5"},
+             follow_redirects=True)
+    assert "вкажіть термін" in r.get_data(as_text=True)
+    assert _raw_db(client).execute("SELECT COUNT(*) FROM orders WHERE number='700-1'").fetchone()[0] == 0
+    due = (_dt_mod.date.today() + _dt_mod.timedelta(days=2)).isoformat()
+    post(client, "/orders/new", {"number": "700-1", "client_id": cid, "items-0-name": "Вал", "items-0-qty": "5",
+                                 "items-0-drawing": "кр.700", "items-0-due": due})
+    oid = _raw_db(client).execute("SELECT id FROM orders WHERE number='700-1'").fetchone()[0]
+    it = _raw_db(client).execute("SELECT * FROM order_items WHERE order_id=?", (oid,)).fetchone()
+    shown = _dt_mod.date.fromisoformat(due).strftime("%d.%m.%Y")
+    assert any("700-1-1 Вал" in t and shown in t for t in tg)  # термін у Telegram
+    page = client.get("/").get_data(as_text=True)
+    assert "Найближчі терміни замовлень" in page and f"до {shown} · ще 2 дн." in page and "due-soon" in page
+    # склад, технолог, постачальник бачать термін
+    for user, pw, url in (("sklad", "sklad123", f"/orders/{oid}"), ("tehnolog", "tehnolog123", "/routings"),
+                          ("maister", "prod123", "/orders")):
+        client.get("/logout"); login(client, user, pw)
+        assert f"до {shown}" in client.get(url).get_data(as_text=True), user
+    client.get("/logout"); login(client, "sklad", "sklad123")
+    post(client, f"/orders/items/{it['id']}/blank", {"action": "to_buy", "blank_note": "Коло Ст45 Ø30"})
+    client.get("/logout"); login(client, "postach", "postach123")
+    assert f"деталі потрібні <span class=\"due due-soon\"" in client.get("/procurement").get_data(as_text=True)
+    # заявка складу без «Потрібно до» не приймається; з датою - видно постачальнику
+    client.get("/logout"); login(client, "sklad", "sklad123")
+    r = post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Мітчик М8", "qty": "4"}, follow_redirects=True)
+    assert "до якої дати" in r.get_data(as_text=True)
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Мітчик М8", "qty": "4",
+                                              "need_by": (_dt_mod.date.today() - _dt_mod.timedelta(days=1)).isoformat()})
+    assert _raw_db(client).execute("SELECT COUNT(*) FROM stock_requests WHERE name='Мітчик М8'").fetchone()[0] == 0
+    post(client, "/warehouse/purchase/add", {"item_id": "", "name": "Мітчик М8", "qty": "4", "need_by": _FUT})
+    assert _raw_db(client).execute("SELECT need_by FROM stock_requests WHERE name='Мітчик М8'").fetchone()[0] == _FUT
+    assert any("Мітчик М8" in t and "потрібно до" in t for t in tg)
+    client.get("/logout"); login(client, "postach", "postach123")
+    assert "до " + _dt_mod.date.fromisoformat(_FUT).strftime("%d.%m.%Y") in client.get("/procurement").get_data(as_text=True)
+    # запуск -> термін у виробництві, у терміналі верстатника й на дошці
+    client.get("/logout"); login(client, "sklad", "sklad123")
+    post(client, f"/orders/items/{it['id']}/blank", {"action": "in_stock"})
+    client.get("/logout"); login(client)
+    rid = _raw_db(client).execute("SELECT id FROM routing_templates ORDER BY id LIMIT 1").fetchone()[0]
+    post(client, f"/orders/items/{it['id']}/routing", {"routing_id": rid})
+    post(client, f"/orders/items/{it['id']}/launch", {})
+    po = _raw_db(client).execute("SELECT * FROM production_orders WHERE order_item_id=?", (it["id"],)).fetchone()
+    assert po and po["due_date"] == due and any("У виробництво" in t and shown in t for t in tg)
+    assert f"до {shown}" in client.get("/production").get_data(as_text=True)
+    assert f"до {shown}" in client.get(f"/production/{po['id']}").get_data(as_text=True)
+    wc = _raw_db(client).execute("SELECT work_center_id FROM production_operations WHERE production_order_id=? ORDER BY step_order",
+                                 (po["id"],)).fetchone()[0]
+    assert f"до {shown}" in client.get(f"/work-centers/{wc}/terminal").get_data(as_text=True)
+    assert "термін здачі замовлення" in client.get("/production/board").get_data(as_text=True)
